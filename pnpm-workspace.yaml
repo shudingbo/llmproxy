@@ -1,0 +1,4 @@
+# pnpm 工作区：包含 server（后端）与 web（前端）两个子包
+packages:
+  - 'server'
+  - 'web'

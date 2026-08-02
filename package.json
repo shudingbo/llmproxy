@@ -1,0 +1,30 @@
+{
+  "name": "llmproxy",
+  "private": true,
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "packageManager": "pnpm@9.15.4",
+  "license": "MIT",
+  "scripts": {
+    "dev": "concurrently -k -n server,web \"pnpm --filter @llmproxy/server dev\" \"pnpm --filter @llmproxy/web dev\"",
+    "start": "pnpm --filter @llmproxy/web build && node server/dist/index.js",
+    "build": "pnpm --filter @llmproxy/web build && pnpm --filter @llmproxy/server build",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "pnpm": {
+    "overrides": {
+      "vite": "^6.4.3"
+    }
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.4"
+  }
+}

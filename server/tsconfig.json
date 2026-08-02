@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    // 目标运行时语法：ES2022（Node 18+ 完整支持）
+    "target": "ES2022",
+    // ESM 模块解析（NodeNext 强制 .js 后缀导入，配合 "type": "module"）
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    // 严格模式：开启全部严格检查
+    "strict": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    // 构建产物保留声明与源码映射，便于调试与类型引用
+    "declaration": true,
+    "sourceMap": true,
+    // 构建时若有类型错误则禁止产出文件；typecheck 走独立的 tsc --noEmit
+    "noEmitOnError": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    // 仅引入 Node 全局类型，避免浏览器 DOM 类型污染
+    "types": ["node"]
+  },
+  "include": ["src"]
+}

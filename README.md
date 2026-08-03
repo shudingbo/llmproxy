@@ -17,7 +17,7 @@ pnpm --filter @llmproxy/web build
 pnpm start
 ```
 
-> `pnpm start` builds the web bundle first, then runs `node server/dist/index.js`.
+> `pnpm start` smart-builds: it only builds what's missing (`server/dist` or `web/dist`); with artifacts present it runs `node server/dist/index.js` directly without recompiling the frontend. Force a full rebuild first with `pnpm start:rebuild`; build explicitly with `pnpm build`.
 > Override the port / host with `PORT` / `HOST` env vars, e.g. `PORT=8080 pnpm start`.
 
 Smoke-test the OpenAI-compatible endpoint (returns an OpenAI-style `choices` payload):
@@ -99,7 +99,7 @@ Example:
 ### 首次启动 First Run
 
 1. **安装依赖**：`pnpm install`（需要 Node ≥ 18 与 pnpm 9.x，见下文「开发说明」）
-2. **构建管理端**：`pnpm --filter @llmproxy/web build`，或直接执行 `pnpm start`（启动前会自动构建 web）
+2. **构建管理端**：`pnpm --filter @llmproxy/web build`，或直接执行 `pnpm start`（产物缺失时启动前自动构建 web）
 3. **启动服务**：`pnpm start`，默认监听 `http://127.0.0.1:3000`；用 `PORT` / `HOST` 环境变量覆盖（如 `PORT=8080 pnpm start`）
 4. **配置文件自动生成**：首次启动会在 `<userHome>/llmproxy/llmproxy.jsonc` 生成一份带注释的示例配置（Windows 为 `C:\Users\<you>\llmproxy\llmproxy.jsonc`，POSIX 为 `$HOME/llmproxy/llmproxy.jsonc`，权限 `0600`）。示例中的 `apiKey` 默认是 `sk-REPLACE_ME`，请替换成真实密钥。改完保存即被热重载，无需重启
 5. **浏览器访问**：打开 `http://127.0.0.1:3000` 进入管理界面（管理端与各 API 共用同一端口）。可用 Quickstart 章节的两个 curl 做冒烟测试
@@ -466,7 +466,7 @@ pnpm workspace 包含两个包：`server`（Node.js/Express 5 服务端）与 `w
 
 ```text
 llmproxy/
-├── package.json            # 工作区根：dev / start / build / test / lint / typecheck
+├── package.json            # 工作区根：dev / start / start:rebuild / build / test / lint / typecheck
 ├── server/                 # @llmproxy/server：Express 5 + TypeScript ESM
 │   ├── package.json
 │   ├── tsconfig.json       # strict + NodeNext（.js 后缀导入）
@@ -504,7 +504,8 @@ llmproxy/
 | `pnpm lint` | 全部工作区 lint（eslint） |
 | `pnpm typecheck` | 全部工作区类型检查（server `tsc --noEmit`、web `vue-tsc --noEmit`） |
 | `pnpm build` | 先 web（`vue-tsc --noEmit && vite build`）后 server（`tsc`） |
-| `pnpm start` | 生产启动：先构建 web，再 `node server/dist/index.js`（默认 `127.0.0.1:3000`） |
+| `pnpm start` | 生产启动：智能构建——`server/dist` / `web/dist` 产物缺失时才构建（server `tsc` / web `vue-tsc --noEmit && vite build`），存在则直接 `node server/dist/index.js`（默认 `127.0.0.1:3000`） |
+| `pnpm start:rebuild` | 强制 `pnpm build`（server+web 全量）后再启动（等同旧版 `pnpm start` 行为） |
 
 server 包内脚本（`pnpm --filter @llmproxy/server <script>`）：
 

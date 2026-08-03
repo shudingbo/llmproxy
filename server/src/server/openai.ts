@@ -2,8 +2,12 @@
 // 职责：模型列表（返回下游别名）、非流式/流式透传、按候选顺序回退、每次尝试计数
 // 请求体解析（express.json 10mb）由装配层 T19 注入；请求体本身原样透传，不做校验
 import type { Express, Request, Response } from 'express'
-import type { Readable } from 'node:stream'
+import type { Readable, Writable } from 'node:stream'
 import type { ConfigStore } from '../config/store.js'
+import { responsesRequestToChat } from '../converters/responses-request.js'
+import { chatResponseToResponses } from '../converters/responses-response.js'
+import { createResponsesStream } from '../converters/responses-stream.js'
+import type { ResponsesRequest } from '../converters/responses-types.js'
 import { ModelNotFoundError } from '../router/errors.js'
 import { executeWithFallback, isFallbackableAxiosError } from '../router/fallback.js'
 import { Router } from '../router/index.js'
@@ -220,6 +224,145 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     stream.pipe(res)
   }
 
+  // Responses API（POST /v1/responses）：非流式/流式两条路径，结构对齐 chat 处理器
+  // 网关边界转换：responses 请求 → chat 请求（responsesRequestToChat），上游统一走 chatCompletion；
+  // 响应回转：chat 非流式响应 → responses 对象 / chat SSE 流 → responses SSE 事件流
+  const handleResponses = async (
+    req: Request,
+    res: Response,
+    body: Record<string, unknown>,
+    model: string,
+    signal: AbortSignal,
+  ): Promise<void> => {
+    // 未知模型别名在此抛 ModelNotFoundError，由外层 catch 转 404
+    const candidates = buildRouter().resolve(model)
+    const session = extractSessionKey(req, body)
+    const ctx = {
+      downstreamModel: model,
+      sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
+      client: session?.client,
+    }
+
+    // ---------- 流式分支：chat SSE → responses SSE 事件流 ----------
+    if (body.stream === true) {
+      const result = await executeWithFallback<StreamSuccess>(
+        candidates,
+        loadBalancer,
+        ctx,
+        async (candidate) => {
+          const attemptStart = process.hrtime.bigint()
+          const client = getUpstreamClient(candidate.upstreamId)
+          if (!client) {
+            reportAttempt(candidate.upstreamId, false, attemptStart)
+            return { ok: false, error: new Error('upstream_client_missing'), fallbackable: true }
+          }
+          // 转换请求：responses → chat，模型名换成上游侧名称，强制流式（includeUsage 让上游补发 usage 块）
+          const chatReq = responsesRequestToChat(body as ResponsesRequest)
+          chatReq.model = candidate.model
+          chatReq.stream = true
+          try {
+            const { stream, abort, connectError } = client.chatCompletionStream(chatReq, {
+              signal,
+              includeUsage: true,
+            })
+            // 等待连接阶段结果：成功（null）→ 把流交给调用方；失败（Error）→ 可回退下一个候选
+            // 必须 await：axios 流式调用是后台 promise，try/catch 抓不到它的 reject
+            const connectErr = await connectError
+            if (connectErr) {
+              // 主动挂空操作监听器，避免被丢弃的流产生 unhandled error 事件
+              // （实际错误已通过 connectError 上报，调用方要走回退路径）
+              stream.on('error', () => {})
+              reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(connectErr))
+              return { ok: false, error: connectErr, fallbackable: isFallbackableAxiosError(connectErr) }
+            }
+            reportAttempt(candidate.upstreamId, true, attemptStart)
+            return { ok: true, value: { stream, abort } }
+          } catch (err) {
+            reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
+            return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
+          }
+        },
+        (candidate) => {
+          // 回退成功后实际成功上游 ≠ 首选时，把会话粘附改绑到成功上游
+          if (ctx.sessionKey !== undefined) {
+            deps.sessionStore?.rebind(ctx.sessionKey, candidate.upstreamId, candidate.model)
+          }
+        },
+      )
+      if (!result.ok || !result.value) {
+        res.status(502).json({ error: 'no_upstream' })
+        return
+      }
+      const { stream, abort } = result.value
+      // 上游 chat SSE 流 → responses SSE 事件流（转换器内部挂接上游 error 监听）
+      const responsesStream = createResponsesStream(stream, model)
+      stream.pipe(responsesStream as unknown as Writable)
+      // SSE 响应头必须在首字节之前设置
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.setHeader('Cache-Control', 'no-cache')
+      res.setHeader('Connection', 'keep-alive')
+      res.setHeader('X-Accel-Buffering', 'no')
+      res.flushHeaders()
+      // 下游断开连接（客户端取消/超时）→ 拆掉上游连接，避免资源泄漏。
+      // 用 res 'close' 而非 req 'close'（后者在请求体消费完后即触发，与断开无关）
+      res.on('close', () => {
+        abort()
+      })
+      // 转换流异常（上游传输错误已由转换器转成 error 事件，正常路径不触发）→ 结束响应
+      responsesStream.on('error', () => {
+        if (!res.destroyed) {
+          res.end()
+        }
+      })
+      responsesStream.pipe(res)
+      return
+    }
+
+    // ---------- 非流式分支：chat 响应 → responses 响应对象 ----------
+    const result = await executeWithFallback<ChatSuccess>(
+      candidates,
+      loadBalancer,
+      ctx,
+      async (candidate) => {
+        const attemptStart = process.hrtime.bigint()
+        const client = getUpstreamClient(candidate.upstreamId)
+        if (!client) {
+          reportAttempt(candidate.upstreamId, false, attemptStart)
+          return { ok: false, error: new Error('upstream_client_missing'), fallbackable: true }
+        }
+        // 转换请求：responses → chat，模型名换成上游侧名称，强制非流式
+        const chatReq = responsesRequestToChat(body as ResponsesRequest)
+        chatReq.model = candidate.model
+        chatReq.stream = false
+        try {
+          const data = await client.chatCompletion(chatReq, { signal })
+          // chat 响应 → responses 响应对象（model 用下游别名，与 /v1/chat/completions 一致）
+          const responsesBody = chatResponseToResponses(data, model)
+          reportAttempt(candidate.upstreamId, true, attemptStart, 200)
+          return { ok: true, value: { status: 200, headers: {}, data: responsesBody } }
+        } catch (err) {
+          reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
+          return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
+        }
+      },
+      (candidate) => {
+        // 回退成功后实际成功上游 ≠ 首选时，把会话粘附改绑到成功上游
+        if (ctx.sessionKey !== undefined) {
+          deps.sessionStore?.rebind(ctx.sessionKey, candidate.upstreamId, candidate.model)
+        }
+      },
+    )
+    if (result.ok && result.value) {
+      res.status(result.value.status).json(result.value.data)
+      return
+    }
+    // 全部候选失败：502，附带最后一次尝试的错误代号（若有）
+    const lastEntry = result.attemptLog[result.attemptLog.length - 1]
+    res.status(502).json(
+      lastEntry.errorCode !== undefined ? { error: 'no_upstream', code: lastEntry.errorCode } : { error: 'no_upstream' },
+    )
+  }
+
   // 模型列表：返回下游别名列表（downstreamModels 的 key），
   // 与聊天接口可识别的模型名保持一致，不再从上游拉取
   app.get('/v1/models', (_req: Request, res: Response) => {
@@ -246,6 +389,24 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       await handleNonStream(req, res, body, model, signal)
     } catch (err) {
       // 未知模型别名 → 404；其余异常（如候选为空）→ 502
+      if (err instanceof ModelNotFoundError) {
+        res.status(404).json({ error: 'model_not_found' })
+        return
+      }
+      res.status(502).json({ error: 'no_upstream' })
+    }
+  })
+
+  // Responses API：非流式与流式两条路径，共用回退逻辑（与 /v1/chat/completions 并列）
+  app.post('/v1/responses', async (req: Request, res: Response) => {
+    try {
+      // 仅提取路由所需的模型名；请求体在边界转换为 chat 格式
+      const body = req.body as Record<string, unknown>
+      const model = typeof body.model === 'string' ? body.model : ''
+      const signal = createRequestSignal(res)
+      await handleResponses(req, res, body, model, signal)
+    } catch (err) {
+      // 未知模型别名 → 404；其余异常（如候选为空）→ 502（与 chat 接口一致）
       if (err instanceof ModelNotFoundError) {
         res.status(404).json({ error: 'model_not_found' })
         return

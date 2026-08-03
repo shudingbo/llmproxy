@@ -301,6 +301,204 @@ describe('OpenAI 下游服务', () => {
   })
 })
 
+describe('OpenAI Responses API（POST /v1/responses）', () => {
+  it('非流式：responses 请求 → chat 上游 → responses 响应对象', async () => {
+    // 捕获上游收到的请求体，断言已转换为 chat 格式
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-1',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: '你好' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        }),
+      )
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/responses')
+      .send({ model: 'gpt-4', input: '你好', max_output_tokens: 100, temperature: 0.7 })
+    expect(res.status).toBe(200)
+    const body = res.body as {
+      id: string
+      object: string
+      status: string
+      model: string
+      output: Array<{
+        id: string
+        type: string
+        role: string
+        status: string
+        content: Array<{ type: string; text: string }>
+      }>
+      usage: { input_tokens: number; output_tokens: number; total_tokens: number }
+    }
+    expect(body.object).toBe('response')
+    expect(body.status).toBe('completed')
+    expect(body.model).toBe('gpt-4')
+    expect(body.id.startsWith('resp_')).toBe(true)
+    expect(body.output).toHaveLength(1)
+    expect(body.output[0]).toMatchObject({ type: 'message', role: 'assistant', status: 'completed' })
+    expect(body.output[0].id.startsWith('msg_')).toBe(true)
+    expect(body.output[0].content).toEqual([{ type: 'output_text', text: '你好', annotations: [] }])
+    expect(body.usage).toEqual({ input_tokens: 10, output_tokens: 5, total_tokens: 15 })
+    // 上游收到的是候选模型名 + chat 格式消息 + 强制非流式 + max_output_tokens 已映射
+    expect(captured).toMatchObject({
+      model: 'gpt-4-u1',
+      stream: false,
+      max_tokens: 100,
+      temperature: 0.7,
+      messages: [{ role: 'user', content: '你好' }],
+    })
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: true })
+  })
+
+  it('instructions 前置 system 消息，数组 input 逐项映射', async () => {
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'ok', object: 'chat.completion', choices: [] }))
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/responses')
+      .send({
+        model: 'gpt-4',
+        instructions: '你是助手',
+        input: [
+          { role: 'user', content: '你好' },
+          { type: 'message', role: 'assistant', content: '收到' },
+          { type: 'function_call', id: 'fc1', call_id: 'c1', name: 'f', arguments: '{}' },
+        ],
+      })
+    expect(res.status).toBe(200)
+    expect(captured).toMatchObject({
+      messages: [
+        { role: 'system', content: '你是助手' },
+        { role: 'user', content: '你好' },
+        { role: 'assistant', content: '收到' },
+      ],
+    })
+  })
+
+  it('流式：返回 Responses SSE 事件流，delta 事件顺序正确', async () => {
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write('data: {"id":"1","choices":[{"delta":{"content":"你"}}]}\n\n')
+      res.write('data: {"id":"2","choices":[{"delta":{"content":"好"}}]}\n\n')
+      res.end('data: [DONE]\n\n')
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/responses')
+      .send({ model: 'gpt-4', input: '你好', stream: true })
+    expect(res.status).toBe(200)
+    // SSE 响应头必须完整
+    expect(res.headers['content-type']).toContain('text/event-stream')
+    expect(res.headers['cache-control']).toContain('no-cache')
+    expect(res.headers['x-accel-buffering']).toBe('no')
+    // 事件序列：created → ... → completed，delta 逐个输出
+    const text = res.text
+    const eventOrder = [
+      'event: response.created',
+      'event: response.in_progress',
+      'event: response.output_item.added',
+      'event: response.content_part.added',
+      'event: response.output_text.delta',
+      'event: response.output_text.delta',
+      'event: response.output_text.done',
+      'event: response.content_part.done',
+      'event: response.output_item.done',
+      'event: response.completed',
+    ]
+    let prev = -1
+    for (const name of eventOrder) {
+      // 同名事件（如连续两个 delta）需从上次位置之后开始查找，保证顺序断言
+      const idx = text.indexOf(name, prev + 1)
+      expect(idx).toBeGreaterThan(prev)
+      prev = idx
+    }
+    // delta 内容逐个出现，completed 事件以完整响应收尾
+    expect(text).toContain('"delta":"你"')
+    expect(text).toContain('"delta":"好"')
+    expect(text).toContain('"text":"你好"')
+    expect(text).toContain('"status":"completed"')
+    // 上游收到的是候选模型名 + chat 格式 + 强制流式 + usage 统计
+    expect(captured).toMatchObject({
+      model: 'gpt-4-u1',
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [{ role: 'user', content: '你好' }],
+    })
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: true })
+  })
+
+  it('未知模型返回 404 model_not_found', async () => {
+    const res = await request(app).post('/v1/responses').send({ model: 'nope', input: 'hi' })
+    expect(res.status).toBe(404)
+    expect(res.body as { error?: string }).toEqual({ error: 'model_not_found' })
+    expect(attempts).toHaveLength(0)
+  })
+
+  it('全部上游失败时返回 502 no_upstream', async () => {
+    const url1 = await startMock(async (req, res) => {
+      res.statusCode = 500
+      res.end('err')
+    })
+    const url2 = await startMock(async (req, res) => {
+      res.statusCode = 503
+      res.end('err')
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+
+    const res = await request(app).post('/v1/responses').send({ model: 'gpt-4', input: 'hi' })
+    expect(res.status).toBe(502)
+    expect(res.body as { error?: string }).toMatchObject({ error: 'no_upstream' })
+    expect(attempts.map((a) => a.upstreamId)).toEqual(['u1', 'u2'])
+    expect(attempts.every((a) => !a.ok)).toBe(true)
+  })
+
+  it('首选上游失败回退到下一个候选并最终 200', async () => {
+    const url1 = await startMock(async (req, res) => {
+      res.statusCode = 500
+      res.end('boom')
+    })
+    const url2 = await startMock(async (req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'ok',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: '回退成功' } }],
+        }),
+      )
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+
+    const res = await request(app).post('/v1/responses').send({ model: 'gpt-4', input: 'hi' })
+    expect(res.status).toBe(200)
+    expect((res.body as { output: Array<{ content: Array<{ text: string }> }> }).output[0].content[0].text).toBe(
+      '回退成功',
+    )
+    expect(attempts.map((a) => a.upstreamId)).toEqual(['u1', 'u2'])
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: false, status: 500 })
+    expect(attempts[1]).toMatchObject({ upstreamId: 'u2', ok: true })
+  })
+})
+
 describe('OpenAI 会话亲和路由', () => {
   it('带 X-OpenWebUI-Chat-Id 的请求按会话粘附同一上游', async () => {
     let hitU1 = 0

@@ -16,7 +16,13 @@ const expectedHash = (messages: unknown[]): string =>
         messages.slice(0, 2).map((m) => {
           const msg = (m ?? {}) as Record<string, unknown>
           const role = typeof msg.role === 'string' ? msg.role : ''
-          const content = typeof msg.content === 'string' ? msg.content : ''
+          // 与 key.ts 的 hashContentPrefix 保持同一口径：字符串原样、缺失视为空串、其余 JSON.stringify
+          const content =
+            typeof msg.content === 'string'
+              ? msg.content
+              : msg.content === undefined
+                ? ''
+                : JSON.stringify(msg.content)
           return [role, content]
         }),
       ),
@@ -74,11 +80,32 @@ describe('extractSessionKey', () => {
     expect(extractSessionKey(makeReq(), {})).toBeUndefined()
   })
 
-  it('content 为 null（多模态）时仍稳定：与 content 为空串的 hash 一致且不抛错', () => {
+  it('content 缺失（undefined）与空串等价：hash 相同', () => {
+    const noContent = { messages: [{ role: 'system' }, { role: 'user' }] }
+    const emptyContent = { messages: [{ role: 'system' }, { role: 'user', content: '' }] }
+    expect(extractSessionKey(makeReq(), noContent)?.raw).toBe(
+      extractSessionKey(makeReq(), emptyContent)?.raw,
+    )
+  })
+
+  it('content 为 null：JSON.stringify(null) 为 "null"，与 content: "null" 字符串 hash 相同', () => {
     const withNull = { messages: [{ role: 'system' }, { role: 'user', content: null }] }
-    const withEmpty = { messages: [{ role: 'system' }, { role: 'user', content: '' }] }
+    const withStringNull = { messages: [{ role: 'system' }, { role: 'user', content: 'null' }] }
     expect(() => extractSessionKey(makeReq(), withNull)).not.toThrow()
-    expect(extractSessionKey(makeReq(), withNull)?.raw).toBe(extractSessionKey(makeReq(), withEmpty)?.raw)
+    expect(extractSessionKey(makeReq(), withNull)?.raw).toBe(
+      extractSessionKey(makeReq(), withStringNull)?.raw,
+    )
+  })
+
+  it('content 为多模态数组：数组参与哈希与纯字符串不同，相同数组内容 hash 稳定', () => {
+    const withArray = { messages: [{ role: 'user', content: [{ type: 'image', url: 'a' }] }] }
+    const withString = { messages: [{ role: 'user', content: 'a' }] }
+    const hashArray = extractSessionKey(makeReq(), withArray)?.raw
+    const hashString = extractSessionKey(makeReq(), withString)?.raw
+    expect(hashArray).toBeDefined()
+    expect(hashString).toBeDefined()
+    expect(hashArray).not.toBe(hashString)
+    expect(extractSessionKey(makeReq(), withArray)?.raw).toBe(hashArray)
   })
 
   it('header 优先：同时有 header 和 messages → 返回 header 值', () => {

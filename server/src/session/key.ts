@@ -27,7 +27,8 @@ const findHeaderValue = (req: Request, name: string): string | undefined => {
   return undefined
 }
 
-// 计算内容前缀 hash：取前 2 条消息的 [role, content] 二元组（content 非字符串统一视为空串，保持简单稳定），
+// 计算内容前缀 hash：取前 2 条消息的 [role, content] 二元组，
+// content 字符串原样、字段缺失视为空串、null/多模态数组/对象用 JSON.stringify 参与哈希（区分不同内容）；
 // JSON.stringify 后 sha256 十六进制；不序列化 id/timestamp 等多余字段，保证同前缀稳定
 const hashContentPrefix = (body: Record<string, unknown>): string | undefined => {
   const messages = body.messages
@@ -38,12 +39,14 @@ const hashContentPrefix = (body: Record<string, unknown>): string | undefined =>
   const prefix = messages.slice(0, 2).map((m) => {
     const msg = (m ?? {}) as Record<string, unknown>
     const role = typeof msg.role === 'string' ? msg.role : ''
-    let content = '';
-    if (typeof msg.content === 'string') {
-      content = msg.content
-    } else {
-      content = JSON.stringify(msg.content)
-    }
+    // content 字符串原样；字段缺失（undefined）视为空串保持稳定；
+    // null / 多模态数组 / 对象用 JSON.stringify 参与哈希（区分不同内容）
+    const content =
+      typeof msg.content === 'string'
+        ? msg.content
+        : msg.content === undefined
+          ? ''
+          : JSON.stringify(msg.content)
     return [role, content]
   })
 

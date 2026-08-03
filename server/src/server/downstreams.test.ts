@@ -52,11 +52,12 @@ describe('下游清单 DOWNSTREAM_ENDPOINTS', () => {
     }
   })
 
-  it('OpenAI 兼容下游至少包含 /v1/models 与 /v1/chat/completions', () => {
+  it('OpenAI 兼容下游至少包含 /v1/models、/v1/chat/completions 与 /v1/responses', () => {
     const openai = DOWNSTREAM_ENDPOINTS.filter((e) => e.type === 'openai')
     const paths = openai.map((e) => `${e.method} ${e.path}`)
     expect(paths).toContain('GET /v1/models')
     expect(paths).toContain('POST /v1/chat/completions')
+    expect(paths).toContain('POST /v1/responses')
   })
 
   it('Ollama 兼容下游至少包含 /api/tags 与 /api/chat', () => {

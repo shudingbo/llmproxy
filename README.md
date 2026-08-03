@@ -13,12 +13,12 @@ pnpm install
 # 2. Build the admin UI (web)
 pnpm --filter @llmproxy/web build
 
-# 3. Start the server (single port, default http://127.0.0.1:3000)
+# 3. Start the server (single port, default 0.0.0.0:3000; local access via http://127.0.0.1:3000)
 pnpm start
 ```
 
 > `pnpm start` smart-builds: it only builds what's missing (`server/dist` or `web/dist`); with artifacts present it runs `node server/dist/index.js` directly without recompiling the frontend. Force a full rebuild first with `pnpm start:rebuild`; build explicitly with `pnpm build`.
-> Override the port / host with `PORT` / `HOST` env vars, e.g. `PORT=8080 pnpm start`.
+> Override the port / host with `--host` / `--port` flags (they pass through to the server process), e.g. `pnpm start -- --host 0.0.0.0 --port 8080` or `node scripts/start.js --host 0.0.0.0 --port 8080`.
 
 Smoke-test the OpenAI-compatible endpoint (returns an OpenAI-style `choices` payload):
 
@@ -100,7 +100,7 @@ Example:
 
 1. **安装依赖**：`pnpm install`（需要 Node ≥ 18 与 pnpm 9.x，见下文「开发说明」）
 2. **构建管理端**：`pnpm --filter @llmproxy/web build`，或直接执行 `pnpm start`（产物缺失时启动前自动构建 web）
-3. **启动服务**：`pnpm start`，默认监听 `http://127.0.0.1:3000`；用 `PORT` / `HOST` 环境变量覆盖（如 `PORT=8080 pnpm start`）
+3. **启动服务**：`pnpm start`，默认监听 `0.0.0.0:3000`（本机访问 `http://127.0.0.1:3000`）；可用命令行参数覆盖：`pnpm start -- --host 0.0.0.0 --port 8080`（或 `node scripts/start.js --host 0.0.0.0 --port 8080`，`--host=0.0.0.0` / `--port=8080` 等号形式亦可）
 4. **配置文件自动生成**：首次启动会在 `<userHome>/llmproxy/llmproxy.jsonc` 生成一份带注释的示例配置（Windows 为 `C:\Users\<you>\llmproxy\llmproxy.jsonc`，POSIX 为 `$HOME/llmproxy/llmproxy.jsonc`，权限 `0600`）。示例中的 `apiKey` 默认是 `sk-REPLACE_ME`，请替换成真实密钥。改完保存即被热重载，无需重启
 5. **浏览器访问**：打开 `http://127.0.0.1:3000` 进入管理界面（管理端与各 API 共用同一端口）。可用 Quickstart 章节的两个 curl 做冒烟测试
 
@@ -346,6 +346,7 @@ All routes are served on the single port (default `3000`).
 | Endpoint | Supported | Notes |
 | --- | --- | --- |
 | `POST /v1/chat/completions` | ✅ | OpenAI-compatible chat; passthrough to upstream with alias routing; streaming SSE when `stream: true` |
+| `POST /v1/responses` | ✅ | OpenAI Responses API; converted to/from Chat Completions at the gateway boundary; non-streaming returns an `object: "response"` payload, `stream: true` returns a Responses SSE event stream |
 | `GET /v1/models` | ✅ | OpenAI-compatible model list (returns downstream model aliases) |
 | `POST /api/chat` | ✅ | Ollama-compatible chat; request/response converted to/from the OpenAI upstream format; NDJSON streaming |
 | `GET /api/tags` | ✅ | Ollama-compatible model list |
@@ -363,7 +364,7 @@ Limitations: tool calls are stripped from upstream responses on the Ollama path 
 
 ## Architecture
 
-The gateway is a single Node.js/Express process composed of three layers: a **gateway core** (config store + file watcher, model-alias router, round-robin load balancer, session-affinity routing with SQLite persistence, sequential failover, stats counter, log4js request logger dual-written to files and SQLite), **protocol adapters** (OpenAI-compatible and Ollama-compatible downstream routes plus OpenAI-compatible upstream clients, with dedicated converters for OpenAI ↔ Ollama request/response/stream shapes), and an **admin UI** (Vue 3 + Element Plus SPA served from the same port, managing upstreams, aliases, sessions, logs and stats through `/admin/api`). Upstream clients and the router rebuild on config change so edits apply without restart; every request is routed through the ordered candidate list with automatic failover to the next healthy upstream.
+The gateway is a single Node.js/Express process composed of three layers: a **gateway core** (config store + file watcher, model-alias router, round-robin load balancer, session-affinity routing with SQLite persistence, sequential failover, stats counter, log4js request logger dual-written to files and SQLite), **protocol adapters** (OpenAI-compatible and Ollama-compatible downstream routes plus OpenAI-compatible upstream clients, with dedicated converters for OpenAI ↔ Ollama request/response/stream shapes and Responses ↔ Chat Completions conversion at the gateway boundary), and an **admin UI** (Vue 3 + Element Plus SPA served from the same port, managing upstreams, aliases, sessions, logs and stats through `/admin/api`). Upstream clients and the router rebuild on config change so edits apply without restart; every request is routed through the ordered candidate list with automatic failover to the next healthy upstream.
 
 ## Protocol Conversion
 
@@ -444,7 +445,7 @@ The `/v1/chat/completions` endpoint is passthrough: requests go to the upstream 
 
 | Symptom | Cause / Fix |
 | --- | --- |
-| `EADDRINUSE` / port already taken on startup | another process holds `3000` (or `PORT`). Stop it or set `PORT` to a free port |
+| `EADDRINUSE` / port already taken on startup | another process holds `3000` (or the port from `--port` / the `server` config). Stop it or start with `--port <free-port>` |
 | Web UI returns `503 { "error": "admin_ui_not_built" }` | `web/dist` is missing (fresh checkout). Run `pnpm --filter @llmproxy/web build` (or `pnpm start`) |
 | Requests fail with 404 / unknown model | the alias in `model` is not defined in `downstreamModels`; check the config file and the admin UI Models page |
 | Upstream unreachable → 502, then failover | verify `baseUrl` reachability (`POST /admin/api/upstreams/:id/test`), `apiKey`, and per-upstream `timeoutMs` |
@@ -476,8 +477,8 @@ llmproxy/
 │       ├── config/         # schema(zod) / loader(JSONC) / store(原子写+去重) / watcher(防抖)
 │       ├── router/         # index(别名→候选) / load-balancer(轮询) / fallback(顺序回退) / errors
 │       ├── upstream/       # openai.ts：OpenAI 兼容上游客户端（axios 流式 + abort + connectError）
-│       ├── converters/     # OpenAI ↔ Ollama 请求 / 响应 / 流 / 模型列表 4 个转换器
-│       ├── server/         # openai.ts / ollama.ts / admin.ts 三个路由模块 + index.ts 单端口装配
+│       ├── converters/     # OpenAI ↔ Ollama 请求 / 响应 / 流 / 模型列表转换 + Responses ↔ Chat 边界转换
+│       ├── server/         # openai.ts / ollama.ts / admin.ts 三个路由模块 + index.ts 单端口装配（含 listen.ts 监听解析）
 │       ├── logger/         # index.ts（log4js 双写：文件 + SQLite）+ sweep.ts（文件保留期清理）
 │       ├── logstore/       # index.ts：LogStore（SQLite 落库 / 查询 / 清理，logs 表）
 │       └── stats/          # counter.ts：进程内计数器
@@ -504,7 +505,7 @@ llmproxy/
 | `pnpm lint` | 全部工作区 lint（eslint） |
 | `pnpm typecheck` | 全部工作区类型检查（server `tsc --noEmit`、web `vue-tsc --noEmit`） |
 | `pnpm build` | 先 web（`vue-tsc --noEmit && vite build`）后 server（`tsc`） |
-| `pnpm start` | 生产启动：智能构建——`server/dist` / `web/dist` 产物缺失时才构建（server `tsc` / web `vue-tsc --noEmit && vite build`），存在则直接 `node server/dist/index.js`（默认 `127.0.0.1:3000`） |
+| `pnpm start` | 生产启动：智能构建——`server/dist` / `web/dist` 产物缺失时才构建（server `tsc` / web `vue-tsc --noEmit && vite build`），存在则直接 `node server/dist/index.js`（默认 `0.0.0.0:3000`，`--host` / `--port` 原样透传给服务进程） |
 | `pnpm start:rebuild` | 强制 `pnpm build`（server+web 全量）后再启动（等同旧版 `pnpm start` 行为） |
 
 server 包内脚本（`pnpm --filter @llmproxy/server <script>`）：
@@ -553,11 +554,15 @@ server 包内脚本（`pnpm --filter @llmproxy/server <script>`）：
 - `openai-to-ollama-response.ts`：OpenAI 非流式响应 → Ollama 响应（`created` unix 秒 → ISO 8601、token 计数映射、tool_calls 告警丢弃）
 - `openai-to-ollama-stream.ts`：OpenAI SSE 字节流 → Ollama NDJSON 字节流（Transform 流；逐行解析 `data:` 事件，最后一次 usage 生效，末尾补一行 `done: true`；上游传输错误输出一行 `{ error }` 后结束）
 - `openai-to-ollama-models.ts`：OpenAI 模型列表 → Ollama `/api/tags` 结构（模型元数据为固定 stub 值）
+- `responses-types.ts`：OpenAI Responses API 类型定义（网关边界子集：请求 / 响应 / usage）
+- `responses-request.ts`：Responses 请求体 → Chat Completions 请求体（`input`/`instructions` → messages、`max_output_tokens` → `max_tokens`、采样参数白名单透传）
+- `responses-response.ts`：上游 chat 非流式响应 → Responses 响应对象（`object: "response"` + `output` 消息）
+- `responses-stream.ts`：上游 chat SSE 流 → Responses SSE 事件流（response.created → … → response.completed，usage 实时捕获）
 
-数据流（Ollama 路径）：客户端 → `/api/chat` → 转换器（转 OpenAI 请求）→ 上游客户端 → 上游响应 → 转换器（转 Ollama 响应 / NDJSON 流）→ 客户端。OpenAI 路径全程透传，只替换模型名。
+数据流（Ollama 路径）：客户端 → `/api/chat` → 转换器（转 OpenAI 请求）→ 上游客户端 → 上游响应 → 转换器（转 Ollama 响应 / NDJSON 流）→ 客户端。OpenAI 路径 `/v1/chat/completions` 全程透传，只替换模型名；`/v1/responses` 在网关边界做 Responses ↔ Chat 互转。
 
 **server（装配与路由）**
-- `openai.ts`：`/v1/models`（返回下游别名列表）与 `/v1/chat/completions`（非流式 / SSE 流式透传 + 回退）
+- `openai.ts`：`/v1/models`（返回下游别名列表）、`/v1/chat/completions`（非流式 / SSE 流式透传 + 回退）与 `/v1/responses`（Responses 格式，网关边界互转 + 回退）
 - `ollama.ts`：`/api/tags` 与 `/api/chat`（转换 + 回退；`n > 1` 返回 400）
 - `admin.ts`：`/admin/api/*` 全部管理端点（上游 CRUD、连通性测试、模型映射、日志、统计、健康、配置）
 - `index.ts`：`createApp` 单端口装配：`express.json(10mb)` + 请求日志中间件 + 三组路由 + 静态 SPA + 非 API 前缀回退到 `index.html`；`startServer` 完成路径定位、配置装载与监听

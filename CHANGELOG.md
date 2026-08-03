@@ -11,7 +11,9 @@
 - 日志页页码分页（总条数 / 每页 50 / 100 / 200 / 跳页）
 - 日志手动清理：界面选择日期（默认清理 7 天前）删除所选日期之前的 SQLite 记录与日志文件
 - 下行流端点清单：`downstreams` 模块集中维护对外暴露的端点，启动时按 openai / ollama / admin 顺序打印
-- 监听参数解析：新增 `listen` 模块（环境变量 `HOST` / `PORT` > 配置文件 `server` 节 > 缺省值），`llmproxy.jsonc` 新增可选 `server{host,port}` 节
+- 新增 OpenAI Responses API 端点 `POST /v1/responses`：非流式返回 `object=response` + `output` 消息；`stream: true` 返回 SSE 事件流（response.created → in_progress → output_item.added → content_part.added → output_text.delta/done → content_part.done → output_item.done → completed）；网关边界经 `converters/responses-*.ts` 与 Chat Completions 互转，复用负载均衡 / 顺序回退 / 会话亲和
+- 新增命令行 `--host` / `--port` 监听参数（支持 `--host=0.0.0.0` / `--port=8080` 等号形式）：优先级命令行 > 配置文件 `server` 节 > 缺省 `0.0.0.0:3000`；`scripts/start.js` 原样透传，根 `package.json` 新增 `"main": "scripts/start.js"`
+- 监听参数解析：新增 `listen` 模块（命令行 `--host` / `--port` > 配置文件 `server` 节 > 缺省值 `0.0.0.0:3000`），`llmproxy.jsonc` 新增可选 `server{host,port}` 节
 - 日志 stdout 镜像输出，便于 docker / tmux 等场景直接查看
 - `/admin/api/health` 暴露 downstreams 与 host / port / baseUrl / listenSource；Dashboard 新增 Downstream Endpoints 区块与 Base URL 徽标
 - 新增 Ollama `/api/version` 端点（Open WebUI 连接探测）
@@ -28,6 +30,7 @@
 - 日志记录方式重构：pino 迁移至 log4js（app 文本 / api JSON 按日轮转 + 文件保留期清理）
 - 日志查询从文件反向读取改为 SQLite（删除 `readLogsTail`）；DB 日志清理规则与文件一致（保留 5 天）
 - 网关默认监听 `0.0.0.0`（此前 `127.0.0.1` 导致外部无法访问）
+- 移除环境变量 `HOST` / `PORT` 对监听地址的支持（改用命令行 `--host` / `--port`）
 - 移除每 60 秒的 stats-snapshot 定时日志
 
 ### 安全

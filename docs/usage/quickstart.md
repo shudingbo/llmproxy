@@ -35,6 +35,12 @@ pnpm dev
 
 开发期访问管理界面走 `http://127.0.0.1:5175`；直接调 `/v1`、`/api` 接口走 `http://127.0.0.1:3000`。
 
+开发模式下如需指定监听地址 / 端口，直接跑 server 包并透传参数（`tsx watch` 会把 `--` 后的参数原样传给被监听脚本）：
+
+```bash
+pnpm --filter @llmproxy/server dev -- --host 0.0.0.0 --port 8080
+```
+
 ### 生产模式
 
 ```bash
@@ -50,6 +56,14 @@ pnpm start   # 启动服务
 - `pnpm start --check`：只检查产物存在性并打印结果，不构建不启动（可加 `--rebuild` 一起看）。
 
 > 首次使用直接执行 `pnpm start` 即可，它会自动补建缺失的产物。
+
+指定监听地址 / 端口：`--host` / `--port` 会被 `start.js` 原样透传给服务进程（也支持 `--host=0.0.0.0` / `--port=8080` 等号形式）：
+
+```bash
+pnpm start -- --host 0.0.0.0 --port 8080
+# 或直接跑服务进程
+node scripts/start.js --host 0.0.0.0 --port 8080
+```
 
 ## 配置文件
 
@@ -92,23 +106,25 @@ pnpm start   # 启动服务
 | 地址 | 用途 |
 | --- | --- |
 | `http://<host>:3000/` | 管理界面（左侧导航 6 个页面） |
-| `http://<host>:3000/v1` | OpenAI 兼容接口（`/v1/models`、`/v1/chat/completions`） |
+| `http://<host>:3000/v1` | OpenAI 兼容接口（`/v1/models`、`/v1/chat/completions`、`/v1/responses`） |
 | `http://<host>:3000/api` | Ollama 兼容接口（`/api/tags`、`/api/chat`、`/api/version`） |
 | `http://<host>:3000/admin/api` | 管理 REST 接口（无鉴权，请在可信网络内使用） |
 
 **监听地址**（`server/src/server/listen.ts`）按优先级取：
 
-1. 环境变量 `HOST` / `PORT`
+1. 命令行参数 `--host` / `--port`（最高优先级；host/port 相互独立可选，未指定的一侧回落下一优先级；也支持 `--host=0.0.0.0` / `--port=8080` 等号形式）
 2. 配置文件 `server` 节（`host` / `port`）
 3. 缺省值 `0.0.0.0:3000`（即监听所有网卡，局域网内其他机器可通过本机 IP 访问）
 
+> 已不再支持环境变量 `HOST` / `PORT` 覆盖监听地址（改用命令行 `--host` / `--port`）。
+
 ```bash
-# 用环境变量覆盖端口 / 监听地址
-PORT=8080 pnpm start
-HOST=127.0.0.1 pnpm start
+# 用命令行参数覆盖端口 / 监听地址（start.js 会把 --host/--port 原样透传给服务进程）
+pnpm start -- --host 0.0.0.0 --port 8080
+node scripts/start.js --host 127.0.0.1 --port 8080
 ```
 
-> 注意：`server` 节的 host/port 在进程启动时绑定，修改后必须重启进程才生效；`routing`、`upstreams` 等其余配置支持热重载。
+> 注意：`server` 节的 host/port 与命令行参数都在进程启动时绑定，修改后必须重启进程才生效；`routing`、`upstreams` 等其余配置支持热重载。
 
 ## 冒烟测试
 
@@ -138,7 +154,7 @@ curl http://127.0.0.1:3000/api/chat \
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| 启动报 `EADDRINUSE` | 端口被占用。停掉占用进程，或 `PORT=<新端口> pnpm start` |
+| 启动报 `EADDRINUSE` | 端口被占用。停掉占用进程，或换端口启动：`pnpm start -- --port <新端口>` |
 | 管理界面返回 `503 {"error":"admin_ui_not_built"}` | `web/dist` 缺失。执行 `pnpm --filter @llmproxy/web build`，或直接 `pnpm start` 自动补建 |
 | 请求返回 404 / unknown model | `model` 里的别名未在 `downstreamModels` 定义，检查配置文件或管理端 Models 页 |
 | 上游不可达返回 502 | 在管理端 Upstreams 页点「测试」检查 `baseUrl` 连通性、`apiKey`、`timeoutMs` |

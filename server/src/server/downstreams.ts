@@ -16,8 +16,9 @@ export interface DownstreamEndpoint {
 // 静态清单：与 server/src/server/openai.ts / ollama.ts / admin.ts 的实际注册保持一致
 export const DOWNSTREAM_ENDPOINTS: ReadonlyArray<DownstreamEndpoint> = [
   // OpenAI 兼容下游
-  { type: 'openai', method: 'GET', path: '/v1/models', summary: '聚合全部上游的模型列表（60s 缓存）' },
+  { type: 'openai', method: 'GET', path: '/v1/models', summary: '返回下游模型别名列表' },
   { type: 'openai', method: 'POST', path: '/v1/chat/completions', summary: '聊天补全，支持非流式与流式（SSE）' },
+  { type: 'openai', method: 'POST', path: '/v1/responses', summary: 'Responses API，支持非流式与流式（SSE）' },
   // Ollama 兼容下游
   { type: 'ollama', method: 'GET', path: '/api/tags', summary: '聚合后的 Ollama 模型列表' },
   { type: 'ollama', method: 'POST', path: '/api/chat', summary: 'Ollama 聊天接口（NDJSON 流 / JSON 非流）' },

@@ -40,7 +40,7 @@
 | `routing.sessionAffinity.cleanupMaxAgeMs` | number | 否 | `604800000`（1 周） | 会话保留期（毫秒）；`0` = 永不过期 |
 | `routing.sessionAffinity.cleanupIntervalMs` | number | 否 | `3600000`（1 小时） | 自动清理周期（毫秒）；`0` = 关闭自动清理调度 |
 
-> 默认值说明：Zod 的 `.default()` / `.prefault()` 在解析时补齐缺省字段，因此 `upstreams[].timeoutMs`、`upstreams[].disabled`、`routing` 各键均可省略。`server` / `routing` 整节省略时按缺省值生效（`127.0.0.1:3000`、会话亲和开启）。
+> 默认值说明：Zod 的 `.default()` / `.prefault()` 在解析时补齐缺省字段，因此 `upstreams[].timeoutMs`、`upstreams[].disabled`、`routing` 各键均可省略。`routing` 整节省略时按缺省值生效（会话亲和开启）；`server` 整节省略时进程按缺省监听 `0.0.0.0:3000`（`server/src/server/listen.ts` 的 `DEFAULT_HOST` / `DEFAULT_PORT`）。
 
 ## 完整配置示例
 
@@ -48,7 +48,7 @@
 
 ```jsonc
 {
-  // ---- server：下行流监听（可选；缺省 127.0.0.1:3000）----
+  // ---- server：下行流监听（可选；节内缺省 127.0.0.1:3000，整节省略时进程默认 0.0.0.0:3000）----
   // 注意：socket 在进程启动时绑定，修改本节必须重启进程才能生效
   "server": {
     "host": "0.0.0.0",   // 监听地址；0.0.0.0 表示对外网卡均可访问
@@ -130,8 +130,9 @@
 
 ### server（监听，可选）
 
-- **`host`** / **`port`**：控制整个进程对外暴露的地址与端口，缺省 `127.0.0.1:3000`。`host` 设为 `0.0.0.0` 表示监听所有网卡，可被外部访问；生产部署时注意防火墙与鉴权（管理端 `/admin/api` 无内置鉴权，请在可信网络内使用）。
-- **需要重启**：socket 在进程启动时绑定，**修改本节的变更不会通过文件监听即时应用**（避免端口漂移 / 重复绑定），必须重启进程。也可以用 `PORT` / `HOST` 环境变量覆盖（例如 `PORT=8080 pnpm start`）。
+- **`host`** / **`port`**：控制整个进程对外暴露的地址与端口。节内缺省 `127.0.0.1:3000`（schema 缺省值）；整节省略时进程缺省监听 `0.0.0.0:3000`（`listen.ts` 的 `DEFAULT_HOST` / `DEFAULT_PORT`）。`host` 设为 `0.0.0.0` 表示监听所有网卡，可被外部访问；生产部署时注意防火墙与鉴权（管理端 `/admin/api` 无内置鉴权，请在可信网络内使用）。
+- **监听优先级**：命令行 `--host` / `--port` > `server` 节 > 缺省值。命令行参数最高优先级，host/port 相互独立可选，未指定的一侧回落下一优先级；也支持 `--host=0.0.0.0` / `--port=8080` 等号形式。**不再支持环境变量 `HOST` / `PORT` 覆盖监听地址**（0.2.0 起移除）。
+- **需要重启**：socket 在进程启动时绑定，**修改本节或命令行参数的变更不会通过文件监听即时应用**（避免端口漂移 / 重复绑定），必须重启进程。例如 `pnpm start -- --host 0.0.0.0 --port 8080` 或 `node scripts/start.js --host 0.0.0.0 --port 8080`。
 
 ### routing（路由，可选）
 
@@ -154,4 +155,4 @@
 | 请求返回 404 / 未知模型 | `model` 里填的是别名吗？检查 `downstreamModels` 中是否存在该别名 |
 | 改了配置"没反应" | 检查文件是否为合法 JSONC、监听重载是否成功（`GET /admin/api/config/reload-error`） |
 | 上游不可达 → 502 后回退 | 用 `POST /admin/api/upstreams/:id/test` 验证 `baseUrl` 可达性、`apiKey`、`timeoutMs` |
-| 改了 host/port 不生效 | `server` 监听配置需重启进程（socket 启动时绑定） |
+| 改了 host/port 不生效 | `server` 节或命令行 `--host` / `--port` 都在进程启动时绑定，需重启进程 |

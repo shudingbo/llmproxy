@@ -4,11 +4,11 @@
 
 ## 1. 定位
 
-llmproxy 是一个**单端口 LLM 网关**：聚合多个 OpenAI 兼容上游（upstream），对外暴露三类接口，全部监听在同一个端口（`PORT`，默认 3000）：
+llmproxy 是一个**单端口 LLM 网关**：聚合多个 OpenAI 兼容上游（upstream），对外暴露三类接口，全部监听在同一个端口（默认 `0.0.0.0:3000`，本机访问 `http://127.0.0.1:3000`）：
 
 | 接口 | 前缀 | 说明 |
 | --- | --- | --- |
-| OpenAI 兼容 | `/v1` | `GET /v1/models`（聚合模型列表，60s 缓存）、`POST /v1/chat/completions`（非流式 + SSE 流式） |
+| OpenAI 兼容 | `/v1` | `GET /v1/models`（聚合模型列表，60s 缓存）、`POST /v1/chat/completions`（非流式 + SSE 流式）、`POST /v1/responses`（Responses API，非流式 + SSE 流式） |
 | Ollama 兼容 | `/api` | `GET /api/tags`、`POST /api/chat`（NDJSON 流 / JSON 非流）、`POST /api/version` |
 | 管理端 | `/admin/api` | 上游 CRUD / 连通性测试、下游模型映射、日志查询与清理、会话粘附管理、统计、健康检查 |
 | 静态 SPA | `/` 其余路径 | Vue 3 + Element Plus 前端产物（`web/dist`），非 API 前缀请求回退到 `index.html` |
@@ -26,6 +26,8 @@ express 应用（单端口）
 
 SPA 产物缺失（全新检出未先 `pnpm --filter @llmproxy/web build`）时，回退路由返回 `503 { error: 'admin_ui_not_built' }` 而非抛 ENOENT。
 
+监听地址解析优先级（`server/src/server/listen.ts`）：命令行 `--host` / `--port` > 配置文件 `server` 节 > 缺省值 `0.0.0.0:3000`；host/port 相互独立可选，未指定的一侧回落下一优先级；**不再支持环境变量 `HOST` / `PORT`**。socket 在进程启动时绑定，改动需重启进程生效。
+
 ## 2. 三层结构
 
 ```mermaid
@@ -37,10 +39,10 @@ flowchart TB
     end
 
     subgraph 协议适配层[协议适配层 server/src/server]
-        OAI[openai.ts<br/>/v1/models /v1/chat/completions]
+        OAI[openai.ts<br/>/v1/models /v1/chat/completions /v1/responses]
         OLL[ollama.ts<br/>/api/tags /api/chat]
         ADM[admin.ts<br/>/admin/api/*]
-        CV[converters/<br/>OpenAI → Ollama 请求/响应/流转换]
+        CV[converters/<br/>OpenAI ↔ Ollama + Responses ↔ Chat 转换]
     end
 
     subgraph gateway core[gateway core server/src]
@@ -85,8 +87,9 @@ flowchart TB
 
 ### 2.2 协议适配层（`server/src/server`）
 
-- `openai.ts`：OpenAI 兼容下游，请求体原样透传，非流式 / 流式（SSE）+ 顺序回退，每次尝试计数。
+- `openai.ts`：OpenAI 兼容下游，`/v1/chat/completions` 请求体原样透传；`/v1/responses` 在网关边界做 Responses ↔ Chat 互转（`converters/responses-*.ts`）；非流式 / 流式（SSE）+ 顺序回退，每次尝试计数。
 - `ollama.ts`：Ollama 兼容下游，通过 `converters/openai-to-ollama-*.ts` 把 OpenAI 上游的请求 / 响应 / SSE 流转成 Ollama 形状（`/api/show`、`/api/generate` 等明确不实现）。
+- `converters/responses-*.ts`：Responses ↔ Chat Completions 边界转换（`responses-types` 类型、`responses-request` 请求、`responses-response` 非流式响应、`responses-stream` SSE 事件流），供 `openai.ts` 的 `/v1/responses` 使用。
 - `admin.ts`：管理端全部端点（无鉴权，由部署层防护；无 CORS，开发期走 web/vite 代理）。
 - `downstreams.ts`：`DOWNSTREAM_ENDPOINTS` 单一真相源——启动日志与 `/admin/api/health` 共用，前端 Dashboard 自动跟随。
 - `index.ts`：装配层（见下）。
@@ -168,7 +171,7 @@ flowchart LR
 
 - **ConfigStore**（`config/store.ts`）：持有唯一内存态 `current`；`set()` 先 `fastDeepEqual` 去重（防"写盘 → 监听 → 再 set"自环），再 Zod 校验，然后写 `${path}.tmp`（0600）原子重命名落盘，最后更新内存态并通知订阅者。`WatchSource` 区分 `'admin' | 'watch' | 'bootstrap'`。
 - **watcher**（`config/watcher.ts`）：chokidar 监听配置文件，变更即重载；重载错误记入 `getRecentReloadError()`，启动时只告警不阻塞。
-- **生效方式**：上游客户端映射由订阅重建（新增 / 删除上游即时生效）；下游处理器按请求 `new Router(store.get())` 重建（无过期引用）；`server.host/port` 属进程级（socket 启动时绑定，改后需重启）；会话亲和开关在启动时确定，不做热更新重选。
+- **生效方式**：上游客户端映射由订阅重建（新增 / 删除上游即时生效）；下游处理器按请求 `new Router(store.get())` 重建（无过期引用）；`server.host/port` 与命令行 `--host/--port` 属进程级（socket 启动时绑定，改后需重启）；会话亲和开关在启动时确定，不做热更新重选。
 
 ## 6. 数据目录
 
@@ -192,7 +195,7 @@ server/src/
 ├── logstore/         日志 SQLite 存储（logs 表：insert/query/cleanup/deleteBefore）
 ├── logger/           双类别 log4js · 双写 Proxy · 请求日志中间件 · 保留期清理（sweep）
 ├── upstream/         OpenAI 兼容上游客户端（axios，非流式 + SSE）
-├── converters/       OpenAI → Ollama 请求 / 响应 / 流 / 模型列表转换
+├── converters/       OpenAI ↔ Ollama 转换 + Responses ↔ Chat 边界转换
 ├── stats/            纯内存统计计数器
 └── paths.ts          数据目录 / 日志路径定位
 

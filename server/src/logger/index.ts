@@ -11,6 +11,7 @@ import { join } from 'node:path'
 import type { NextFunction, Request, Response } from 'express'
 import { nanoid } from 'nanoid'
 import { getDataDir, getLog4jsConfigPath, getLogDir } from '../paths.js'
+import type { LogEntry, LogStore } from '../logstore/index.js'
 import { initLogRetention, stopLogRetention, sweepOldLogs } from './sweep.js'
 
 // 敏感请求头：任何情况下都不允许出现在日志里（匹配时忽略大小写）
@@ -136,9 +137,123 @@ export function configureLogging(): void {
 // 缓存可让测试 vi.spyOn(getLogger('app'), 'info') 真正命中生产代码后续调用
 const loggerCache = new Map<string, Logger>()
 
+// ---- SQLite 双写（可选装配，不依赖 log4js 自定义 appender）----
+// 装配层通过 setLogStore 注入 LogStore；未注入时 getLogger 行为与原来完全一致（现有调用零感知）
+let logStore: LogStore | undefined
+
+// 一次性故障标记：api 日志高频，DB 故障时避免每行都刷屏
+let sqliteWriteFailed = false
+
+const LOG_METHODS = new Set(['trace', 'debug', 'info', 'warn', 'error', 'fatal'])
+
+// 包装缓存与原始 logger 缓存分离，setLogStore 时整体失效重建
+const wrappedLoggerCache = new Map<string, Logger>()
+
+/**
+ * 注入（或解除）LogStore：设置后 getLogger/getApiLogger 返回双写包装；传 undefined 恢复纯文件行为。
+ */
+export function setLogStore(store: LogStore | undefined): void {
+  logStore = store
+  wrappedLoggerCache.clear()
+  if (store !== undefined) {
+    sqliteWriteFailed = false
+  }
+}
+
+// 深度脱敏：剔除对象树中任意层级的 authorization / x-api-key（大小写不敏感），其余原样保留
+function sanitizeRawValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeRawValue(item))
+  }
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (SENSITIVE_HEADERS.has(key.toLowerCase())) {
+        continue
+      }
+      out[key] = sanitizeRawValue(item)
+    }
+    return out
+  }
+  return value
+}
+
+/**
+ * 解析日志参数为 LogEntry（合并规则与 installPinoJsonLayout 一致）。
+ */
+function extractLogEntry(name: string, method: string, args: unknown[]): LogEntry {
+  const type = name === 'api' ? 'api' : 'app'
+  const entry: LogEntry = {
+    type,
+    level: LEVEL_NUMBERS[method.toUpperCase()] ?? 30,
+    time: Date.now(),
+    // app 类别：category 列默认记 logger 名（与文本格式 [app] 对应），对象内 category 字段可覆盖
+    ...(type === 'app' ? { category: name } : {}),
+  }
+  const msgParts: string[] = []
+  const raw: Record<string, unknown> = {}
+  for (const piece of args) {
+    if (piece instanceof Error) {
+      raw.err = { name: piece.name, message: piece.message, stack: piece.stack }
+      msgParts.push(`err=${piece.message}`)
+    } else if (typeof piece === 'object' && piece !== null && !Array.isArray(piece)) {
+      const obj = piece as Record<string, unknown>
+      if (typeof obj.requestId === 'string') entry.requestId = obj.requestId
+      if (typeof obj.method === 'string') entry.method = obj.method
+      if (typeof obj.url === 'string') entry.url = obj.url
+      if (typeof obj.status === 'number') entry.status = obj.status
+      if (typeof obj.durationMs === 'number') entry.durationMs = obj.durationMs
+      if (typeof obj.category === 'string') entry.category = obj.category
+      // 整对象并入 raw（无损，含 headers 等）；敏感键由 sanitizeRawValue 兜底剔除
+      Object.assign(raw, obj)
+    } else if (typeof piece === 'string') {
+      msgParts.push(piece)
+    } else if (piece !== undefined && piece !== null) {
+      msgParts.push(String(piece))
+    }
+  }
+  const msg = msgParts.join(' ').trim()
+  if (msg !== '') {
+    entry.msg = msg
+  }
+  if (Object.keys(raw).length > 0) {
+    entry.raw = JSON.stringify(sanitizeRawValue(raw))
+  }
+  return entry
+}
+
+// 双写包装：拦截日志方法先写 SQLite（try-catch 隔离）再写文件；其余属性/方法原样透传
+function wrapLoggerWithStore(l: Logger, name: string): Logger {
+  return new Proxy(l, {
+    get(target: Logger, prop: PropertyKey, receiver: unknown): unknown {
+      const value = Reflect.get(target, prop, receiver)
+      if (typeof prop === 'string' && LOG_METHODS.has(prop) && typeof value === 'function') {
+        return (...args: unknown[]): unknown => {
+          try {
+            logStore?.insert(extractLogEntry(name, prop, args))
+          } catch (err) {
+            // 错误隔离：DB 失败绝不影响文件日志；提示走原始 logger 的 warn（非包装），避免死循环
+            if (!sqliteWriteFailed) {
+              sqliteWriteFailed = true
+              try {
+                target.warn.call(target, '日志写入 SQLite 失败', err)
+              } catch {
+                // 提示失败也吞掉：日志调用对业务永不抛错
+              }
+            }
+          }
+          return value.apply(target, args)
+        }
+      }
+      return value
+    },
+  })
+}
+
 /**
  * 通用 logger：未指定 name 时落到 'app' category（与 default 等价）。
  * 同一 name 多次调用返回同一 Logger 实例（按 category 缓存）。
+ * 已装配 LogStore 时返回双写包装（按 name 缓存）；未装配时原样返回，现有调用零感知。
  */
 export function getLogger(name?: string): Logger {
   const key = name ?? 'app'
@@ -147,7 +262,15 @@ export function getLogger(name?: string): Logger {
     l = log4js.getLogger(key)
     loggerCache.set(key, l)
   }
-  return l
+  if (logStore === undefined) {
+    return l
+  }
+  let wrapped = wrappedLoggerCache.get(key)
+  if (wrapped === undefined) {
+    wrapped = wrapLoggerWithStore(l, key)
+    wrappedLoggerCache.set(key, wrapped)
+  }
+  return wrapped
 }
 
 /**

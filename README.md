@@ -106,7 +106,7 @@ Example:
 
 ### 管理界面 Management UI
 
-管理端是 Vue 3 + Element Plus 单页应用，挂在 `/` 路径。左侧导航共 6 个页面，所有操作都通过 `/admin/api` 接口并立即生效（配置类操作落到配置文件，会话粘附落到 SQLite）。
+管理端是 Vue 3 + Element Plus 单页应用，挂在 `/` 路径。左侧导航共 6 个页面，所有操作都通过 `/admin/api` 接口并立即生效（配置类操作落到配置文件，会话粘附与日志查询落到 SQLite）。
 
 #### Dashboard
 
@@ -144,13 +144,16 @@ Example:
 
 #### Logs（日志）
 
-顶部三个筛选条件，变更后防抖 300ms 自动拉取，页面每 5 秒自动刷新：
+顶部四个筛选条件，变更后防抖 300ms 自动拉取，页面每 5 秒自动刷新（浏览历史日志时暂停自动刷新）：
 
+- **类型**：App 日志 / API 日志 切换（对应 `type=app|api`）
 - **日期**：必填，默认今天，格式 `YYYY-MM-DD`
 - **级别**：`all` / trace / debug / info / warn / error / fatal。**级别是阈值语义**：选 `info` 显示 info 及以上（info/warn/error/fatal）；选 `all` 时前端显式传 `trace` 以包含全部级别（后端缺省阈值是 info）
-- **关键词**：对消息内容做子串匹配，**大小写敏感**
+- **关键词**：对消息内容做子串匹配，**大小写敏感**（后端同时匹配 msg / url / request_id / category）
 
-表格列：Time、Level（彩色标签）、Request ID（前 8 位）、Message（请求完成行会附带 `method url -> status`）。后端单次最多返回 1000 条，前端按每页 100 条内存分页。
+表格列：Time、Level（彩色标签）、App 日志显示 Category、API 日志显示 Request ID（前 8 位）、Message（请求完成行会附带 `method url -> status`）。
+
+查询**直接读 SQLite**（`llmproxy.db` 的 `logs` 表，见「日志存储」），不再反向读取日志文件。分页由后端完成：`offset` / `limit` 游标分页（limit 默认 100、上限 500），按时间倒序（最新在前），返回 `hasMore` 标记是否还有更早记录；前端「加载更早」把 offset 后移翻页，「回到最新」重置 offset=0。
 
 #### Stats（统计）
 
@@ -297,7 +300,7 @@ curl -N http://127.0.0.1:3000/api/chat \
 | POST | `/admin/api/upstreams/:id/test` | 连通性测试（可用 body 覆盖 baseUrl / apiKey） |
 | GET | `/admin/api/downstream-models` | 查看别名 → 候选映射 |
 | PUT | `/admin/api/downstream-models` | 全量替换映射（每个别名至少 1 个候选） |
-| GET | `/admin/api/logs` | 日志查询：`?date=YYYY-MM-DD&level=info&keyword=xx` |
+| GET | `/admin/api/logs` | 日志查询（走 SQLite）：`?type=app|api&date=YYYY-MM-DD&level=info&keyword=xx&offset=0&limit=100`，返回 `lines` / `hasMore` |
 | GET | `/admin/api/stats` | 统计：`since` / `totals` / `perUpstream` |
 | GET | `/admin/api/config` | 当前生效配置（apiKey 已掩码） |
 | GET | `/admin/api/config/reload-error` | 最近一次配置重载错误（无则 `null`） |
@@ -328,8 +331,8 @@ curl -X DELETE http://127.0.0.1:3000/admin/api/upstreams/deepseek
 # 连通性测试
 curl -X POST http://127.0.0.1:3000/admin/api/upstreams/openai-main/test
 
-# 查询日志（阈值 info，关键词 "error"）
-curl 'http://127.0.0.1:3000/admin/api/logs?date=2026-08-02&level=info&keyword=error'
+# 查询日志（走 SQLite；type 区分 app/api，阈值 info，关键词 "error"）
+curl 'http://127.0.0.1:3000/admin/api/logs?type=app&date=2026-08-02&level=info&keyword=error'
 
 # 统计与重载错误
 curl http://127.0.0.1:3000/admin/api/stats
@@ -351,7 +354,7 @@ All routes are served on the single port (default `3000`).
 | `GET /admin/api/stats` | ✅ | per-alias attempt counters (60s snapshot) |
 | `GET /admin/api/upstreams` · `POST` · `PUT /:id` · `DELETE /:id` · `POST /:id/test` | ✅ | upstream CRUD + connectivity test |
 | `GET /admin/api/downstream-models` · `PUT` | ✅ | alias/candidate management |
-| `GET /admin/api/logs` | ✅ | log lines with level/time/keyword filters |
+| `GET /admin/api/logs` | ✅ | log lines served from SQLite (type/level/time/keyword filters, offset/limit pagination, `hasMore`) |
 | `GET /admin/api/config` · `GET /admin/api/config/reload-error` | ✅ | config inspection + last reload error |
 | `GET /admin/api/sessions` · `DELETE /:sessionKey` · `DELETE` · `POST /cleanup` | ✅ | session-affinity mapping: list, unbind, clear-all, cleanup |
 | `/` (web UI) | ✅ | built admin SPA (requires `web/dist`, otherwise `503`) |
@@ -360,7 +363,7 @@ Limitations: tool calls are stripped from upstream responses on the Ollama path 
 
 ## Architecture
 
-The gateway is a single Node.js/Express process composed of three layers: a **gateway core** (config store + file watcher, model-alias router, round-robin load balancer, session-affinity routing with SQLite persistence, sequential failover, stats counter, pino request logger), **protocol adapters** (OpenAI-compatible and Ollama-compatible downstream routes plus OpenAI-compatible upstream clients, with dedicated converters for OpenAI ↔ Ollama request/response/stream shapes), and an **admin UI** (Vue 3 + Element Plus SPA served from the same port, managing upstreams, aliases, sessions, logs and stats through `/admin/api`). Upstream clients and the router rebuild on config change so edits apply without restart; every request is routed through the ordered candidate list with automatic failover to the next healthy upstream.
+The gateway is a single Node.js/Express process composed of three layers: a **gateway core** (config store + file watcher, model-alias router, round-robin load balancer, session-affinity routing with SQLite persistence, sequential failover, stats counter, log4js request logger dual-written to files and SQLite), **protocol adapters** (OpenAI-compatible and Ollama-compatible downstream routes plus OpenAI-compatible upstream clients, with dedicated converters for OpenAI ↔ Ollama request/response/stream shapes), and an **admin UI** (Vue 3 + Element Plus SPA served from the same port, managing upstreams, aliases, sessions, logs and stats through `/admin/api`). Upstream clients and the router rebuild on config change so edits apply without restart; every request is routed through the ordered candidate list with automatic failover to the next healthy upstream.
 
 ## Protocol Conversion
 
@@ -412,16 +415,18 @@ The `/v1/chat/completions` endpoint is passthrough: requests go to the upstream 
 
 ## Logging
 
-- **Path**: `<userHome>/llmproxy/logs/app-YYYY-MM-DD.log` (e.g. `C:\Users\<you>\llmproxy\logs\app-2026-08-02.log`)
-- **Format**: pino JSON lines; each request gets a `requestId`, with method / URL / status / duration recorded on completion
-- **Rotation**: one file per local calendar day (daily rotation)
-- **Retention**: files older than 5 days are swept automatically (checked on startup and by a daily timer; see `server/src/logger/sweep.ts`)
+日志**双写**：每条约目同时写入按日轮转的日志文件与 SQLite，两条链路互相独立（DB 写入失败只降级、绝不影响业务与文件日志）：
 
-Server logs go to the file, not stdout — check the daily log under `logs/` when troubleshooting startup (e.g. the "ready on" message).
+- **文件**：`<userHome>/llmproxy/logs/app-YYYY-MM-DD.log`（文本格式）与 `api-YYYY-MM-DD.log`（JSON 行格式，兼容原 pino 契约），按本地日历日轮转（log4js dateFile）。每个请求带 `requestId`，完成后记录 method / URL / status / duration
+- **SQLite**：`<userHome>/llmproxy/llmproxy.db` 的 `logs` 表（与 `sessions` 表共存于同一 DB 文件）。写入走统一包装：`getLogger()` 与 API 请求日志经 `setLogStore` 注入的双写包装自动落库，业务代码零改动
+- **表结构**：`logs` 表（id / type / level / time / msg / category / request_id / method / url / status / duration_ms / raw）；`raw` 列保存完整原始 JSON（含 headers，已脱敏：`authorization` / `x-api-key` 永不落库，任意嵌套层级剔除）
+- **保留期**：文件与 DB 完全一致。文件按 mtime 清理超过 5 天的 `app-*.log` / `api-*.log`；DB 执行 `DELETE FROM logs WHERE time < now - 5天`。两者均在启动时清理一次 + 每 6 小时清理一次（文件见 `server/src/logger/sweep.ts`，DB 见 `server/src/logstore/index.ts`，调度装配见 `server/src/server/index.ts`）
+
+服务日志写文件而非 stdout，排查启动问题时看 `logs/` 下的当日日志（如 "ready on" 消息）；管理端日志查询走 SQLite（见「管理界面 → Logs」），不依赖日志文件。
 
 ## API Key Behavior
 
-1. **MUST NOT** be logged — api keys never appear in request/response logs (pino `redact` also censors them as defense in depth)
+1. **MUST NOT** be logged: api keys never appear in request/response logs (the file side filters the sensitive headers; the SQLite side strips `authorization` / `x-api-key` at any nesting depth as defense in depth)
 2. **MUST NOT** be forwarded from the request — the gateway never reads a client-supplied `Authorization` header to reach upstreams; upstream auth always comes from the configured `apiKey`
 3. **MUST NOT** be shown in cleartext in the admin UI — the API returns a masked value (e.g. `sk-****`), and an empty key on edit means "keep the existing one"
 4. **MUST NOT** be echoed back — no API response, error body, or admin endpoint echoes the stored key
@@ -433,7 +438,7 @@ Server logs go to the file, not stdout — check the daily log under `logs/` whe
 
 - **Open WebUI 需开启** `ENABLE_FORWARD_USER_INFO_HEADERS=true`（环境变量），否则 Open WebUI 不会发送 `X-OpenWebUI-Chat-Id` header，只能走内容前缀哈希兜底（仍可用，只是亲和精度略低）
 - Open WebUI 的 header 名可自定义：`FORWARD_SESSION_INFO_HEADER_CHAT_ID`（默认 `X-OpenWebUI-Chat-Id`）
-- **SQLite 依赖**：会话粘附持久化使用 better-sqlite3（Node 14+ 兼容）；DB 文件与配置文件同目录 `<userHome>/llmproxy/llmproxy.db`
+- **SQLite 依赖**：better-sqlite3（Node 14+ 兼容）。DB 文件与配置文件同目录 `<userHome>/llmproxy/llmproxy.db`，内含 `sessions`（会话粘附）与 `logs`（日志双写）两张表；WAL 模式，多连接并发读写互不阻塞
 
 ## Troubleshooting
 
@@ -445,7 +450,7 @@ Server logs go to the file, not stdout — check the daily log under `logs/` whe
 | Upstream unreachable → 502, then failover | verify `baseUrl` reachability (`POST /admin/api/upstreams/:id/test`), `apiKey`, and per-upstream `timeoutMs` |
 | Config edit "does nothing" | check `<userHome>/llmproxy/llmproxy.jsonc` is valid JSONC and the watcher reload succeeded (see `GET /admin/api/config/reload-error`) |
 | `GET /api/tags` or `/v1/models` stale | the model list returns downstream aliases directly from config (no caching); check the config file to ensure expected aliases are present |
-| Logs not on stdout | expected — logs are written to `<userHome>/llmproxy/logs/app-YYYY-MM-DD.log` |
+| Logs not on stdout | expected: logs are written to `<userHome>/llmproxy/logs/app-YYYY-MM-DD.log` and dual-written to SQLite (admin queries read the DB) |
 | Open WebUI 会话未粘附到同一上游 | 确认已设置 `ENABLE_FORWARD_USER_INFO_HEADERS=true` 并重启 Open WebUI（见「部署注意事项」）；未开启时仅内容前缀哈希生效 |
 
 ## Development 开发说明
@@ -473,7 +478,8 @@ llmproxy/
 │       ├── upstream/       # openai.ts：OpenAI 兼容上游客户端（axios 流式 + abort + connectError）
 │       ├── converters/     # OpenAI ↔ Ollama 请求 / 响应 / 流 / 模型列表 4 个转换器
 │       ├── server/         # openai.ts / ollama.ts / admin.ts 三个路由模块 + index.ts 单端口装配
-│       ├── logger/         # index.ts（pino 单例）+ sweep.ts（保留期清理）
+│       ├── logger/         # index.ts（log4js 双写：文件 + SQLite）+ sweep.ts（文件保留期清理）
+│       ├── logstore/       # index.ts：LogStore（SQLite 落库 / 查询 / 清理，logs 表）
 │       └── stats/          # counter.ts：进程内计数器
 └── web/                    # @llmproxy/web：Vue 3 + Element Plus 管理端 SPA
     ├── package.json
@@ -556,9 +562,15 @@ server 包内脚本（`pnpm --filter @llmproxy/server <script>`）：
 - `index.ts`：`createApp` 单端口装配：`express.json(10mb)` + 请求日志中间件 + 三组路由 + 静态 SPA + 非 API 前缀回退到 `index.html`；`startServer` 完成路径定位、配置装载与监听
 
 **logger（日志）**
-- pino 单例，按本地日期分文件（`app-YYYY-MM-DD.log`），写日志前检查日期翻转并自动切换目标流
-- 敏感头脱敏：`authorization` / `x-api-key` 在记录请求头时过滤，pino `redact` 兜底
-- `sweep.ts`：超过 5 天的 `app-*.log` 在启动时与每 6 小时自动清理（按 mtime 判定）
+- log4js 双类别：app（文本 pattern layout）与 api（JSON 行，兼容原 pino 契约），按本地日期分文件（`app-YYYY-MM-DD.log` / `api-YYYY-MM-DD.log`），写日志前检查日期翻转并自动切换目标流
+- **SQLite 双写**：装配层 `setLogStore` 注入 `LogStore` 后，`getLogger()` 返回 Proxy 包装，日志方法先写 SQLite（try-catch 隔离，失败只降级不抛错）再写文件；未注入时行为与原来完全一致
+- 敏感头脱敏：`authorization` / `x-api-key` 在记录请求头时过滤；写库前 `sanitizeRawValue` 按任意嵌套层级剔除，`raw` 列永不含敏感头
+- `sweep.ts`：超过 5 天的 `app-*.log` / `api-*.log` 在启动时与每 6 小时自动清理（按 mtime 判定）
+
+**logstore（日志 SQLite 存储）**
+- `LogStore` 只做存储（insert / query / cleanup / close），不写文件、不碰 HTTP：`logs` 表 + `(type, time DESC)` 复合索引，WAL + 预编译语句支撑高频写入
+- `query`：type 必填 + time 范围 + 级别下限 + keyword 模糊匹配（msg / url / request_id / category 任一命中），`ORDER BY time DESC, id DESC`，返回满足过滤条件的 `total`（不含分页）
+- `cleanup(maxAgeMs)`：`DELETE FROM logs WHERE time < now - maxAgeMs`；保留期与文件 sweep 一致（5 天），启动一次 + 每 6 小时（调度装配见 `server/src/server/index.ts`）
 
 **stats（统计）**
 - `StatsCounter` 纯内存计数：按上游聚合 requests / errors / totalLatencyMs，`since` 为构造时刻（进程启动），重启清零；`snapshot()` 时计算平均延迟

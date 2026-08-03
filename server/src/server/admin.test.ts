@@ -1,7 +1,7 @@
 // 管理端 REST 接口测试：supertest + 真实 ConfigStore（临时目录）+ 可注入假客户端
 // 覆盖：上游 CRUD 与密钥掩码、级联删除、最后一个上游保护、连通性测试（覆盖/配置两种模式、各类错误代号）、
-//       下游模型映射整体替换、日志反向分页查询（倒序/级别/关键词过滤/offset 翻页/limit/hasMore）、统计汇总、健康检查、配置掩码与重载错误
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+//       下游模型映射整体替换、日志 SQLite 查询（倒序/级别/关键词过滤/offset 翻页/limit/hasMore/日期过滤）、统计汇总、健康检查、配置掩码与重载错误
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -12,6 +12,7 @@ import express, { type Express } from 'express'
 import request from 'supertest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ConfigStore } from '../config/store.js'
+import { LogStore, type LogEntry } from '../logstore/index.js'
 import { SessionStore, type SessionBindInfo } from '../session/db.js'
 import { StatsCounter } from '../stats/counter.js'
 import type { OpenAIUpstreamClient } from '../upstream/openai.js'
@@ -90,6 +91,8 @@ let store: ConfigStore
 let stats: StatsCounter
 let sessionStore: SessionStore
 let sessionDbPath: string
+let logStore: LogStore
+let logDbPath: string
 let app: Express
 let clients: Map<string, OpenAIUpstreamClient>
 
@@ -102,6 +105,7 @@ function buildApp(): void {
     getUpstreamClient: (id) => clients.get(id),
     stats,
     sessionStore,
+    logStore,
   })
 }
 
@@ -115,6 +119,9 @@ beforeEach(() => {
   // 会话粘附存储：真实 SessionStore + 临时 DB 文件（WAL 伴生文件随 tmpDir 一并删除）
   sessionDbPath = join(tmpDir, 'sessions.db')
   sessionStore = new SessionStore(sessionDbPath)
+  // 日志存储：真实 LogStore + 临时 DB 文件（独立文件，避免与 sessions 表互相干扰）
+  logDbPath = join(tmpDir, 'logs.db')
+  logStore = new LogStore(logDbPath)
   clients = new Map()
   buildApp()
   // Windows 读 USERPROFILE，POSIX 读 HOME：两个都 stub 才跨平台生效
@@ -127,6 +134,11 @@ afterEach(async () => {
   // 先关会话库再删目录：WAL 模式下文件句柄保持打开，先关连接避免删除竞态
   try {
     sessionStore.close()
+  } catch {
+    // 连接已关闭，无需处理
+  }
+  try {
+    logStore.close()
   } catch {
     // 连接已关闭，无需处理
   }
@@ -341,218 +353,208 @@ describe('下游模型映射 /admin/api/downstream-models', () => {
 })
 
 describe('日志查询 /admin/api/logs', () => {
-  it('api 类型按级别阈值过滤（默认 info）并跳过非 JSON 行，返回倒序', async () => {
-    // 日志目录重定向到临时目录（beforeEach stub 了 USERPROFILE/HOME）
-    const logDir = join(tmpDir, 'llmproxy', 'logs')
-    mkdirSync(logDir, { recursive: true })
-    writeFileSync(
-      join(logDir, 'api-2026-08-02.log'),
-      [
-        JSON.stringify({ level: 30, msg: 'request-complete', url: '/v1/models' }),
-        JSON.stringify({ level: 40, msg: 'upstream slow' }),
-        JSON.stringify({ level: 50, msg: 'boom' }),
-        'not-json-line',
-      ].join('\n') + '\n',
-    )
+  // 2026-08-02 当日 HH:mm:ss 的本地时区 epoch ms（处理器按 date 换算本地时区当日范围，用同一本地解析保证命中）
+  const dayMs = (hhmmss: string): number => new Date(`2026-08-02T${hhmmss}`).getTime()
+
+  it('app 日志：level 过滤、keyword 过滤、倒序返回（默认 type=app）', async () => {
+    logStore.insert({ type: 'app', level: 30, time: dayMs('10:00:00.000'), msg: 'downstream-ready', category: 'app' })
+    logStore.insert({ type: 'app', level: 40, time: dayMs('10:00:01.000'), msg: 'upstream slow', category: 'app' })
+    logStore.insert({ type: 'app', level: 50, time: dayMs('10:00:02.000'), msg: 'boom', category: 'app' })
+
+    // 默认 type=app + level=info(30)：三条全部命中，time 倒序 → 50/40/30
+    const all = await request(app).get('/admin/api/logs?date=2026-08-02')
+    expect(all.status).toBe(200)
+    expect(all.body.type).toBe('app')
+    expect(all.body.lines.map((l: { level: number }) => l.level)).toEqual([50, 40, 30])
+    expect(all.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['boom', 'upstream slow', 'downstream-ready'])
+
+    // level=error(50)：只返回 50
+    const errors = await request(app).get('/admin/api/logs?date=2026-08-02&level=error')
+    expect(errors.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['boom'])
+
+    // keyword 过滤：msg 含 upstream 的只有 40
+    const byKeyword = await request(app).get('/admin/api/logs?date=2026-08-02&keyword=upstream')
+    expect(byKeyword.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['upstream slow'])
+
+    // type 互不干扰：app 记录不出现在 api 查询
+    const apis = await request(app).get('/admin/api/logs?date=2026-08-02&type=api')
+    expect(apis.body.lines).toEqual([])
+  })
+
+  it('api 日志：返回 camelCase 字段（requestId/method/url/status），缺省字段不出现', async () => {
+    logStore.insert({
+      type: 'api',
+      level: 30,
+      time: dayMs('10:00:00.000'),
+      msg: 'request-complete',
+      requestId: 'req-1',
+      method: 'POST',
+      url: '/v1/chat/completions',
+      status: 200,
+    })
     const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
     expect(res.status).toBe(200)
-    // info=30：30/40/50 全部满足 ≥30；非 JSON 行被跳过；反向读取 → 最新（50）在前
-    expect(res.body.lines.map((l: { level: number }) => l.level)).toEqual([50, 40, 30])
-    // 3 条匹配全部返回且已扫到文件头 → hasMore=false；scanned 含未匹配的 4 行
-    expect(res.body.hasMore).toBe(false)
-    expect(res.body.scanned).toBe(4)
-    // 默认分页参数回显
-    expect(res.body.offset).toBe(0)
-    expect(res.body.limit).toBe(100)
+    expect(res.body.lines[0]).toEqual({
+      level: 30,
+      time: dayMs('10:00:00.000'),
+      msg: 'request-complete',
+      requestId: 'req-1',
+      method: 'POST',
+      url: '/v1/chat/completions',
+      status: 200,
+    })
+    // 未提供的可选字段不出现在响应（snake_case 列名绝不外泄）
+    expect(res.body.lines[0].category).toBeUndefined()
+    expect(res.body.lines[0].duration_ms).toBeUndefined()
   })
 
-  it('api 类型 level + keyword 联合过滤', async () => {
-    const logDir = join(tmpDir, 'llmproxy', 'logs')
-    mkdirSync(logDir, { recursive: true })
-    writeFileSync(
-      join(logDir, 'api-2026-08-02.log'),
-      [
-        JSON.stringify({ level: 30, msg: 'request-complete' }),
-        JSON.stringify({ level: 40, msg: 'upstream slow' }),
-        JSON.stringify({ level: 50, msg: 'boom upstream' }),
-      ].join('\n') + '\n',
-    )
-    // level=error(50) + keyword=boom → 仅 50 且 msg 含 boom
-    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&level=error&keyword=boom')
-    expect(res.body.lines).toHaveLength(1)
-    expect(res.body.lines[0].msg).toBe('boom upstream')
+  it('date 过滤：只查当日（含当日 23:59:59.999 边界，不含异日记录）', async () => {
+    logStore.insert({ type: 'api', level: 30, time: dayMs('10:00:00.000'), msg: 'in-day' })
+    logStore.insert({ type: 'api', level: 30, time: new Date('2026-08-02T23:59:59.999').getTime(), msg: 'day-edge' })
+    logStore.insert({ type: 'api', level: 30, time: new Date('2026-08-01T10:00:00.000').getTime(), msg: 'prev-day' })
+    logStore.insert({ type: 'api', level: 30, time: new Date('2026-08-03T10:00:00.000').getTime(), msg: 'next-day' })
 
-    // 仅 keyword=upstream（默认 info）→ 40 与 50 命中，倒序 → 50 在前
-    const res2 = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&keyword=upstream')
-    expect(res2.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['boom upstream', 'upstream slow'])
-  })
-
-  it('app 类型按文本格式 [time] [LEVEL] [category] msg 解析，返回倒序', async () => {
-    const logDir = join(tmpDir, 'llmproxy', 'logs')
-    mkdirSync(logDir, { recursive: true })
-    writeFileSync(
-      join(logDir, 'app-2026-08-02.log'),
-      [
-        '[2026-08-02T10:00:00.000] [INFO] [app] downstream-ready',
-        '[2026-08-02T10:00:01.000] [WARN] [app] upstream slow',
-        '[2026-08-02T10:00:02.000] [ERROR] [app] boom',
-        'not-a-valid-line',
-      ].join('\n') + '\n',
-    )
-    const res = await request(app).get('/admin/api/logs?type=app&date=2026-08-02')
+    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
     expect(res.status).toBe(200)
-    expect(res.body.lines.map((l: { level: number }) => l.level)).toEqual([50, 40, 30])
-    expect(res.body.lines.map((l: { msg: string }) => l.msg)).toEqual([
-      'boom',
-      'upstream slow',
-      'downstream-ready',
-    ])
+    expect(res.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['day-edge', 'in-day'])
   })
 
-  it('app 类型默认（无 type 参数）走 app 文件解析文本', async () => {
-    const logDir = join(tmpDir, 'llmproxy', 'logs')
-    mkdirSync(logDir, { recursive: true })
-    writeFileSync(
-      join(logDir, 'app-2026-08-02.log'),
-      '[2026-08-02T10:00:00.000] [INFO] [app] default-type-marker\n',
-    )
+  it('offset/limit 分页：倒序取页，hasMore 按是否还有更早匹配行；total 始终为筛选条件下总条数', async () => {
+    for (let i = 1; i <= 5; i++) {
+      logStore.insert({ type: 'api', level: 30, time: dayMs(`10:00:0${i}.000`), msg: `line-${i}` })
+    }
+
+    // 第一页：最新两条 line-5/line-4，更早还有匹配 → hasMore=true；total=5（满筛选条件）
+    const page1 = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&limit=2')
+    expect(page1.status).toBe(200)
+    expect(page1.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-5', 'line-4'])
+    expect(page1.body.hasMore).toBe(true)
+    expect(page1.body.scanned).toBe(2)
+    expect(page1.body.total).toBe(5)
+
+    // 第二页：offset=2 → line-3/line-2，分页参数回显；total 不随翻页改变
+    const page2 = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&offset=2&limit=2')
+    expect(page2.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-3', 'line-2'])
+    expect(page2.body.hasMore).toBe(true)
+    expect(page2.body.offset).toBe(2)
+    expect(page2.body.limit).toBe(2)
+    expect(page2.body.total).toBe(5)
+
+    // 末页：offset=4 → 只剩 line-1，已无更早 → hasMore=false；total 仍=5
+    const last = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&offset=4&limit=2')
+    expect(last.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-1'])
+    expect(last.body.hasMore).toBe(false)
+    expect(last.body.total).toBe(5)
+  })
+
+  it('level + keyword 联合过滤：keyword 命中 msg/url，空串视为未传', async () => {
+    logStore.insert({ type: 'api', level: 30, time: dayMs('10:00:00.000'), msg: 'request-complete', url: '/v1/models' })
+    logStore.insert({ type: 'api', level: 40, time: dayMs('10:00:01.000'), msg: 'upstream slow' })
+    logStore.insert({ type: 'api', level: 50, time: dayMs('10:00:02.000'), msg: 'boom upstream' })
+
+    // level=error(50) + keyword=boom → 仅 50 且 msg 含 boom
+    const both = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&level=error&keyword=boom')
+    expect(both.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['boom upstream'])
+
+    // keyword 命中 url 字段
+    const byUrl = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&keyword=/v1/models')
+    expect(byUrl.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['request-complete'])
+
+    // keyword 空串等价于未传：三条全部返回
+    const emptyKw = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&keyword=')
+    expect(emptyKw.body.lines).toHaveLength(3)
+  })
+
+  it('非法参数返回 400：负 offset、limit=0、limit 超上限、非法日期', async () => {
+    const neg = await request(app).get('/admin/api/logs?date=2026-08-02&offset=-1')
+    expect(neg.status).toBe(400)
+    expect(neg.body.error).toBe('invalid_query')
+
+    const zero = await request(app).get('/admin/api/logs?date=2026-08-02&limit=0')
+    expect(zero.status).toBe(400)
+    expect(zero.body.error).toBe('invalid_query')
+
+    const over = await request(app).get('/admin/api/logs?date=2026-08-02&limit=501')
+    expect(over.status).toBe(400)
+    expect(over.body.error).toBe('invalid_query')
+
+    const badDate = await request(app).get('/admin/api/logs?date=2026/08/02')
+    expect(badDate.status).toBe(400)
+    expect(badDate.body.error).toBe('invalid_query')
+  })
+
+  it('空库返回空行列表、scanned=0 且 hasMore=false', async () => {
     const res = await request(app).get('/admin/api/logs?date=2026-08-02')
     expect(res.status).toBe(200)
-    expect(res.body.lines).toHaveLength(1)
-    expect(res.body.lines[0].msg).toBe('default-type-marker')
+    expect(res.body.lines).toEqual([])
+    expect(res.body.hasMore).toBe(false)
+    expect(res.body.scanned).toBe(0)
     expect(res.body.type).toBe('app')
   })
+})
 
-  it('反向读取：首行是文件最后一行（最新在前）', async () => {
-    const logDir = join(tmpDir, 'llmproxy', 'logs')
-    mkdirSync(logDir, { recursive: true })
-    writeFileSync(
-      join(logDir, 'api-2026-08-02.log'),
-      [1, 2, 3, 4, 5].map((n) => JSON.stringify({ level: 30, msg: `line-${n}` })).join('\n') + '\n',
-    )
-    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
+describe('日志手动清理 /admin/api/logs/cleanup', () => {
+  // 日志目录 = <homedir>/llmproxy/logs（beforeEach 已把 HOME 重定向到 tmpDir，getLogDir() 即指向 tmpDir/llmproxy/logs）
+  const logDir = (): string => join(tmpDir, 'llmproxy', 'logs')
+
+  it('不传 before → 缺省 7 天前，响应含 deleted/deletedFiles/before 字段', async () => {
+    // 先确保日志目录存在（端点内 getLogDir 会创建，但 sweepLogsBefore 需目录已存在）
+    mkdirSync(logDir(), { recursive: true })
+    const now = Date.now()
+    const res = await request(app).post('/admin/api/logs/cleanup')
     expect(res.status).toBe(200)
-    expect(res.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-5', 'line-4', 'line-3', 'line-2', 'line-1'])
+    expect(typeof res.body.deleted).toBe('number')
+    expect(typeof res.body.deletedFiles).toBe('number')
+    // 缺省 before ≈ now - 7 天（范围断言，容忍毫秒级耗时差）
+    const sevenDays = 7 * 24 * 60 * 60 * 1000
+    expect(res.body.before).toBeGreaterThan(now - sevenDays - 60_000)
+    expect(res.body.before).toBeLessThan(now - sevenDays + 60_000)
   })
 
-  it('offset 翻页：跳过前 offset 条匹配行（按匹配行计数，不含未达级别的行）', async () => {
-    const logDir = join(tmpDir, 'llmproxy', 'logs')
-    mkdirSync(logDir, { recursive: true })
-    // 首行 level=20 低于默认 info=30 不匹配；匹配行（文件顺序）为 m2/m3/m4/m5，倒序为 m5/m4/m3/m2
-    writeFileSync(
-      join(logDir, 'api-2026-08-02.log'),
-      [
-        JSON.stringify({ level: 20, msg: 'below' }),
-        JSON.stringify({ level: 30, msg: 'm2' }),
-        JSON.stringify({ level: 50, msg: 'm3' }),
-        JSON.stringify({ level: 50, msg: 'm4' }),
-        JSON.stringify({ level: 30, msg: 'm5' }),
-      ].join('\n') + '\n',
-    )
-    // offset=1 → 跳过最新匹配行 m5，返回 m4/m3，更早还有 m2 → hasMore=true
-    const page1 = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&offset=1&limit=2')
-    expect(page1.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['m4', 'm3'])
-    expect(page1.body.hasMore).toBe(true)
-    expect(page1.body.offset).toBe(1)
-    expect(page1.body.limit).toBe(2)
+  it('传 before：DB 中 time < before 的记录被删，deleted 条数正确且响应回显 before', async () => {
+    mkdirSync(logDir(), { recursive: true })
+    logStore.insert({ type: 'app', level: 30, time: 1_000, msg: 'old-1' })
+    logStore.insert({ type: 'app', level: 30, time: 2_000, msg: 'old-2' })
+    logStore.insert({ type: 'app', level: 30, time: 3_000, msg: 'keep' })
 
-    // offset=3 → 跳过 m5/m4/m3，只剩 m2 → hasMore=false（扫到文件头仍未凑够）
-    const page2 = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&offset=3&limit=2')
-    expect(page2.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['m2'])
-    expect(page2.body.hasMore).toBe(false)
-  })
-
-  it('limit 生效：只返回 limit 条且 hasMore=true', async () => {
-    const logDir = join(tmpDir, 'llmproxy', 'logs')
-    mkdirSync(logDir, { recursive: true })
-    writeFileSync(
-      join(logDir, 'api-2026-08-02.log'),
-      [1, 2, 3, 4, 5].map((n) => JSON.stringify({ level: 30, msg: `line-${n}` })).join('\n') + '\n',
-    )
-    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&limit=2')
+    const res = await request(app).post('/admin/api/logs/cleanup').send({ before: 2_500 })
     expect(res.status).toBe(200)
-    expect(res.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-5', 'line-4'])
-    expect(res.body.hasMore).toBe(true)
+    expect(res.body).toEqual({ deleted: 2, deletedFiles: 0, before: 2_500 })
+    // 剩余记录验证（time 倒序最新在前）
+    const after = logStore.query({
+      type: 'app',
+      from: 0,
+      to: Number.MAX_SAFE_INTEGER,
+      minLevel: 0,
+      offset: 0,
+      limit: 10,
+    })
+    expect(after.total).toBe(1)
+    expect(after.rows[0].msg).toBe('keep')
   })
 
-  it('hasMore=false：恰好取完所有匹配行（limit 等于/大于匹配行数）', async () => {
-    const logDir = join(tmpDir, 'llmproxy', 'logs')
-    mkdirSync(logDir, { recursive: true })
-    writeFileSync(
-      join(logDir, 'api-2026-08-02.log'),
-      [1, 2, 3].map((n) => JSON.stringify({ level: 30, msg: `line-${n}` })).join('\n') + '\n',
-    )
-    // limit 恰好等于匹配行数 → 取完且扫到文件头 → hasMore=false
-    const exact = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&limit=3')
-    expect(exact.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-3', 'line-2', 'line-1'])
-    expect(exact.body.hasMore).toBe(false)
-    // limit 大于匹配行数 → 同样 hasMore=false
-    const over = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&limit=5')
-    expect(over.body.lines).toHaveLength(3)
-    expect(over.body.hasMore).toBe(false)
-  })
+  it('传 before：日志文件按 mtime 清理（旧文件删除、新文件保留），deletedFiles 正确', async () => {
+    const dir = logDir()
+    mkdirSync(dir, { recursive: true })
+    // 构造文件并设置 mtime：before = 2 天前，旧文件 3 天前、新文件 1 天前、无关文件不处理
+    const oldFile = join(dir, 'app-old.log')
+    const freshFile = join(dir, 'app-fresh.log')
+    const other = join(dir, 'service.log')
+    for (const f of [oldFile, freshFile, other]) {
+      writeFileSync(f, 'dummy')
+    }
+    const before = Date.now() - 2 * 24 * 60 * 60 * 1000
+    const oldMtime = new Date(before - 24 * 60 * 60 * 1000)
+    const freshMtime = new Date(Date.now() - 24 * 60 * 60 * 1000)
+    utimesSync(oldFile, oldMtime, oldMtime)
+    utimesSync(freshFile, freshMtime, freshMtime)
 
-  it('文件末尾无换行也能取到最后一整行', async () => {
-    const logDir = join(tmpDir, 'llmproxy', 'logs')
-    mkdirSync(logDir, { recursive: true })
-    writeFileSync(
-      join(logDir, 'api-2026-08-02.log'),
-      [1, 2, 3].map((n) => JSON.stringify({ level: 30, msg: `line-${n}` })).join('\n'),
-    )
-    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
+    const res = await request(app).post('/admin/api/logs/cleanup').send({ before })
     expect(res.status).toBe(200)
-    expect(res.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-3', 'line-2', 'line-1'])
-  })
-
-  it('单行超过读取块大小（64KB）时跨多个块拼全解析', async () => {
-    const logDir = join(tmpDir, 'llmproxy', 'logs')
-    mkdirSync(logDir, { recursive: true })
-    // 第一行 msg 70KB（跨 2 个 64KB 块），第二行是普通小行；反向读取应完整还原大行
-    const big = JSON.stringify({ level: 30, msg: 'x'.repeat(70 * 1024), url: '/big-line' })
-    writeFileSync(join(logDir, 'api-2026-08-02.log'), `${big}\n${JSON.stringify({ level: 30, msg: 'small' })}\n`)
-    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
-    expect(res.status).toBe(200)
-    expect(res.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['small', 'x'.repeat(70 * 1024)])
-    expect(res.body.lines[1].url).toBe('/big-line')
-    expect(res.body.lines[1].msg).toHaveLength(70 * 1024)
-    expect(res.body.scanned).toBe(2)
-  })
-
-  it('空文件返回空行列表且 hasMore=false', async () => {
-    const logDir = join(tmpDir, 'llmproxy', 'logs')
-    mkdirSync(logDir, { recursive: true })
-    writeFileSync(join(logDir, 'api-2026-08-02.log'), '')
-    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
-    expect(res.status).toBe(200)
-    expect(res.body.lines).toEqual([])
-    expect(res.body.hasMore).toBe(false)
-    expect(res.body.scanned).toBe(0)
-  })
-
-  it('文件不存在返回空行列表', async () => {
-    const res = await request(app).get('/admin/api/logs?date=2026-08-01')
-    expect(res.status).toBe(200)
-    expect(res.body.lines).toEqual([])
-    expect(res.body.hasMore).toBe(false)
-    expect(res.body.scanned).toBe(0)
-  })
-
-  it('非法日期格式返回 400', async () => {
-    const res = await request(app).get('/admin/api/logs?date=2026/08/02')
-    expect(res.status).toBe(400)
-    expect(res.body.error).toBe('invalid_query')
-  })
-
-  it('非法 offset/limit 返回 400', async () => {
-    const res = await request(app).get('/admin/api/logs?date=2026-08-02&offset=-1')
-    expect(res.status).toBe(400)
-    expect(res.body.error).toBe('invalid_query')
-    const res2 = await request(app).get('/admin/api/logs?date=2026-08-02&limit=0')
-    expect(res2.status).toBe(400)
-    expect(res2.body.error).toBe('invalid_query')
-    const res3 = await request(app).get('/admin/api/logs?date=2026-08-02&limit=501')
-    expect(res3.status).toBe(400)
-    expect(res3.body.error).toBe('invalid_query')
+    expect(res.body).toEqual({ deleted: 0, deletedFiles: 1, before })
+    expect(existsSync(oldFile)).toBe(false)
+    expect(existsSync(freshFile)).toBe(true)
+    expect(existsSync(other)).toBe(true)
   })
 })
 

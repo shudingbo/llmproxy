@@ -3,8 +3,8 @@
 import { readdirSync, statSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 
-// 日志保留天数
-const RETENTION_DAYS = 5
+// 日志保留天数（导出供日志 DB 清理复用，保证 DB 与文件 sweep 规则一致）
+export const RETENTION_DAYS = 5
 // 自动清理间隔：6 小时（毫秒）
 const SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
 
@@ -25,6 +25,26 @@ export function sweepOldLogs(dir: string): number {
     if (!isAppLog && !isApiLog) continue
     const filePath = join(dir, name)
     if (statSync(filePath).mtime.getTime() < cutoff) {
+      unlinkSync(filePath)
+      deleted++
+    }
+  }
+  return deleted
+}
+
+/**
+ * 删除 dir 下 mtime < beforeMs 的 app-*.log / api-*.log 文件（手动清理用，阈值由调用方指定）。
+ * 与 sweepOldLogs 同规则（mtime 判定、仅处理 app- 与 api- 前缀的 .log 文件），返回删除的文件数量。
+ */
+export function sweepLogsBefore(dir: string, beforeMs: number): number {
+  let deleted = 0
+  for (const name of readdirSync(dir)) {
+    // 只处理按日期命名的日志文件（app-* 与 api-* 两种前缀均适用同一规则）
+    const isAppLog = name.startsWith('app-') && name.endsWith('.log')
+    const isApiLog = name.startsWith('api-') && name.endsWith('.log')
+    if (!isAppLog && !isApiLog) continue
+    const filePath = join(dir, name)
+    if (statSync(filePath).mtime.getTime() < beforeMs) {
       unlinkSync(filePath)
       deleted++
     }

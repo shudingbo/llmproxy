@@ -9,10 +9,12 @@ import { ConfigStore } from '../config/store.js'
 import { Router } from '../router/index.js'
 import { RoundRobinLoadBalancer, SessionAffinityLoadBalancer } from '../router/load-balancer.js'
 import { SessionStore } from '../session/db.js'
+import { LogStore } from '../logstore/index.js'
 import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
 import { StatsCounter } from '../stats/counter.js'
 import { getConfigPath, getDataDir, getLogDir } from '../paths.js'
-import { getLogger, initLogRetention, requestLogger, configureLogging } from '../logger/index.js'
+import { getLogger, initLogRetention, requestLogger, configureLogging, setLogStore } from '../logger/index.js'
+import { RETENTION_DAYS } from '../logger/sweep.js'
 import { registerAdminRoutes } from './admin.js'
 import { registerOpenAIRoutes } from './openai.js'
 import { registerOllamaRoutes } from './ollama.js'
@@ -67,6 +69,10 @@ export function createApp(deps: AppDeps): Express {
   // 会话亲和均衡器：同一会话（内容前缀 hash / Open WebUI chat_id）粘附同一上游，利用 LLM prompt cache；
   // 无会话键的请求委托内部轮询均衡器，行为不变
   const sessionStore = new SessionStore(join(getDataDir(), 'llmproxy.db'))
+  // 日志 SQLite 存储：与 SessionStore 共用 ~/llmproxy/llmproxy.db（WAL 多连接安全）
+  const logStore = new LogStore(join(getDataDir(), 'llmproxy.db'))
+  // 双写：所有 getLogger().info/warn/... 在写文件的同时写 SQLite
+  setLogStore(logStore)
   // 会话亲和总开关：routing.sessionAffinity.enabled 缺省为 true（schema 已给默认值），
   // 仅当显式配置为 false 时退回纯轮询均衡器；开关在启动时确定，不做热更新重选
   const affinityEnabled = store.get().routing?.sessionAffinity?.enabled !== false
@@ -92,6 +98,19 @@ export function createApp(deps: AppDeps): Express {
     setInterval(runCleanup, cleanupInterval).unref()
   }
 
+  // 日志 DB 清理：保留期与文件 sweep 一致（RETENTION_DAYS 天），启动执行一次 + 周期调度（与 sweep.ts 的 SWEEP_INTERVAL_MS 一致）
+  const LOG_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
+  const cleanupLogs = (): void => {
+    try {
+      const deleted = logStore.cleanup(RETENTION_DAYS * 24 * 60 * 60 * 1000)
+      if (deleted > 0) getLogger().info(`日志 DB 清理完成，删除 ${deleted} 条`, 'log-cleanup')
+    } catch (err) {
+      getLogger().warn('日志 DB 清理失败', err)
+    }
+  }
+  cleanupLogs() // 启动执行一次
+  setInterval(cleanupLogs, LOG_SWEEP_INTERVAL_MS).unref()
+
   // 每次上游尝试的统计钩子：直接计入计数器（status 字段被忽略，AttemptInfo 不需它）
   const onAttempt = (info: { upstreamId: string; ok: boolean; durationMs: number; status?: number }): void => {
     stats.recordAttempt(info)
@@ -108,7 +127,7 @@ export function createApp(deps: AppDeps): Express {
   // 请求日志中间件：每个请求生成 requestId 并记录方法/URL/状态码/耗时
   app.use(requestLogger)
   // 三组 API 路由：管理端 / OpenAI 兼容 / Ollama 兼容
-  registerAdminRoutes(app, { store, getUpstreamClient, stats, sessionStore })
+  registerAdminRoutes(app, { store, getUpstreamClient, stats, sessionStore, logStore })
   registerOpenAIRoutes(app, { store, getUpstreamClient, router, loadBalancer, onAttempt, sessionStore })
   registerOllamaRoutes(app, { store, getUpstreamClient, router, loadBalancer, onAttempt, sessionStore })
 

@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFi
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { LogStore } from '../logstore/index.js'
 
 // 每个用例通过 vi.resetModules() + 动态导入获得全新模块实例，保证 log4js 单例状态互不污染
 let mod: typeof import('./index.js')
@@ -302,6 +303,125 @@ describe('requestLogger', () => {
     const content = await readAllLogs((c) => c.includes('"msg":"request-complete"'))
     expect(content).not.toContain('hunter2')
     expect(content).not.toContain('must-not-leak')
+  })
+})
+
+describe('setLogStore + SQLite 双写', () => {
+  // 每个用例独立的临时 DB，互不污染
+  const makeStore = (): LogStore => new LogStore(join(tmp, `${Math.random().toString(36).slice(2)}.db`))
+
+  // 查询当前 store 中 type 的全部行（time 上限放宽到假时钟后的未来）
+  const queryAll = (store: LogStore, type: 'app' | 'api') =>
+    store.query({ type, from: 0, to: Date.now() + 60_000, minLevel: 0, offset: 0, limit: 100 })
+
+  it('未 setLogStore：行为与原来完全一致，不写 SQLite', async () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 18, 0, 0))
+    const store = makeStore()
+    try {
+      mod.setLogStore(store)
+      mod.getLogger('app').info('with-store-marker')
+      expect(queryAll(store, 'app').total).toBe(1)
+
+      mod.setLogStore(undefined)
+      expect(() => {
+        mod.getLogger('app').info('no-store-marker')
+        mod.getApiLogger().info('no-store-api-marker')
+      }).not.toThrow()
+      expect(queryAll(store, 'app').total).toBe(1)
+      expect(queryAll(store, 'api').total).toBe(0)
+      const content = await readAllLogs((c) => c.includes('no-store-marker'))
+      expect(content).toContain('no-store-marker')
+    } finally {
+      store.close()
+    }
+  })
+
+  it('setLogStore 后 getLogger().info 双写：DB 记录 type=app、level=30、msg 含内容，文件照常', async () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 18, 0, 0))
+    const store = makeStore()
+    try {
+      mod.setLogStore(store)
+      mod.getLogger('app').info('hello-dual-write')
+      const res = queryAll(store, 'app')
+      expect(res.total).toBe(1)
+      expect(res.rows[0].type).toBe('app')
+      expect(res.rows[0].level).toBe(30)
+      expect(res.rows[0].msg).toContain('hello-dual-write')
+      const content = await readAllLogs((c) => c.includes('hello-dual-write'))
+      expect(content).toContain('hello-dual-write')
+    } finally {
+      store.close()
+    }
+  })
+
+  it('app 日志：category 列记 logger 名，结构化对象并入 raw（headers 无损）', () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 18, 0, 0))
+    const store = makeStore()
+    try {
+      mod.setLogStore(store)
+      mod.getLogger('app').info({ downstreamModel: 'm', headers: { 'user-agent': 'vitest' } }, 'downstream-used')
+      const row = queryAll(store, 'app').rows[0]
+      expect(row.category).toBe('app')
+      expect(row.raw).toContain('downstreamModel')
+      expect(row.raw).toContain('"user-agent":"vitest"')
+      expect(row.msg).toContain('downstream-used')
+    } finally {
+      store.close()
+    }
+  })
+
+  it('api 日志：request_id/method/url/status/duration_ms 列正确', () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 18, 0, 0))
+    const store = makeStore()
+    try {
+      mod.setLogStore(store)
+      mod.getApiLogger().info(
+        { requestId: 'r1', method: 'GET', url: '/x', status: 200, durationMs: 5 },
+        'request-complete',
+      )
+      const row = queryAll(store, 'api').rows[0]
+      expect(row.type).toBe('api')
+      expect(row.request_id).toBe('r1')
+      expect(row.method).toBe('GET')
+      expect(row.url).toBe('/x')
+      expect(row.status).toBe(200)
+      expect(row.duration_ms).toBe(5)
+      expect(row.msg).toBe('request-complete')
+    } finally {
+      store.close()
+    }
+  })
+
+  it('raw 脱敏：authorization / x-api-key 不落库（含 headers 嵌套），其余保留', () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 18, 0, 0))
+    const store = makeStore()
+    try {
+      mod.setLogStore(store)
+      mod.getLogger('app').info(
+        { authorization: 'Bearer SECRET-TOKEN', headers: { 'x-api-key': 'SECRET-KEY', 'user-agent': 'vitest' } },
+        'with-secrets',
+      )
+      const raw = queryAll(store, 'app').rows[0].raw ?? ''
+      expect(raw).not.toContain('SECRET-TOKEN')
+      expect(raw).not.toContain('SECRET-KEY')
+      expect(raw).not.toContain('authorization')
+      expect(raw).not.toContain('x-api-key')
+      expect(raw).toContain('"user-agent":"vitest"')
+    } finally {
+      store.close()
+    }
+  })
+
+  it('insert 抛错（store 已 close）：不崩溃，文件日志仍写入', async () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 18, 0, 0))
+    const store = makeStore()
+    mod.setLogStore(store)
+    store.close() // 关闭后 insert 抛错，模拟 DB 故障
+    expect(() => {
+      mod.getLogger('app').info('still-writes-marker')
+    }).not.toThrow()
+    const content = await readAllLogs((c) => c.includes('still-writes-marker'))
+    expect(content).toContain('still-writes-marker')
   })
 })
 

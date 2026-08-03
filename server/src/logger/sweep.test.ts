@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { initLogRetention, stopLogRetention, sweepOldLogs } from './sweep.js'
+import { initLogRetention, stopLogRetention, sweepLogsBefore, sweepOldLogs } from './sweep.js'
 
 // 每个用例独立的临时日志目录
 let tmp: string
@@ -54,6 +54,38 @@ describe('sweepOldLogs', () => {
     touchLog('app-b.log', 9)
     touchLog('app-c.log', 1)
     expect(sweepOldLogs(tmp)).toBe(2)
+  })
+})
+
+describe('sweepLogsBefore', () => {
+  it('删除 mtime 早于 beforeMs 的日志文件，保留更新的文件', () => {
+    const oldFile = touchLog('app-old.log', 3)
+    const freshFile = touchLog('app-fresh.log', 1)
+    // beforeMs = 2 天前：3 天前的旧文件被删，1 天前的新文件保留
+    const beforeMs = Date.now() - 2 * 24 * 60 * 60 * 1000
+    expect(sweepLogsBefore(tmp, beforeMs)).toBe(1)
+    expect(existsSync(oldFile)).toBe(false)
+    expect(existsSync(freshFile)).toBe(true)
+  })
+
+  it('api-*.log 同样按 mtime 清理；只删 app-*/api-* 不删其他文件', () => {
+    const oldApi = touchLog('api-old.log', 5)
+    const freshApi = touchLog('api-fresh.log', 1)
+    const other = touchLog('service.log', 5)
+    const notes = touchLog('api-notes.txt', 5)
+    const beforeMs = Date.now() - 2 * 24 * 60 * 60 * 1000
+    expect(sweepLogsBefore(tmp, beforeMs)).toBe(1)
+    expect(existsSync(oldApi)).toBe(false)
+    expect(existsSync(freshApi)).toBe(true)
+    expect(existsSync(other)).toBe(true)
+    expect(existsSync(notes)).toBe(true)
+  })
+
+  it('beforeMs 为当前时间时全删；空目录返回 0', () => {
+    touchLog('app-a.log', 0.5)
+    touchLog('app-b.log', 0.1)
+    expect(sweepLogsBefore(tmp, Date.now())).toBe(2)
+    expect(sweepLogsBefore(tmp, Date.now())).toBe(0)
   })
 })
 

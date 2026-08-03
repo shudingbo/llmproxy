@@ -1,6 +1,6 @@
 // 管理端 REST 接口测试：supertest + 真实 ConfigStore（临时目录）+ 可注入假客户端
 // 覆盖：上游 CRUD 与密钥掩码、级联删除、最后一个上游保护、连通性测试（覆盖/配置两种模式、各类错误代号）、
-//       下游模型映射整体替换、日志级别/关键词过滤、统计汇总、健康检查、配置掩码与重载错误
+//       下游模型映射整体替换、日志反向分页查询（倒序/级别/关键词过滤/offset 翻页/limit/hasMore）、统计汇总、健康检查、配置掩码与重载错误
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
@@ -307,7 +307,7 @@ describe('下游模型映射 /admin/api/downstream-models', () => {
 })
 
 describe('日志查询 /admin/api/logs', () => {
-  it('api 类型按级别阈值过滤（默认 info）并跳过非 JSON 行', async () => {
+  it('api 类型按级别阈值过滤（默认 info）并跳过非 JSON 行，返回倒序', async () => {
     // 日志目录重定向到临时目录（beforeEach stub 了 USERPROFILE/HOME）
     const logDir = join(tmpDir, 'llmproxy', 'logs')
     mkdirSync(logDir, { recursive: true })
@@ -322,8 +322,14 @@ describe('日志查询 /admin/api/logs', () => {
     )
     const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
     expect(res.status).toBe(200)
-    // info=30：30/40/50 全部满足 ≥30；非 JSON 行被跳过
-    expect(res.body.lines.map((l: { level: number }) => l.level)).toEqual([30, 40, 50])
+    // info=30：30/40/50 全部满足 ≥30；非 JSON 行被跳过；反向读取 → 最新（50）在前
+    expect(res.body.lines.map((l: { level: number }) => l.level)).toEqual([50, 40, 30])
+    // 3 条匹配全部返回且已扫到文件头 → hasMore=false；scanned 含未匹配的 4 行
+    expect(res.body.hasMore).toBe(false)
+    expect(res.body.scanned).toBe(4)
+    // 默认分页参数回显
+    expect(res.body.offset).toBe(0)
+    expect(res.body.limit).toBe(100)
   })
 
   it('api 类型 level + keyword 联合过滤', async () => {
@@ -342,12 +348,12 @@ describe('日志查询 /admin/api/logs', () => {
     expect(res.body.lines).toHaveLength(1)
     expect(res.body.lines[0].msg).toBe('boom upstream')
 
-    // 仅 keyword=upstream（默认 info）→ 40 与 50 命中
+    // 仅 keyword=upstream（默认 info）→ 40 与 50 命中，倒序 → 50 在前
     const res2 = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&keyword=upstream')
-    expect(res2.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['upstream slow', 'boom upstream'])
+    expect(res2.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['boom upstream', 'upstream slow'])
   })
 
-  it('app 类型按文本格式 [time] [LEVEL] [category] msg 解析', async () => {
+  it('app 类型按文本格式 [time] [LEVEL] [category] msg 解析，返回倒序', async () => {
     const logDir = join(tmpDir, 'llmproxy', 'logs')
     mkdirSync(logDir, { recursive: true })
     writeFileSync(
@@ -361,11 +367,11 @@ describe('日志查询 /admin/api/logs', () => {
     )
     const res = await request(app).get('/admin/api/logs?type=app&date=2026-08-02')
     expect(res.status).toBe(200)
-    expect(res.body.lines.map((l: { level: number }) => l.level)).toEqual([30, 40, 50])
+    expect(res.body.lines.map((l: { level: number }) => l.level)).toEqual([50, 40, 30])
     expect(res.body.lines.map((l: { msg: string }) => l.msg)).toEqual([
-      'downstream-ready',
-      'upstream slow',
       'boom',
+      'upstream slow',
+      'downstream-ready',
     ])
   })
 
@@ -383,16 +389,136 @@ describe('日志查询 /admin/api/logs', () => {
     expect(res.body.type).toBe('app')
   })
 
+  it('反向读取：首行是文件最后一行（最新在前）', async () => {
+    const logDir = join(tmpDir, 'llmproxy', 'logs')
+    mkdirSync(logDir, { recursive: true })
+    writeFileSync(
+      join(logDir, 'api-2026-08-02.log'),
+      [1, 2, 3, 4, 5].map((n) => JSON.stringify({ level: 30, msg: `line-${n}` })).join('\n') + '\n',
+    )
+    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
+    expect(res.status).toBe(200)
+    expect(res.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-5', 'line-4', 'line-3', 'line-2', 'line-1'])
+  })
+
+  it('offset 翻页：跳过前 offset 条匹配行（按匹配行计数，不含未达级别的行）', async () => {
+    const logDir = join(tmpDir, 'llmproxy', 'logs')
+    mkdirSync(logDir, { recursive: true })
+    // 首行 level=20 低于默认 info=30 不匹配；匹配行（文件顺序）为 m2/m3/m4/m5，倒序为 m5/m4/m3/m2
+    writeFileSync(
+      join(logDir, 'api-2026-08-02.log'),
+      [
+        JSON.stringify({ level: 20, msg: 'below' }),
+        JSON.stringify({ level: 30, msg: 'm2' }),
+        JSON.stringify({ level: 50, msg: 'm3' }),
+        JSON.stringify({ level: 50, msg: 'm4' }),
+        JSON.stringify({ level: 30, msg: 'm5' }),
+      ].join('\n') + '\n',
+    )
+    // offset=1 → 跳过最新匹配行 m5，返回 m4/m3，更早还有 m2 → hasMore=true
+    const page1 = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&offset=1&limit=2')
+    expect(page1.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['m4', 'm3'])
+    expect(page1.body.hasMore).toBe(true)
+    expect(page1.body.offset).toBe(1)
+    expect(page1.body.limit).toBe(2)
+
+    // offset=3 → 跳过 m5/m4/m3，只剩 m2 → hasMore=false（扫到文件头仍未凑够）
+    const page2 = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&offset=3&limit=2')
+    expect(page2.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['m2'])
+    expect(page2.body.hasMore).toBe(false)
+  })
+
+  it('limit 生效：只返回 limit 条且 hasMore=true', async () => {
+    const logDir = join(tmpDir, 'llmproxy', 'logs')
+    mkdirSync(logDir, { recursive: true })
+    writeFileSync(
+      join(logDir, 'api-2026-08-02.log'),
+      [1, 2, 3, 4, 5].map((n) => JSON.stringify({ level: 30, msg: `line-${n}` })).join('\n') + '\n',
+    )
+    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&limit=2')
+    expect(res.status).toBe(200)
+    expect(res.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-5', 'line-4'])
+    expect(res.body.hasMore).toBe(true)
+  })
+
+  it('hasMore=false：恰好取完所有匹配行（limit 等于/大于匹配行数）', async () => {
+    const logDir = join(tmpDir, 'llmproxy', 'logs')
+    mkdirSync(logDir, { recursive: true })
+    writeFileSync(
+      join(logDir, 'api-2026-08-02.log'),
+      [1, 2, 3].map((n) => JSON.stringify({ level: 30, msg: `line-${n}` })).join('\n') + '\n',
+    )
+    // limit 恰好等于匹配行数 → 取完且扫到文件头 → hasMore=false
+    const exact = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&limit=3')
+    expect(exact.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-3', 'line-2', 'line-1'])
+    expect(exact.body.hasMore).toBe(false)
+    // limit 大于匹配行数 → 同样 hasMore=false
+    const over = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&limit=5')
+    expect(over.body.lines).toHaveLength(3)
+    expect(over.body.hasMore).toBe(false)
+  })
+
+  it('文件末尾无换行也能取到最后一整行', async () => {
+    const logDir = join(tmpDir, 'llmproxy', 'logs')
+    mkdirSync(logDir, { recursive: true })
+    writeFileSync(
+      join(logDir, 'api-2026-08-02.log'),
+      [1, 2, 3].map((n) => JSON.stringify({ level: 30, msg: `line-${n}` })).join('\n'),
+    )
+    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
+    expect(res.status).toBe(200)
+    expect(res.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-3', 'line-2', 'line-1'])
+  })
+
+  it('单行超过读取块大小（64KB）时跨多个块拼全解析', async () => {
+    const logDir = join(tmpDir, 'llmproxy', 'logs')
+    mkdirSync(logDir, { recursive: true })
+    // 第一行 msg 70KB（跨 2 个 64KB 块），第二行是普通小行；反向读取应完整还原大行
+    const big = JSON.stringify({ level: 30, msg: 'x'.repeat(70 * 1024), url: '/big-line' })
+    writeFileSync(join(logDir, 'api-2026-08-02.log'), `${big}\n${JSON.stringify({ level: 30, msg: 'small' })}\n`)
+    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
+    expect(res.status).toBe(200)
+    expect(res.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['small', 'x'.repeat(70 * 1024)])
+    expect(res.body.lines[1].url).toBe('/big-line')
+    expect(res.body.lines[1].msg).toHaveLength(70 * 1024)
+    expect(res.body.scanned).toBe(2)
+  })
+
+  it('空文件返回空行列表且 hasMore=false', async () => {
+    const logDir = join(tmpDir, 'llmproxy', 'logs')
+    mkdirSync(logDir, { recursive: true })
+    writeFileSync(join(logDir, 'api-2026-08-02.log'), '')
+    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
+    expect(res.status).toBe(200)
+    expect(res.body.lines).toEqual([])
+    expect(res.body.hasMore).toBe(false)
+    expect(res.body.scanned).toBe(0)
+  })
+
   it('文件不存在返回空行列表', async () => {
     const res = await request(app).get('/admin/api/logs?date=2026-08-01')
     expect(res.status).toBe(200)
     expect(res.body.lines).toEqual([])
+    expect(res.body.hasMore).toBe(false)
+    expect(res.body.scanned).toBe(0)
   })
 
   it('非法日期格式返回 400', async () => {
     const res = await request(app).get('/admin/api/logs?date=2026/08/02')
     expect(res.status).toBe(400)
     expect(res.body.error).toBe('invalid_query')
+  })
+
+  it('非法 offset/limit 返回 400', async () => {
+    const res = await request(app).get('/admin/api/logs?date=2026-08-02&offset=-1')
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('invalid_query')
+    const res2 = await request(app).get('/admin/api/logs?date=2026-08-02&limit=0')
+    expect(res2.status).toBe(400)
+    expect(res2.body.error).toBe('invalid_query')
+    const res3 = await request(app).get('/admin/api/logs?date=2026-08-02&limit=501')
+    expect(res3.status).toBe(400)
+    expect(res3.body.error).toBe('invalid_query')
   })
 })
 

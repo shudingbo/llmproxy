@@ -1,7 +1,7 @@
 // 管理端 REST 接口：/admin/api/* 全部端点
 // 职责：上游增删改查与连通性测试、下游模型映射替换、日志查询、统计、健康检查、配置查看与重载错误
 // 无鉴权（由部署层防护）、无 CORS（开发期走 web/vite 代理）；apiKey 一律不落日志、响应中全部掩码
-import { existsSync, readFileSync } from 'node:fs'
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs'
 import type { Express, Request, Response } from 'express'
 import { z, type ZodType } from 'zod'
 import type { ConfigStore } from '../config/store.js'
@@ -23,11 +23,14 @@ export interface AdminDeps {
 
 // 日志查询参数（date 必填且必须是 YYYY-MM-DD；type 区分 app/api；level/keyword 可选）
 // type 默认 app，向后兼容旧调用；api 类型时返回 JSON 行的完整字段，app 类型时把文本行也按 JSON 形状还原
+// offset/limit 游标分页：从文件尾部反向读取，最新在前；offset 是"已跳过的匹配行数"，limit 默认 100 上限 500
 interface LogQuery {
   date: string
   type: 'app' | 'api'
   level?: string
   keyword?: string
+  offset: number
+  limit: number
 }
 
 const LogQuerySchema: ZodType<LogQuery> = z.object({
@@ -35,6 +38,9 @@ const LogQuerySchema: ZodType<LogQuery> = z.object({
   type: z.enum(['app', 'api']).optional().default('app'),
   level: z.string().optional().default('info'),
   keyword: z.string().optional(),
+  // query 参数均为字符串，用 coerce 转数字；int/min 校验不通过返回 400
+  offset: z.coerce.number().int().min(0).default(0),
+  limit: z.coerce.number().int().min(1).max(500).default(100),
 })
 
 // log4js / pino 共同的级别数值映射（前端 Logs 视图契约）：trace=10 debug=20 info=30 warn=40 error=50 fatal=60
@@ -70,6 +76,119 @@ function parseAppLine(line: string): { level: number; time: string; category: st
   return { level: LEVEL_NAME_TO_VALUE[levelStr] ?? 0, time, category, msg }
 }
 
+// 每次反向读取的块大小：64KB，只读文件尾部所需部分，不读整个文件
+const READ_CHUNK_SIZE = 64 * 1024
+
+// 反向读取日志页：从文件尾部向前分块扫描，最新在前；offset 跳过前 offset 条匹配行
+interface TailLogPage {
+  lines: unknown[]
+  hasMore: boolean
+  scanned: number
+}
+
+function readLogsTail(
+  filePath: string,
+  type: 'app' | 'api',
+  levelValue: number,
+  keyword: string | undefined,
+  offset: number,
+  limit: number,
+): TailLogPage {
+  const fd = openSync(filePath, 'r')
+  try {
+    const { size } = fstatSync(fd)
+    const lines: unknown[] = []
+    let scanned = 0
+    let hasMore = false
+    if (size === 0) {
+      return { lines, hasMore, scanned }
+    }
+    // 过滤单行（app 文本 / api JSON）：空行、解析失败、级别不足、不含关键词 → null
+    const matchLine = (rawLine: string): Record<string, unknown> | null => {
+      if (rawLine.trim() === '') return null
+      if (type === 'api') {
+        // api 日志每行都应是合法 JSON；解析失败直接跳过
+        let obj: Record<string, unknown>
+        try {
+          obj = JSON.parse(rawLine) as Record<string, unknown>
+        } catch {
+          return null
+        }
+        if (typeof obj.level === 'number' && obj.level < levelValue) return null
+        if (keyword !== undefined && keyword !== '' && typeof obj.msg === 'string' && !obj.msg.includes(keyword)) {
+          return null
+        }
+        return obj
+      }
+      // app 日志是文本：[time] [LEVEL] [category] msg，解析后合成与 api 相同的字段形状
+      const parsed = parseAppLine(rawLine)
+      if (parsed === null) return null
+      if (parsed.level < levelValue) return null
+      if (keyword !== undefined && keyword !== '' && !parsed.msg.includes(keyword)) return null
+      return { level: parsed.level, time: parsed.time, category: parsed.category, msg: parsed.msg }
+    }
+    // 处理一行：空行不计 scanned；匹配行先跳过 offset 条再收集；返回是否已凑够 limit
+    let skipped = 0
+    const emitLine = (rawLine: string): boolean => {
+      const line = rawLine.replace(/\r$/, '')
+      if (line.trim() === '') return false
+      scanned++
+      const obj = matchLine(line)
+      if (obj === null) return false
+      if (skipped < offset) {
+        skipped++
+        return false
+      }
+      lines.push(obj)
+      return lines.length >= limit
+    }
+
+    let pos = size
+    let buf = Buffer.alloc(0)
+    let filled = false
+    while (pos > 0 && !filled) {
+      const start = Math.max(0, pos - READ_CHUNK_SIZE)
+      const chunk = Buffer.allocUnsafe(pos - start)
+      readSync(fd, chunk, 0, chunk.length, start)
+      pos = start
+      // 新 chunk 拼到已收集字节的最前（更早内容在前）；跨块保持原始字节，UTF-8 字符不被截断
+      buf = Buffer.concat([chunk, buf])
+      // 从尾部逐个取完整行（0x0A 分隔）；末尾可能是半行，保留等下一 chunk 补全后再解码
+      let end = buf.length
+      while (end > 0 && !filled) {
+        const nl = buf.lastIndexOf(0x0a, end - 1)
+        if (nl === -1) break
+        filled = emitLine(buf.toString('utf-8', nl + 1, end))
+        end = nl
+      }
+      buf = buf.subarray(0, end)
+    }
+
+    // 已读到文件开头：剩余字节全部处理（可能含 filled 时未处理完的多个完整行 + 文件首行）
+    if (buf.length > 0) {
+      for (const part of buf.toString('utf-8').split('\n')) {
+        if (filled) {
+          // 已凑够本页：仅探测剩余是否还有匹配行（决定 hasMore），不再收集
+          if (matchLine(part) !== null) {
+            hasMore = true
+            break
+          }
+        } else if (emitLine(part)) {
+          filled = true
+        }
+      }
+    }
+
+    // 提前凑够 limit 且文件还有未读字节 → 更早处仍有日志 → hasMore=true
+    if (filled && pos > 0) {
+      hasMore = true
+    }
+    return { lines, hasMore, scanned }
+  } finally {
+    closeSync(fd)
+  }
+}
+
 // 版本号：从包根 package.json 惰性读取并缓存（读取失败兜底 'unknown'）
 let cachedVersion: string | null = null
 function getVersion(): string {
@@ -101,26 +220,12 @@ const extractErrorCode = (err: unknown): string => {
   return 'unknown'
 }
 
-// 60 秒统计快照装饰器：unref 保证不阻塞进程退出；模块级防重（多次注册只启动一个）
-let statsTimerStarted = false
-function startStatsSnapshotTimer(stats: StatsCounter): void {
-  if (statsTimerStarted) {
-    return
-  }
-  statsTimerStarted = true
-  const log = getLogger()
-  setInterval(() => {
-    log.info({ stats: stats.snapshot() }, 'stats-snapshot')
-  }, 60_000).unref()
-}
-
 /**
  * 注册管理端路由（挂到传入的 Express 应用上）。
  * 假定装配层已注入 express.json（10mb）与请求日志中间件。
  */
 export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
   const { store, getUpstreamClient, stats } = deps
-  startStatsSnapshotTimer(stats)
 
   // 上游列表：apiKey 掩码后返回（仅展示用途，绝不回传明文）
   app.get('/admin/api/upstreams', (_req: Request, res: Response) => {
@@ -237,57 +342,31 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     res.json(parsed.data)
   })
 
-  // 日志查询：date 必填；type 区分 app（文本）或 api（JSON）；按级别阈值 + 关键词过滤；最多返回 1000 行
+  // 日志查询：date 必填；type 区分 app（文本）或 api（JSON）；按级别阈值 + 关键词过滤；
+  // 反向读取文件尾部（最新在前），offset/limit 游标分页；hasMore 表示更早处是否还有匹配日志
   app.get('/admin/api/logs', (req: Request, res: Response) => {
     const parsed = LogQuerySchema.safeParse(req.query)
     if (!parsed.success) {
       res.status(400).json({ error: 'invalid_query', issues: parsed.error.issues.map((i) => i.message) })
       return
     }
-    const { date, type, level, keyword } = parsed.data
+    const { date, type, level, keyword, offset, limit } = parsed.data
     const levelValue = LEVEL_NUMBERS[level ?? 'info'] ?? 30
     // 选取对应类别的日志文件：app-YYYY-MM-DD.log 或 api-YYYY-MM-DD.log
     const sampleDate = new Date(`${date}T12:00:00`)
     const filePath =
       type === 'api' ? getApiLogFilePath(sampleDate) : getAppLogFilePath(sampleDate)
-    const lines: unknown[] = []
-    if (existsSync(filePath)) {
-      for (const rawLine of readFileSync(filePath, 'utf-8').split('\n')) {
-        const line = rawLine.replace(/\r$/, '')
-        if (line.trim() === '') {
-          continue
-        }
-        if (type === 'api') {
-          // api 日志每行都应是合法 JSON；解析失败直接跳过
-          let obj: Record<string, unknown>
-          try {
-            obj = JSON.parse(line) as Record<string, unknown>
-          } catch {
-            continue
-          }
-          if (typeof obj.level === 'number' && obj.level < levelValue) continue
-          if (keyword !== undefined && keyword !== '' && typeof obj.msg === 'string' && !obj.msg.includes(keyword)) {
-            continue
-          }
-          lines.push(obj)
-        } else {
-          // app 日志是文本：[time] [LEVEL] [category] msg，解析后合成与 api 相同的字段形状
-          const parsed_line = parseAppLine(line)
-          if (parsed_line === null) continue
-          if (parsed_line.level < levelValue) continue
-          if (keyword !== undefined && keyword !== '' && !parsed_line.msg.includes(keyword)) {
-            continue
-          }
-          lines.push({
-            level: parsed_line.level,
-            time: parsed_line.time,
-            category: parsed_line.category,
-            msg: parsed_line.msg,
-          })
-        }
-      }
+    if (!existsSync(filePath)) {
+      res.json({ lines: [], type, offset, limit, hasMore: false, scanned: 0 })
+      return
     }
-    res.json({ lines: lines.slice(-1000), type })
+    try {
+      const page = readLogsTail(filePath, type, levelValue, keyword, offset, limit)
+      res.json({ ...page, type, offset, limit })
+    } catch (err) {
+      getLogger().warn({ err, filePath }, `日志反向读取失败: ${filePath}`)
+      res.status(500).json({ error: 'log_read_failed' })
+    }
   })
 
   // 统计：窗口起点 + 全量汇总 + 按上游聚合明细

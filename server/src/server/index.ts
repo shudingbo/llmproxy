@@ -11,7 +11,7 @@ import { RoundRobinLoadBalancer } from '../router/load-balancer.js'
 import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
 import { StatsCounter } from '../stats/counter.js'
 import { getConfigPath, getLogDir } from '../paths.js'
-import { getLogger, initLogRetention, requestLogger } from '../logger/index.js'
+import { getLogger, initLogRetention, requestLogger, configureLogging } from '../logger/index.js'
 import { registerAdminRoutes } from './admin.js'
 import { registerOpenAIRoutes } from './openai.js'
 import { registerOllamaRoutes } from './ollama.js'
@@ -33,7 +33,7 @@ function logDownstreamEndpoints(endpoints: ReadonlyArray<DownstreamEndpoint>): v
       continue
     }
     for (const ep of list) {
-      getLogger().info({ type: ep.type, method: ep.method, path: ep.path, summary: ep.summary }, 'downstream-ready')
+      getLogger().info(`path: ${ep.path} ${ep.summary}`, 'downstream-ready')
     }
   }
 }
@@ -111,6 +111,8 @@ export function createApp(deps: AppDeps): Express {
  * 历史重载错误不阻塞启动，仅记录告警。
  */
 export function startServer(): void {
+  // 启动期先把 log4js 配置好（幂等），所有后续 logger 调用都走入两套分类
+  configureLogging()
   const logger = getLogger()
 
   // 前端产物目录：从当前模块位置逐级向上推导（dev 用 tsx 直接跑 src 时同样成立），
@@ -139,7 +141,6 @@ export function startServer(): void {
   const host = listen.host
   app.listen(port, host, () => {
     logger.info(
-      { port, host, listenSource: listen.source },
       `ready on http://${host}:${port} (source=${listen.source})`,
     )
     // 启动期间打印当前暴露的全部下行流端点，方便部署/排障一眼可查

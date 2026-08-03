@@ -2,14 +2,12 @@
 // 职责：上游增删改查与连通性测试、下游模型映射替换、日志查询、统计、健康检查、配置查看与重载错误
 // 无鉴权（由部署层防护）、无 CORS（开发期走 web/vite 代理）；apiKey 一律不落日志、响应中全部掩码
 import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
 import type { Express, Request, Response } from 'express'
-import pino from 'pino'
 import { z, type ZodType } from 'zod'
 import type { ConfigStore } from '../config/store.js'
 import { DownstreamModelSchema, UpstreamSchema, type UpstreamCandidate } from '../config/schema.js'
 import { getLogger } from '../logger/index.js'
-import { getLogDir } from '../paths.js'
+import { getApiLogFilePath, getAppLogFilePath } from '../paths.js'
 import type { StatsCounter } from '../stats/counter.js'
 import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
 import { DOWNSTREAM_ENDPOINTS } from './downstreams.js'
@@ -23,18 +21,54 @@ export interface AdminDeps {
   stats: StatsCounter
 }
 
-// 日志查询参数（date 必填且必须是 YYYY-MM-DD；level/keyword 可选）
+// 日志查询参数（date 必填且必须是 YYYY-MM-DD；type 区分 app/api；level/keyword 可选）
+// type 默认 app，向后兼容旧调用；api 类型时返回 JSON 行的完整字段，app 类型时把文本行也按 JSON 形状还原
 interface LogQuery {
   date: string
+  type: 'app' | 'api'
   level?: string
   keyword?: string
 }
 
 const LogQuerySchema: ZodType<LogQuery> = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD'),
+  type: z.enum(['app', 'api']).optional().default('app'),
   level: z.string().optional().default('info'),
   keyword: z.string().optional(),
 })
+
+// log4js / pino 共同的级别数值映射（前端 Logs 视图契约）：trace=10 debug=20 info=30 warn=40 error=50 fatal=60
+const LEVEL_NUMBERS: Record<string, number> = {
+  trace: 10,
+  debug: 20,
+  info: 30,
+  warn: 40,
+  error: 50,
+  fatal: 60,
+}
+
+// level 名 → 数值（用于文本格式的 app 日志：'[2026-...][INFO]...）
+const LEVEL_NAME_TO_VALUE: Record<string, number> = {
+  TRACE: 10,
+  DEBUG: 20,
+  INFO: 30,
+  WARN: 40,
+  ERROR: 50,
+  FATAL: 60,
+}
+
+// 解析 log4js pattern 输出的文本行 [time] [LEVEL] [category] msg
+// 末尾的 msg 可含空格与中括号（cat 用时例外），这里简单按前三段切分后剩余整体作为 msg
+function parseAppLine(line: string): { level: number; time: string; category: string; msg: string } | null {
+  // 匹配前三个 [..] 段：[time] [LEVEL] [category]，剩余一并作为 msg
+  const m = /^(\[[^\]\n]+\]) (\[[^\]\n]+\]) (\[[^\]\n]+\]) (.*)$/.exec(line)
+  if (m === null) return null
+  const time = m[1].slice(1, -1)
+  const levelStr = m[2].slice(1, -1)
+  const category = m[3].slice(1, -1)
+  const msg = m[4] ?? ''
+  return { level: LEVEL_NAME_TO_VALUE[levelStr] ?? 0, time, category, msg }
+}
 
 // 版本号：从包根 package.json 惰性读取并缓存（读取失败兜底 'unknown'）
 let cachedVersion: string | null = null
@@ -203,39 +237,57 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     res.json(parsed.data)
   })
 
-  // 日志查询：读取指定日期文件，按 pino 级别阈值（≥ selected）与关键词过滤，返回最后 1000 条
+  // 日志查询：date 必填；type 区分 app（文本）或 api（JSON）；按级别阈值 + 关键词过滤；最多返回 1000 行
   app.get('/admin/api/logs', (req: Request, res: Response) => {
     const parsed = LogQuerySchema.safeParse(req.query)
     if (!parsed.success) {
       res.status(400).json({ error: 'invalid_query', issues: parsed.error.issues.map((i) => i.message) })
       return
     }
-    const { date, level, keyword } = parsed.data
-    // pino 级别数值：trace=10 debug=20 info=30 warn=40 error=50 fatal=60
-    const levelValue = (pino.levels.values as Record<string, number>)[level ?? 'info'] ?? 30
-    const filePath = join(getLogDir(), `app-${date}.log`)
+    const { date, type, level, keyword } = parsed.data
+    const levelValue = LEVEL_NUMBERS[level ?? 'info'] ?? 30
+    // 选取对应类别的日志文件：app-YYYY-MM-DD.log 或 api-YYYY-MM-DD.log
+    const sampleDate = new Date(`${date}T12:00:00`)
+    const filePath =
+      type === 'api' ? getApiLogFilePath(sampleDate) : getAppLogFilePath(sampleDate)
     const lines: unknown[] = []
     if (existsSync(filePath)) {
-      for (const line of readFileSync(filePath, 'utf-8').split('\n')) {
+      for (const rawLine of readFileSync(filePath, 'utf-8').split('\n')) {
+        const line = rawLine.replace(/\r$/, '')
         if (line.trim() === '') {
           continue
         }
-        try {
-          const obj = JSON.parse(line) as Record<string, unknown>
-          // 级别低于阈值 → 跳过；关键词命中 msg 字段（大小写敏感）
-          if (typeof obj.level === 'number' && obj.level < levelValue) {
+        if (type === 'api') {
+          // api 日志每行都应是合法 JSON；解析失败直接跳过
+          let obj: Record<string, unknown>
+          try {
+            obj = JSON.parse(line) as Record<string, unknown>
+          } catch {
             continue
           }
+          if (typeof obj.level === 'number' && obj.level < levelValue) continue
           if (keyword !== undefined && keyword !== '' && typeof obj.msg === 'string' && !obj.msg.includes(keyword)) {
             continue
           }
           lines.push(obj)
-        } catch {
-          // 非 JSON 行（如启动横幅）直接跳过
+        } else {
+          // app 日志是文本：[time] [LEVEL] [category] msg，解析后合成与 api 相同的字段形状
+          const parsed_line = parseAppLine(line)
+          if (parsed_line === null) continue
+          if (parsed_line.level < levelValue) continue
+          if (keyword !== undefined && keyword !== '' && !parsed_line.msg.includes(keyword)) {
+            continue
+          }
+          lines.push({
+            level: parsed_line.level,
+            time: parsed_line.time,
+            category: parsed_line.category,
+            msg: parsed_line.msg,
+          })
         }
       }
     }
-    res.json({ lines: lines.slice(-1000) })
+    res.json({ lines: lines.slice(-1000), type })
   })
 
   // 统计：窗口起点 + 全量汇总 + 按上游聚合明细

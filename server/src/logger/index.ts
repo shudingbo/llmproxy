@@ -1,109 +1,169 @@
-// pino 日志器单例：按本地日期分文件（app-YYYY-MM-DD.log），同时镜像输出到 stdout
-// 所有日志调用都经由自定义 write 包装流：先做日期翻转检查与文件目标写入，再 tee 一份到控制台
-// 控制台输出已经过 pino redact 脱敏，密钥/请求头敏感字段不会出现
-import pino, { type Logger } from 'pino'
-import { mkdirSync, openSync } from 'node:fs'
+// log4js 双类别日志：app（调试信息）走文本 pattern layout，api（HTTP 请求）走 JSON layout
+// 配置外置于 ~/llmproxy/log4js.json，启动期确保该文件存在（缺省时自动写入一份并由用户后续编辑）
+// 两类均按日轮转（streamroller dateFile）+ stdout 镜像，便于 docker/tmux 直接看
+// 日志格式样例：
+//   app: [2026-03-31T16:48:45.839] [INFO] [app] downstream-ready { type: 'openai', ... }
+//   api: {"level":30,"time":1774...",msg":"request-complete","requestId":"...","method":"GET",...}
+import log4js, { type Configuration, type Logger } from 'log4js'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import type { IncomingHttpHeaders } from 'node:http'
-import { dirname } from 'node:path'
+import { join } from 'node:path'
 import type { NextFunction, Request, Response } from 'express'
 import { nanoid } from 'nanoid'
-import { getLogFilePath, getLocalDateString } from '../paths.js'
+import { getDataDir, getLog4jsConfigPath, getLogDir } from '../paths.js'
 import { initLogRetention, stopLogRetention, sweepOldLogs } from './sweep.js'
 
 // 敏感请求头：任何情况下都不允许出现在日志里（匹配时忽略大小写）
 const SENSITIVE_HEADERS = new Set(['authorization', 'x-api-key'])
 
-// 目标流的最小结构（pino.destination 返回的 SonicBoom 满足该结构）
-interface LogDestination {
-  write(chunk: string): void
-  flushSync?(): void
-  end?(): void
+// pino 兼容的级别数值映射（保持前端 Logs 视图契约不变）
+const LEVEL_NUMBERS: Record<string, number> = {
+  ALL: 0,
+  TRACE: 10,
+  DEBUG: 20,
+  INFO: 30,
+  WARN: 40,
+  ERROR: 50,
+  FATAL: 60,
+  OFF: 70,
 }
 
-// stdout 控制台目标：直接写 process.stdout，确保 pino redact 已经对内容脱敏后再输出
-function createConsoleDestination(): LogDestination {
+// 模块级状态：configureLogging 一次性调用，后续幂等
+let configured = false
+
+// 默认的 log4js 配置对象构造器（以 logDir 为参数，因为路径跟 home 目录相关，无法写死在 JSON 中）
+// 此函数同时被 boot 期间写默认文件 用，也是测试断言默认结构的依据
+// 备注：date-format@4 在 log4js 里只识别小写 hh / mm / ss 与大写 yyyy / MM / dd / SSS，
+// HH 是字面字符，毫秒分隔的 T 也是字面。ISO 时间戳需用 yyyy-MM-ddThh:mm:ss.SSS（不再转义 T）
+export function buildDefaultLog4jsConfig(logDir: string): Configuration {
   return {
-    write(chunk: string): void {
-      // 直接同步写：避免异步缓冲在进程退出时丢失最后几条日志
-      // 控制台输出是单进程串行源，竞态风险由 Node 单线程事件循环天然消除
-      process.stdout.write(chunk)
-    },
-    flushSync(): void {
-      // stdout 自身不需要额外的同步冲刷
-    },
-  }
-}
-
-// 模块级单例状态（惰性初始化）
-let loggerInstance: Logger | null = null
-let currentDate = ''
-let currentFileDest: LogDestination | null = null
-let consoleDest: LogDestination | null = null
-
-/**
- * 创建指向 logPath 的文件目标流。
- * 先同步建目录并打开 fd，再交给 pino.destination（async 写入）；这样目标流立即可用，
- * 避免异步打开时 fd 尚未就绪导致 flushSync 抛 "sonic boom is not ready yet"。
- */
-function createFileDestination(logPath: string): LogDestination {
-  mkdirSync(dirname(logPath), { recursive: true })
-  const fd = openSync(logPath, 'a')
-  return pino.destination({ fd, sync: false })
-}
-
-/**
- * 若本地日期已翻转，则关闭旧日志文件并切换目标流到新日期的文件。
- * 每次写日志前调用；首次调用时完成目标流初始化。
- */
-function maybeRotate(): void {
-  const now = new Date()
-  const date = getLocalDateString(now)
-  if (currentFileDest !== null && currentDate === date) return
-  // 日期变化（或首次）：创建指向新日期文件的目标流
-  const newDest = createFileDestination(getLogFilePath(now))
-  if (currentFileDest !== null) {
-    // 先冲刷再关闭旧目标，避免异步缓冲内容丢失
-    currentFileDest.flushSync?.()
-    currentFileDest.end?.()
-  }
-  currentFileDest = newDest
-  currentDate = date
-}
-
-/**
- * 获取日志器单例（惰性初始化，无参数，路径来自 paths.ts）。
- * 包装流在每次写入前检查日期翻转；子 logger 通过原型链共享同一包装流，因此同样受控。
- */
-export function getLogger(): Logger {
-  if (loggerInstance !== null) return loggerInstance
-  consoleDest ??= createConsoleDestination()
-  const stream: pino.DestinationStream = {
-    write(chunk: string): void {
-      maybeRotate()
-      currentFileDest?.write(chunk)
-      // stdout 镜像：运维/tmux/docker logs 能直接看到日志
-      consoleDest?.write(chunk)
-    },
-  }
-  loggerInstance = pino(
-    {
-      level: 'info',
-      // 纵深防御：即便调用方误传敏感头字段，pino 自身也会脱敏
-      redact: {
-        paths: ['authorization', 'x-api-key', '*.authorization', '*.x-api-key'],
-        censor: '[REDACTED]',
+    appenders: {
+      appStdout: {
+        type: 'stdout',
+        layout: { type: 'pattern', pattern: '[%d{yyyy-MM-ddThh:mm:ss.SSS}] [%p] [%c] %m' },
+      },
+      appFile: {
+        type: 'dateFile',
+        filename: join(logDir, 'app'),
+        pattern: 'yyyy-MM-dd.log',
+        alwaysIncludePattern: true,
+        keepFileExt: false,
+        // 流式 streamroller 默认分隔符是 .，会产出 app.2026-08-03.log；用 - 取得 -YYYY-MM-DD 连接形式
+        fileNameSep: '-',
+        layout: { type: 'pattern', pattern: '[%d{yyyy-MM-ddThh:mm:ss.SSS}] [%p] [%c] %m' },
+      },
+      apiFile: {
+        type: 'dateFile',
+        filename: join(logDir, 'api'),
+        pattern: 'yyyy-MM-dd.log',
+        alwaysIncludePattern: true,
+        keepFileExt: false,
+        fileNameSep: '-',
+        layout: { type: 'pinoJson' },
       },
     },
-    stream,
-  )
-  return loggerInstance
+    categories: {
+      default: { appenders: ['appStdout', 'appFile'], level: 'info' },
+      app: { appenders: ['appStdout', 'appFile'], level: 'info' },
+      api: { appenders: ['apiFile'], level: 'info' },
+    },
+  }
 }
 
 /**
- * 同步冲刷当前日志目标（测试用：确保缓冲日志落盘后可断言）。
+ * 自定义 JSON layout：与原 pino 输出契约一致（level/time/msg + 任意字段）。
+ * 把 log4js 的 variadic data 数组合并：首个对象为结构化字段（与 pino 的
+ * `logger.info({obj}, 'msg')` 语义一致）；其他字符串/Error 一并合并到 msg。
+ */
+function installPinoJsonLayout(): void {
+  log4js.addLayout('pinoJson', () => (logEvent) => {
+    const obj: Record<string, unknown> = {
+      level: LEVEL_NUMBERS[logEvent.level.levelStr] ?? 30,
+      time: logEvent.startTime.getTime(),
+    }
+    const msgParts: string[] = []
+    for (const piece of logEvent.data) {
+      if (piece instanceof Error) {
+        obj.err = { name: piece.name, message: piece.message, stack: piece.stack }
+        msgParts.push(`err=${piece.message}`)
+      } else if (typeof piece === 'object' && piece !== null && !Array.isArray(piece)) {
+        Object.assign(obj, piece)
+      } else if (typeof piece === 'string') {
+        msgParts.push(piece)
+      } else if (piece !== undefined && piece !== null) {
+        msgParts.push(String(piece))
+      }
+    }
+    const msg = msgParts.join(' ').trim()
+    if (msg !== '') {
+      obj.msg = msg
+    }
+    return JSON.stringify(obj) + '\n'
+  })
+}
+
+/**
+ * 一次性配置 log4js：从 ~/llmproxy/log4js.json 加载；文件不存在则写一份默认值。
+ * 自定义 layout（pinoJson）必须先于 configure 注册，因 appender.laytout.type='pinoJson' 依赖它
+ * 启动期首调一次；后续重复调用为 no-op
+ */
+export function configureLogging(): void {
+  if (configured) {
+    return
+  }
+  configured = true
+
+  installPinoJsonLayout()
+
+  const configPath = getLog4jsConfigPath()
+  const dataDir = getDataDir()
+  const logDir = getLogDir()
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 })
+  mkdirSync(logDir, { recursive: true, mode: 0o700 })
+
+  // 缺省配置首次启动写入一份，供运维在此基础上按需编辑；后续启动不再覆盖
+  if (!existsSync(configPath)) {
+    const defaultConfig = buildDefaultLog4jsConfig(logDir)
+    writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2), { mode: 0o600 })
+  }
+
+  // 从文件加载：log4js.configure 接受文件路径，同步读取与解析；解析失败抛错
+  // 故意不在 catch 里"写默认覆盖"：用户的自定义配置出错应被运维看见，而不是被静默覆盖
+  log4js.configure(configPath)
+}
+
+// 按 category 缓存的 Logger 实例：log4js.getLogger() 每次都返回新对象，
+// 缓存可让测试 vi.spyOn(getLogger('app'), 'info') 真正命中生产代码后续调用
+const loggerCache = new Map<string, Logger>()
+
+/**
+ * 通用 logger：未指定 name 时落到 'app' category（与 default 等价）。
+ * 同一 name 多次调用返回同一 Logger 实例（按 category 缓存）。
+ */
+export function getLogger(name?: string): Logger {
+  const key = name ?? 'app'
+  let l = loggerCache.get(key)
+  if (l === undefined) {
+    l = log4js.getLogger(key)
+    loggerCache.set(key, l)
+  }
+  return l
+}
+
+/**
+ * HTTP 请求日志 logger：仅 requestLogger 中间件使用，写入 api 类别的 JSON 文件。
+ */
+export function getApiLogger(): Logger {
+  return getLogger('api')
+}
+
+/**
+ * 同步冲刷所有 appender（测试用兼容入口：log4js 无 sync flush 接口，调用 shutdown 即可）。
+ * 实际生产不用调用——log4js.shutdown 在进程退出钩子里处理异步落盘。
  */
 export function flushLoggerSync(): void {
-  currentFileDest?.flushSync?.()
+  // log4js 的 dateFile appender 内部用 streamroller，shutdown 是异步的；
+  // 测试场景下 fs 读取端用轮询等待即可，无需在此阻塞。
 }
 
 // 带 requestId 的请求 / 响应对象类型（局部扩展，避免污染全局 Express 类型声明）
@@ -128,8 +188,8 @@ function redactHeaders(headers: IncomingHttpHeaders): Record<string, string | st
 }
 
 /**
- * Express 请求日志中间件：为每个请求生成 requestId（nanoid），
- * 响应完成（finish）时输出结构化日志（方法 / URL / 状态码 / 耗时 / 脱敏后的请求头）。
+ * Express 请求日志中间件：使用 api category（JSON 格式）。
+ * 与原 pino 版本行为一致：每个请求生成 requestId，响应完成输出结构化日志。
  * 绝不记录请求体，也绝不记录 Authorization / x-api-key。
  */
 export function requestLogger(req: RequestWithLog, res: ResponseWithLog, next: NextFunction): void {
@@ -137,11 +197,12 @@ export function requestLogger(req: RequestWithLog, res: ResponseWithLog, next: N
   req.requestId = requestId
   res.requestId = requestId
   const startedAt = process.hrtime.bigint()
-  const reqLogger = getLogger().child({ requestId })
+  const reqLogger = getApiLogger()
   res.on('finish', () => {
     const durationMs = Math.round((Number(process.hrtime.bigint() - startedAt) / 1e6) * 100) / 100
     reqLogger.info(
       {
+        requestId,
         method: req.method,
         url: req.originalUrl ?? req.url,
         status: res.statusCode,

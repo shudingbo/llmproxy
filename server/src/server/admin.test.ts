@@ -307,12 +307,12 @@ describe('下游模型映射 /admin/api/downstream-models', () => {
 })
 
 describe('日志查询 /admin/api/logs', () => {
-  it('按级别阈值过滤（默认 info）并跳过非 JSON 行', async () => {
+  it('api 类型按级别阈值过滤（默认 info）并跳过非 JSON 行', async () => {
     // 日志目录重定向到临时目录（beforeEach stub 了 USERPROFILE/HOME）
     const logDir = join(tmpDir, 'llmproxy', 'logs')
     mkdirSync(logDir, { recursive: true })
     writeFileSync(
-      join(logDir, 'app-2026-08-02.log'),
+      join(logDir, 'api-2026-08-02.log'),
       [
         JSON.stringify({ level: 30, msg: 'request-complete', url: '/v1/models' }),
         JSON.stringify({ level: 40, msg: 'upstream slow' }),
@@ -320,17 +320,17 @@ describe('日志查询 /admin/api/logs', () => {
         'not-json-line',
       ].join('\n') + '\n',
     )
-    const res = await request(app).get('/admin/api/logs?date=2026-08-02')
+    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
     expect(res.status).toBe(200)
     // info=30：30/40/50 全部满足 ≥30；非 JSON 行被跳过
     expect(res.body.lines.map((l: { level: number }) => l.level)).toEqual([30, 40, 50])
   })
 
-  it('level + keyword 联合过滤', async () => {
+  it('api 类型 level + keyword 联合过滤', async () => {
     const logDir = join(tmpDir, 'llmproxy', 'logs')
     mkdirSync(logDir, { recursive: true })
     writeFileSync(
-      join(logDir, 'app-2026-08-02.log'),
+      join(logDir, 'api-2026-08-02.log'),
       [
         JSON.stringify({ level: 30, msg: 'request-complete' }),
         JSON.stringify({ level: 40, msg: 'upstream slow' }),
@@ -338,13 +338,49 @@ describe('日志查询 /admin/api/logs', () => {
       ].join('\n') + '\n',
     )
     // level=error(50) + keyword=boom → 仅 50 且 msg 含 boom
-    const res = await request(app).get('/admin/api/logs?date=2026-08-02&level=error&keyword=boom')
+    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&level=error&keyword=boom')
     expect(res.body.lines).toHaveLength(1)
     expect(res.body.lines[0].msg).toBe('boom upstream')
 
     // 仅 keyword=upstream（默认 info）→ 40 与 50 命中
-    const res2 = await request(app).get('/admin/api/logs?date=2026-08-02&keyword=upstream')
+    const res2 = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&keyword=upstream')
     expect(res2.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['upstream slow', 'boom upstream'])
+  })
+
+  it('app 类型按文本格式 [time] [LEVEL] [category] msg 解析', async () => {
+    const logDir = join(tmpDir, 'llmproxy', 'logs')
+    mkdirSync(logDir, { recursive: true })
+    writeFileSync(
+      join(logDir, 'app-2026-08-02.log'),
+      [
+        '[2026-08-02T10:00:00.000] [INFO] [app] downstream-ready',
+        '[2026-08-02T10:00:01.000] [WARN] [app] upstream slow',
+        '[2026-08-02T10:00:02.000] [ERROR] [app] boom',
+        'not-a-valid-line',
+      ].join('\n') + '\n',
+    )
+    const res = await request(app).get('/admin/api/logs?type=app&date=2026-08-02')
+    expect(res.status).toBe(200)
+    expect(res.body.lines.map((l: { level: number }) => l.level)).toEqual([30, 40, 50])
+    expect(res.body.lines.map((l: { msg: string }) => l.msg)).toEqual([
+      'downstream-ready',
+      'upstream slow',
+      'boom',
+    ])
+  })
+
+  it('app 类型默认（无 type 参数）走 app 文件解析文本', async () => {
+    const logDir = join(tmpDir, 'llmproxy', 'logs')
+    mkdirSync(logDir, { recursive: true })
+    writeFileSync(
+      join(logDir, 'app-2026-08-02.log'),
+      '[2026-08-02T10:00:00.000] [INFO] [app] default-type-marker\n',
+    )
+    const res = await request(app).get('/admin/api/logs?date=2026-08-02')
+    expect(res.status).toBe(200)
+    expect(res.body.lines).toHaveLength(1)
+    expect(res.body.lines[0].msg).toBe('default-type-marker')
+    expect(res.body.type).toBe('app')
   })
 
   it('文件不存在返回空行列表', async () => {

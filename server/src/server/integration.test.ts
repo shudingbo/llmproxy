@@ -12,7 +12,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import type { FSWatcher } from 'chokidar'
 import { ConfigStore } from '../config/store.js'
 import { startConfigWatcher } from '../config/watcher.js'
-import { flushLoggerSync } from '../logger/index.js'
+import { configureLogging, flushLoggerSync } from '../logger/index.js'
 import { getLocalDateString } from '../paths.js'
 import type { Config } from '../config/schema.js'
 import { createApp } from './index.js'
@@ -164,9 +164,10 @@ function startGateway(config: Config): void {
   app = createApp({ store, webDistPath: join(tmpDir, 'no-web-dist') })
 }
 
-// 读取当日日志文件全文（pino 异步落盘：冲刷后轮询直至有内容）
-async function readLogText(): Promise<string> {
-  const logPath = join(tmpDir, 'llmproxy', 'logs', `app-${getLocalDateString(new Date())}.log`)
+// 读取当日 API 日志文件全文（log4js 异步落盘：轮询直至有内容）。
+// request-complete（含脱敏请求头）写入 api-<date>.log；app-<date>.log 只放调试信息
+async function readLogText(type: 'app' | 'api' = 'api'): Promise<string> {
+  const logPath = join(tmpDir, 'llmproxy', 'logs', `${type}-${getLocalDateString(new Date())}.log`)
   const deadline = Date.now() + 3000
   for (;;) {
     flushLoggerSync()
@@ -190,6 +191,9 @@ beforeAll(() => {
   tmpDir = mkdtempSync(join(tmpdir(), 'llmproxy-itg-'))
   vi.stubEnv('HOME', tmpDir)
   vi.stubEnv('USERPROFILE', tmpDir)
+  // 必须显式初始化 log4js（曾经的 pino 在 import 时即初始化；log4js 改为按需）
+  // 这样 requestLogger 才能找到 api file appender，正常写到 tmpDir/llmproxy/logs/api-<date>.log
+  configureLogging()
 })
 
 beforeEach(() => {

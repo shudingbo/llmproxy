@@ -1,4 +1,4 @@
-// 日志保留期清理：删除超过保留天数的 app-*.log，支持启动时立即清理与定时自动清理
+// 日志保留期清理：删除超过保留天数的 app-*.log 与 api-*.log，支持启动时立即清理与定时自动清理
 // 本模块保持纯净（不依赖 logger），避免与 index.ts 循环依赖
 import { readdirSync, statSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
@@ -12,15 +12,17 @@ const SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
 let sweepTimer: NodeJS.Timeout | null = null
 
 /**
- * 清理 dir 下超过保留期的 app-*.log 文件。
+ * 清理 dir 下超过保留期的 app-*.log / api-*.log 文件。
  * 判定标准：文件 mtime < 当前时间 - 5 天。返回删除的文件数量。
  */
 export function sweepOldLogs(dir: string): number {
   const cutoff = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000
   let deleted = 0
   for (const name of readdirSync(dir)) {
-    // 只处理按日期命名的日志文件
-    if (!name.startsWith('app-') || !name.endsWith('.log')) continue
+    // 只处理按日期命名的日志文件（app-* 与 api-* 两种前缀均适用同一规则）
+    const isAppLog = name.startsWith('app-') && name.endsWith('.log')
+    const isApiLog = name.startsWith('api-') && name.endsWith('.log')
+    if (!isAppLog && !isApiLog) continue
     const filePath = join(dir, name)
     if (statSync(filePath).mtime.getTime() < cutoff) {
       unlinkSync(filePath)

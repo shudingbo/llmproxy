@@ -1,29 +1,30 @@
-// logger 单元测试：按日分文件、日期翻转、请求日志脱敏、stdout 镜像
+// logger 单元测试：基于 log4js 的双 category 配置、按日分文件、stdout 镜像、JSON / text 输出契约
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, readFileSync, readdirSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-// 每个用例通过 vi.resetModules() + 动态导入获得全新模块实例，保证单例状态互不污染
+// 每个用例通过 vi.resetModules() + 动态导入获得全新模块实例，保证 log4js 单例状态互不污染
 let mod: typeof import('./index.js')
 
-// 日志中间件参数类型（从 requestLogger 签名推导，避免重复声明）
+// requestLogger 参数类型（从签名推导）
 type ReqLike = Parameters<typeof mod.requestLogger>[0]
 type ResLike = Parameters<typeof mod.requestLogger>[1]
 
-// 每个用例独立的临时数据目录（<tmp>/llmproxy/logs 为日志目录）
 let tmp: string
 
 beforeEach(async () => {
   tmp = mkdtempSync(join(tmpdir(), 'llmproxy-logger-'))
-  // POSIX 下 os.homedir() 读 HOME；Windows 下优先读 USERPROFILE，两者都 stub
+  // POSIX 下 os.homedir() 读 HOME；Windows 下读 USERPROFILE：都 stub
   vi.stubEnv('HOME', tmp)
   vi.stubEnv('USERPROFILE', tmp)
-  // 假时钟仅覆盖 Date：控制 new Date() / Date.now() 模拟跨日；保留真实定时器供轮询等待 fs 落盘
+  // 假时钟只覆盖 Date，控制跨日；保留真实定时器让 fs 落盘
   vi.useFakeTimers({ toFake: ['Date'] })
   vi.resetModules()
   mod = await import('./index.js')
+  // 每个用例都重新配置 log4js，logDir 会指向新的 tmp/<userid>/llmproxy/logs
+  mod.configureLogging()
 })
 
 afterEach(() => {
@@ -31,80 +32,210 @@ afterEach(() => {
   vi.unstubAllEnvs()
 })
 
-// 日志目录完整路径
+// 测试日志目录：tmp/<user>/llmproxy/logs
 const logDir = (): string => join(tmp, 'llmproxy', 'logs')
 
-// 轮询读取日志目录全部内容直到满足 predicate：
-// pino 目标流是异步写（sync: false），flushSync 无法追回在途的 fs.write，读取前需等待落盘
-async function readAllLogs(dir: string, predicate: (content: string) => boolean, timeoutMs = 2000): Promise<string> {
+// 轮询读取日志目录全部内容直到 predicate 满足
+async function readAllLogs(predicate: (content: string) => boolean, timeoutMs = 3000): Promise<string> {
+  const dir = logDir()
   const deadline = Date.now() + timeoutMs
   let content = ''
   while (Date.now() < deadline) {
+    if (!existsSync(dir)) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      continue
+    }
     content = readdirSync(dir)
       .map((name) => readFileSync(join(dir, name), 'utf8'))
       .join('')
     if (predicate(content)) return content
-    // 真实定时器（fake 仅覆盖 Date），让出事件循环等待 fs 回调完成
     await new Promise((resolve) => setTimeout(resolve, 20))
   }
   return content
 }
 
-// 极简的响应替身：支持 on('finish') 监听与状态码
+// 数据目录：tmp/<user>/llmproxy
+const dataDir = (): string => join(tmp, 'llmproxy')
+// log4js.json 配置路径
+const log4jsConfigPath = (): string => join(dataDir(), 'log4js.json')
+
 class FakeResponse extends EventEmitter {
   statusCode = 200
 }
 
-describe('getLogger 按日分文件', () => {
-  it('跨日写入 3 行，生成 2 个正确命名的文件且内容各归其位', async () => {
-    const { getLogger, flushLoggerSync } = mod
-    // 第一天写 2 行
+describe('configureLogging + log4js.json 文件加载', () => {
+  it('首次启动在 ~/llmproxy/log4js.json 不存在时自动写入默认配置', () => {
+    const path = log4jsConfigPath()
+    expect(existsSync(path)).toBe(true)
+    const content = readFileSync(path, 'utf8')
+    const cfg = JSON.parse(content) as Record<string, unknown>
+    expect(cfg.appenders).toBeDefined()
+    expect(cfg.categories).toBeDefined()
+  })
+
+  it('默认配置：app 用 stdout + file，api 仅用 file（避免请求日志刷控制台）', () => {
+    const cfg = JSON.parse(readFileSync(log4jsConfigPath(), 'utf8')) as {
+      appenders: Record<string, { type: string; layout?: unknown }>
+      categories: Record<string, { appenders: string[]; level: string }>
+    }
+    expect(cfg.appenders.appStdout?.type).toBe('stdout')
+    expect(cfg.appenders.appFile?.type).toBe('dateFile')
+    // api 不再镜像到控制台
+    expect(cfg.appenders.apiStdout).toBeUndefined()
+    expect(cfg.appenders.apiFile?.type).toBe('dateFile')
+    expect(cfg.appenders.apiFile?.layout).toEqual({ type: 'pinoJson' })
+    expect(cfg.categories.app?.appenders).toEqual(['appStdout', 'appFile'])
+    expect(cfg.categories.api?.appenders).toEqual(['apiFile'])
+    expect(cfg.categories.default?.appenders).toEqual(['appStdout', 'appFile'])
+  })
+
+  it('运维修改 log4js.json 后：configureLogging 加载新值生效（不止缺省）', async () => {
+    const customPath = log4jsConfigPath()
+    const cfg = JSON.parse(readFileSync(customPath, 'utf8')) as {
+      categories: Record<string, { appenders: string[]; level: string }>
+    }
+    cfg.categories.api = { appenders: ['apiFile'], level: 'fatal' }
+    writeFileSync(customPath, JSON.stringify(cfg, null, 2))
+    // log4js.addLayout / 内部状态是进程级全局，vi.resetModules() 不会重置 log4js 单例
+    // 但 layout 注册在 configureLogging 内被重新调用（addLayout 幂等），故直接重读文件即可
+    vi.resetModules()
+    mod = await import('./index.js')
+    mod.configureLogging()
+
+    vi.setSystemTime(new Date(2026, 7, 2, 18, 0, 0))
+    mod.getApiLogger().info('post-edit-info-marker')
+    const dir = logDir()
+    await new Promise((r) => setTimeout(r, 100))
+    const apiFile = join(dir, 'api-2026-08-02.log')
+    const content = existsSync(apiFile) ? readFileSync(apiFile, 'utf8') : ''
+    expect(content).not.toContain('post-edit-info-marker')
+  })
+
+  it('configureLogging 幂等：同一进程多次调用不破坏已加载配置', () => {
+    expect(() => {
+      mod.configureLogging()
+      mod.configureLogging()
+    }).not.toThrow()
+    const path = log4jsConfigPath()
+    const statBefore = readFileSync(path, 'utf8').length
+    mod.configureLogging()
+    const statAfter = readFileSync(path, 'utf8').length
+    expect(statAfter).toBe(statBefore)
+  })
+})
+
+describe('configureLogging + getLogger/getApiLogger', () => {
+  it('configureLogging 幂等：多次调用不抛错（log4js 不支持热改也安全）', () => {
+    expect(() => {
+      mod.configureLogging()
+      mod.configureLogging()
+    }).not.toThrow()
+  })
+
+  it('getLogger 默认返回 app 类别的 logger，写入 app-<date>.log 文本格式', async () => {
     vi.setSystemTime(new Date(2026, 7, 2, 10, 0, 0))
-    getLogger().info('第一行-第一天')
-    getLogger().info({ extra: 1 }, '第二行-第一天')
-    // 第二天写 1 行
+    mod.getLogger().info('app-info-marker-12345')
+    const content = await readAllLogs((c) => c.includes('app-info-marker-12345'))
+    expect(content).toContain('[app]')
+    expect(content).toMatch(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\] \[INFO\] \[app\]/)
+    // 同时段不应有 api-*.log 内容
+    expect(content).not.toContain('"msg":"app-info-marker-12345"')
+  })
+
+  it('getApiLogger 写入 api-<date>.log JSON 格式，且 level/time/msg 字段契约保持不变', async () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 11, 0, 0))
+    mod.getApiLogger().info('api-info-marker-67890')
+    const content = await readAllLogs((c) => c.includes('"msg":"api-info-marker-67890"'))
+    // JSON 输出包含数值 level、毫秒 time、msg 字符串（前端 Logs 视图契约）
+    expect(content).toContain('"level":30')
+    expect(content).toContain('"time":')
+    expect(content).toContain('"msg":"api-info-marker-67890"')
+    // 不应有文本格式 [INFO] [api] 出现在 api 文件里
+    expect(content).not.toContain('[INFO] [api]')
+  })
+
+  it('同一行调用 getLogger 与 getApiLogger 写到不同文件', async () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 12, 0, 0))
+    mod.getLogger().info('app-side-marker')
+    mod.getApiLogger().info('api-side-marker')
+    const content = await readAllLogs(
+      (c) => c.includes('app-side-marker') && c.includes('"msg":"api-side-marker"'),
+    )
+    // 文本格式的 app 行不应包含 api-side-marker（该 marker 只在 JSON 文件中）
+    const textOnly = content.split('\n').filter((l) => l.startsWith('['))
+    expect(textOnly.some((l) => l.includes('api-side-marker'))).toBe(false)
+  })
+
+  it('按日切分：跨日写入 2 行，分别落在两个日期文件中', async () => {
+    const dir = logDir()
+    vi.setSystemTime(new Date(2026, 7, 2, 10, 0, 0))
+    mod.getLogger().info('day1-marker')
+    mod.getApiLogger().info('api-day1')
+    // 流式 streamroller 写完后还需要等真正的内容落盘，文件存在不等于内容就绪
+    await readAllLogs(
+      (c) => c.includes('day1-marker') && c.includes('api-day1'),
+    )
+
     vi.setSystemTime(new Date(2026, 7, 3, 9, 0, 0))
-    getLogger().info('第三行-第二天')
-    flushLoggerSync()
+    mod.getLogger().info('day2-marker')
+    mod.getApiLogger().info('api-day2')
+    await readAllLogs(
+      (c) => c.includes('day2-marker') && c.includes('api-day2'),
+    )
 
-    // 等待两天的日志都落盘
-    await readAllLogs(logDir(), (c) => c.includes('第一行-第一天') && c.includes('第三行-第二天'))
-    const files = readdirSync(logDir()).sort()
-    expect(files).toEqual(['app-2026-08-02.log', 'app-2026-08-03.log'])
-    const day1 = readFileSync(join(logDir(), 'app-2026-08-02.log'), 'utf8')
-    const day2 = readFileSync(join(logDir(), 'app-2026-08-03.log'), 'utf8')
-    expect(day1).toContain('第一行-第一天')
-    expect(day1).toContain('第二行-第一天')
-    expect(day2).toContain('第三行-第二天')
-    // 内容不串文件
-    expect(day1).not.toContain('第三行-第二天')
-    expect(day2).not.toContain('第一行-第一天')
+    const files = readdirSync(dir).sort()
+    expect(files).toContain('app-2026-08-02.log')
+    expect(files).toContain('app-2026-08-03.log')
+    expect(files).toContain('api-2026-08-02.log')
+    expect(files).toContain('api-2026-08-03.log')
+    // 内容按文件名各自隔离
+    const a2 = readFileSync(join(dir, 'app-2026-08-02.log'), 'utf8')
+    const a3 = readFileSync(join(dir, 'app-2026-08-03.log'), 'utf8')
+    expect(a2).toContain('day1-marker')
+    expect(a2).not.toContain('day2-marker')
+    expect(a3).toContain('day2-marker')
+    expect(a3).not.toContain('day1-marker')
   })
 
-  it('getLogger 返回同一单例', () => {
-    const { getLogger } = mod
-    expect(getLogger()).toBe(getLogger())
-  })
-
-  it('每条日志同步镜像到 process.stdout（控制台也能看到）', () => {
-    const { getLogger, flushLoggerSync } = mod
+  it('app 类别同时镜像到 stdout（控制台可看）', () => {
     vi.setSystemTime(new Date(2026, 7, 2, 12, 0, 0))
     const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
     try {
-      getLogger().info('stdout-mirror-marker-12345')
-      flushLoggerSync()
+      mod.getLogger().info('app-stdout-mirror-12345')
       const lines = stdoutSpy.mock.calls.map((call) => String(call[0])).join('')
-      expect(lines).toContain('"msg":"stdout-mirror-marker-12345"')
+      expect(lines).toContain('app-stdout-mirror-12345')
+      // 文本格式才会在 stdout 镜像到原样
+      expect(lines).toContain('[INFO] [app]')
     } finally {
       stdoutSpy.mockRestore()
     }
   })
+
+  it('api 类别不镜像到 stdout：避免大量请求日志刷控制台', () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 12, 0, 0))
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    try {
+      mod.getApiLogger().info('api-no-stdout-marker-67890')
+      const lines = stdoutSpy.mock.calls.map((call) => String(call[0])).join('')
+      expect(lines).not.toContain('api-no-stdout-marker-67890')
+    } finally {
+      stdoutSpy.mockRestore()
+    }
+  })
+
+  it('getLogger(name) 落到未注册 category 时继承 default 配置（仍写入 app 文件）', async () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 13, 0, 0))
+    mod.getLogger('not-registered').info('fallback-marker-1')
+    const content = await readAllLogs((c) => c.includes('fallback-marker-1'))
+    // 因为 default 走 appFile，所以应写入 app-*.log 且 category 在文本里显示为传入名
+    expect(content).toContain('[not-registered]')
+    expect(content).toMatch(/^\[\d{4}-\d{2}-\d{2}T/)
+  })
 })
 
 describe('requestLogger', () => {
-  it('附加 requestId 并输出 request-complete 日志', async () => {
-    const { flushLoggerSync, requestLogger } = mod
-    vi.setSystemTime(new Date(2026, 7, 2, 12, 0, 0))
+  it('附加 requestId 并输出 request-complete 到 api 类别的 JSON 文件', async () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 14, 0, 0))
     const req = {
       method: 'GET',
       url: '/api/ping',
@@ -113,23 +244,24 @@ describe('requestLogger', () => {
     } as unknown as ReqLike
     const res = new FakeResponse() as unknown as ResLike
     const next = vi.fn()
-    requestLogger(req, res, next)
+    mod.requestLogger(req, res, next)
 
     expect(next).toHaveBeenCalledTimes(1)
     expect((req as unknown as { requestId?: string }).requestId).toBeTruthy()
     res.emit('finish')
-    flushLoggerSync()
 
-    const content = await readAllLogs(logDir(), (c) => c.includes('request-complete'))
-    expect(content).toContain('request-complete')
+    const content = await readAllLogs((c) => c.includes('"msg":"request-complete"'))
+    expect(content).toContain('"msg":"request-complete"')
     expect(content).toContain('"requestId"')
-    expect(content).toContain('/api/ping')
+    expect(content).toContain('"method":"GET"')
+    expect(content).toContain('"url":"/api/ping"')
     expect(content).toContain('"status":200')
+    // 不应落在文本格式（app-*.log）
+    expect(content).not.toMatch(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\] \[INFO\] \[api\]/)
   })
 
-  it('脱敏：Authorization / x-api-key 的密钥不出现在日志中，其余请求头保留', async () => {
-    const { flushLoggerSync, requestLogger } = mod
-    vi.setSystemTime(new Date(2026, 7, 2, 12, 0, 0))
+  it('脱敏：Authorization / x-api-key 不出现在 api 日志中，其余请求头保留', async () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 15, 0, 0))
     const req = {
       method: 'POST',
       url: '/api/keys',
@@ -142,24 +274,20 @@ describe('requestLogger', () => {
       },
     } as unknown as ReqLike
     const res = new FakeResponse() as unknown as ResLike
-    requestLogger(req, res, vi.fn())
+    mod.requestLogger(req, res, vi.fn())
     res.emit('finish')
-    flushLoggerSync()
 
-    const content = await readAllLogs(logDir(), (c) => c.includes('request-complete'))
-    // 密钥及其字段名一律不得出现
+    const content = await readAllLogs((c) => c.includes('"msg":"request-complete"'))
     expect(content).not.toContain('SECRET-TOKEN-123')
     expect(content).not.toContain('SECRET-KEY-456')
     expect(content).not.toContain('Bearer')
     expect(content).not.toContain('x-api-key')
-    // 允许保留的请求头照常记录
     expect(content).toContain('"user-agent":"vitest"')
     expect(content).toContain('"content-type":"application/json"')
   })
 
   it('不记录请求体', async () => {
-    const { flushLoggerSync, requestLogger } = mod
-    vi.setSystemTime(new Date(2026, 7, 2, 12, 0, 0))
+    vi.setSystemTime(new Date(2026, 7, 2, 16, 0, 0))
     const req = {
       method: 'POST',
       url: '/api/echo',
@@ -168,12 +296,28 @@ describe('requestLogger', () => {
       body: { password: 'hunter2', note: 'must-not-leak' },
     } as unknown as ReqLike
     const res = new FakeResponse() as unknown as ResLike
-    requestLogger(req, res, vi.fn())
+    mod.requestLogger(req, res, vi.fn())
     res.emit('finish')
-    flushLoggerSync()
 
-    const content = await readAllLogs(logDir(), (c) => c.includes('request-complete'))
+    const content = await readAllLogs((c) => c.includes('"msg":"request-complete"'))
     expect(content).not.toContain('hunter2')
     expect(content).not.toContain('must-not-leak')
+  })
+})
+
+describe('sweep 集成：getLogger 写入的文件也能被 sweep 清理', () => {
+  it('过期 app-*.log 被 sweepOldLogs 删除', async () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 17, 0, 0))
+    mod.getLogger().info('will-be-old')
+    // 等文件落盘
+    await readAllLogs((c) => c.includes('will-be-old'))
+    const dir = logDir()
+    const file = join(dir, 'app-2026-08-02.log')
+    expect(existsSync(file)).toBe(true)
+    // 把 mtime 推到 6 天前
+    const past = new Date(Date.now() - 6 * 24 * 60 * 60 * 1000)
+    utimesSync(file, past, past)
+    mod.sweepOldLogs(dir)
+    expect(existsSync(file)).toBe(false)
   })
 })

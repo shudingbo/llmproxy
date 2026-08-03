@@ -471,17 +471,29 @@ llmproxy/
 ├── server/                 # @llmproxy/server：Express 5 + TypeScript ESM
 │   ├── package.json
 │   ├── tsconfig.json       # strict + NodeNext（.js 后缀导入）
-│   └── src/
-│       ├── index.ts        # 进程入口：调用 startServer()
-│       ├── paths.ts        # 数据目录 / 配置文件 / 日志路径推导（<homedir>/llmproxy）
-│       ├── config/         # schema(zod) / loader(JSONC) / store(原子写+去重) / watcher(防抖)
-│       ├── router/         # index(别名→候选) / load-balancer(轮询) / fallback(顺序回退) / errors
-│       ├── upstream/       # openai.ts：OpenAI 兼容上游客户端（axios 流式 + abort + connectError）
-│       ├── converters/     # OpenAI ↔ Ollama 请求 / 响应 / 流 / 模型列表转换 + Responses ↔ Chat 边界转换
-│       ├── server/         # openai.ts / ollama.ts / admin.ts 三个路由模块 + index.ts 单端口装配（含 listen.ts 监听解析）
-│       ├── logger/         # index.ts（log4js 双写：文件 + SQLite）+ sweep.ts（文件保留期清理）
-│       ├── logstore/       # index.ts：LogStore（SQLite 落库 / 查询 / 清理，logs 表）
-│       └── stats/          # counter.ts：进程内计数器
+│   ├── vitest.config.ts    # include: test/**/*.test.ts
+│   ├── src/                # 业务源码（不含测试文件）
+│   │   ├── index.ts        # 进程入口：调用 startServer()
+│   │   ├── paths.ts        # 数据目录 / 配置文件 / 日志路径推导（<homedir>/llmproxy）
+│   │   ├── config/         # schema(zod) / loader(JSONC) / store(原子写+去重) / watcher(防抖)
+│   │   ├── router/         # index(别名→候选) / load-balancer(轮询) / fallback(顺序回退) / errors
+│   │   ├── upstream/       # openai.ts：OpenAI 兼容上游客户端（axios 流式 + abort + connectError）
+│   │   ├── converters/     # OpenAI ↔ Ollama 请求 / 响应 / 流 / 模型列表转换 + Responses ↔ Chat 边界转换
+│   │   ├── server/         # openai.ts / ollama.ts / admin.ts 三个路由模块 + index.ts 单端口装配（含 listen.ts 监听解析）
+│   │   ├── logger/         # index.ts（log4js 双写：文件 + SQLite）+ sweep.ts（文件保留期清理）
+│   │   ├── logstore/       # index.ts：LogStore（SQLite 落库 / 查询 / 清理，logs 表）
+│   │   └── stats/          # counter.ts：进程内计数器
+│   └── test/               # 测试文件统一目录（镜像 src/ 子目录结构，便于隔离）
+│       ├── paths.test.ts
+│       ├── config/         # schema / loader / store / watcher
+│       ├── router/         # index / load-balancer / fallback
+│       ├── upstream/       # openai
+│       ├── converters/     # OpenAI ↔ Ollama + Responses ↔ Chat
+│       ├── server/         # openai / ollama / admin / index / downstreams / listen / integration
+│       ├── logger/         # index / sweep
+│       ├── logstore/       # index
+│       ├── session/        # db / key
+│       └── stats/          # counter
 └── web/                    # @llmproxy/web：Vue 3 + Element Plus 管理端 SPA
     ├── package.json
     ├── vite.config.ts      # dev server 5173 + /admin/api 代理到 127.0.0.1:3000
@@ -513,7 +525,7 @@ server 包内脚本（`pnpm --filter @llmproxy/server <script>`）：
 | 命令 | 说明 |
 | --- | --- |
 | `test` | 单测（vitest run，不含集成测试） |
-| `test:integration` | 仅跑集成测试 `src/server/integration.test.ts`（supertest 打真实应用） |
+| `test:integration` | 仅跑集成测试 `test/server/integration.test.ts`（supertest 打真实应用） |
 | `test:watch` | vitest watch 模式 |
 | `exec vitest run --coverage` | 覆盖率（已内置 `@vitest/coverage-v8`） |
 
@@ -528,7 +540,7 @@ server 包内脚本（`pnpm --filter @llmproxy/server <script>`）：
 1. 改代码（遵循「约定与规范」）
 2. `pnpm typecheck`：先过类型关，避免把类型错误带到后面
 3. `pnpm lint`：静态检查
-4. `pnpm test`：单元测试（各模块自带 `*.test.ts`）
+4. `pnpm test`：单元测试（统一放在 `test/` 下，镜像 `src/` 子目录结构）
 5. `pnpm --filter @llmproxy/server test:integration`：端到端验证路由装配与协议转换
 6. `pnpm build`：确认生产构建通过
 7. `pnpm start` 后用 Quickstart 里的两个 curl 手动冒烟验证

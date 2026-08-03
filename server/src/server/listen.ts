@@ -10,12 +10,14 @@ export interface ResolvedListen {
   source: 'cli' | 'config' | 'default'
 }
 
+export type CliArgs = { host?: string; port?: number }
+
 export interface ResolveOptions {
   // 命令行参数（最高优先级）：host/port 相互独立可选，任一项存在即 source='cli'
-  cli?: { host?: string; port?: number }
+  cli?: CliArgs
 }
 
-export const DEFAULT_HOST = '0.0.0.0'
+export const DEFAULT_HOST = '127.0.0.1'
 export const DEFAULT_PORT = 3000
 
 /**

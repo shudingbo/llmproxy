@@ -1,0 +1,14 @@
+{
+  // 测试类型检查专用：包含 src（用于模块解析）+ test（实际要检查的测试文件）
+  // 继承主 tsconfig 的全部编译器选项，但重写 rootDir 以允许 test/ 与 src/ 并列
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // 必须覆盖：主配置 rootDir=src 会拒绝 test/ 下的文件
+    "rootDir": ".",
+    // 不发射产物；类型检查完即退出
+    "noEmit": true,
+    // 覆盖主配置的 outDir，避免把 dist 写入重复路径
+    "outDir": "dist-test"
+  },
+  "include": ["src", "test"]
+}

@@ -19,7 +19,7 @@ import { registerAdminRoutes } from './admin.js'
 import { registerOpenAIRoutes } from './openai.js'
 import { registerOllamaRoutes } from './ollama.js'
 import { DOWNSTREAM_ENDPOINTS, type DownstreamEndpoint } from './downstreams.js'
-import { resolveListen } from './listen.js'
+import { resolveListen, type CliArgs } from './listen.js'
 
 // 启动时按下游类型分组打印一份端点清单：与 admin/api/health.downstreams 同源
 function logDownstreamEndpoints(endpoints: ReadonlyArray<DownstreamEndpoint>): void {
@@ -45,6 +45,8 @@ function logDownstreamEndpoints(endpoints: ReadonlyArray<DownstreamEndpoint>): v
 export interface AppDeps {
   store: ConfigStore
   webDistPath: string
+  // 命令行 --host/--port：透传到管理端路由（如 /admin/api/health），保证返回值与 app.listen 一致
+  cli?: CliArgs
 }
 
 /**
@@ -52,7 +54,7 @@ export interface AppDeps {
  * 上游客户端映射按配置构建并在配置变更时重建，新增/删除上游即时生效。
  */
 export function createApp(deps: AppDeps): Express {
-  const { store, webDistPath } = deps
+  const { store, webDistPath, cli } = deps
 
   // 上游客户端映射：配置变更时重建，保证新增/删除上游无需重启
   const clients = new Map<string, OpenAIUpstreamClient>()
@@ -127,7 +129,7 @@ export function createApp(deps: AppDeps): Express {
   // 请求日志中间件：每个请求生成 requestId 并记录方法/URL/状态码/耗时
   app.use(requestLogger)
   // 三组 API 路由：管理端 / OpenAI 兼容 / Ollama 兼容
-  registerAdminRoutes(app, { store, getUpstreamClient, stats, sessionStore, logStore })
+  registerAdminRoutes(app, { store, getUpstreamClient, stats, sessionStore, logStore, cli })
   registerOpenAIRoutes(app, { store, getUpstreamClient, router, loadBalancer, onAttempt, sessionStore })
   registerOllamaRoutes(app, { store, getUpstreamClient, router, loadBalancer, onAttempt, sessionStore })
 
@@ -217,11 +219,12 @@ export function startServer(): void {
     logger.warn({ err: reloadError }, '存在历史配置重载错误，继续启动')
   }
 
-  const app = createApp({ store, webDistPath })
+  const cli = parseCliArgs(process.argv)
+  const app = createApp({ store, webDistPath, cli })
   // 日志保留期清理：进程内启动每日清扫定时器
   initLogRetention(getLogDir())
 
-  const listen = resolveListen(store.get(), { cli: parseCliArgs(process.argv) })
+  const listen = resolveListen(store.get(), { cli })
   const port = listen.port
   const host = listen.host
   app.listen(port, host, () => {

@@ -15,7 +15,7 @@ import type { StatsCounter } from '../stats/counter.js'
 import { SessionStore } from '../session/db.js'
 import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
 import { DOWNSTREAM_ENDPOINTS } from './downstreams.js'
-import { resolveListen } from './listen.js'
+import { resolveListen, type CliArgs } from './listen.js'
 import { maskApiKey } from './admin-helpers.js'
 
 // 依赖注入集合：由装配层（T19）构造后传入
@@ -27,6 +27,8 @@ export interface AdminDeps {
   sessionStore: SessionStore
   // 日志存储：/admin/api/logs 查询走 LogStore.query（SQLite），路由层不直接碰文件
   logStore: LogStore
+  // 命令行 --host/--port：透传到 /admin/api/health，保证返回值与 app.listen 实际生效值一致
+  cli?: CliArgs
 }
 
 // 日志查询参数（date 必填且必须是 YYYY-MM-DD；type 区分 app/api；level/keyword 可选）
@@ -136,7 +138,7 @@ function resolvePublicBaseUrl(listen: { host: string; port: number }): string {
  * 假定装配层已注入 express.json（10mb）与请求日志中间件。
  */
 export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
-  const { store, getUpstreamClient, stats, sessionStore, logStore } = deps
+  const { store, getUpstreamClient, stats, sessionStore, logStore, cli } = deps
 
   // 上游列表：apiKey 掩码后返回（仅展示用途，绝不回传明文）
   app.get('/admin/api/upstreams', (_req: Request, res: Response) => {
@@ -405,7 +407,7 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     for (const u of store.get().upstreams) {
       upstreams[u.id] = u.disabled ? 'paused' : 'healthy'
     }
-    const listen = resolveListen(store.get())
+    const listen = resolveListen(store.get(), { cli })
     res.json({
       status: 'ok',
       uptime: process.uptime(),

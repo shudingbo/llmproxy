@@ -190,7 +190,7 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 # 环境变量指向网关（把默认的 11434 换成网关端口）
 export OLLAMA_HOST=http://127.0.0.1:3000
 
-# ollama list 命中 GET /api/tags（列出聚合后的上游模型）
+# ollama list 命中 GET /api/tags（列出下游模型别名）
 ollama list
 
 # ollama run 命中 POST /api/chat（model 用下游别名）
@@ -209,7 +209,7 @@ const res = await ollama.chat({
 })
 ```
 
-> 限制：网关只实现了 Ollama 的 `/api/chat` 与 `/api/tags`；`/api/generate`、`/api/embed`、`/api/show` 等未实现。`n > 1` 在 `/api/chat` 上会被拒绝（400）。
+> 限制：网关只实现了 Ollama 的 `/api/chat`、`/api/tags` 与 `/api/version`；`/api/generate`、`/api/embed`、`/api/show` 等未实现。`n > 1` 在 `/api/chat` 上会被拒绝（400）。
 
 #### 流式调用 Streaming
 
@@ -294,9 +294,10 @@ All routes are served on the single port (default `3000`).
 | Endpoint | Supported | Notes |
 | --- | --- | --- |
 | `POST /v1/chat/completions` | ✅ | OpenAI-compatible chat; passthrough to upstream with alias routing; streaming SSE when `stream: true` |
-| `GET /v1/models` | ✅ | OpenAI-compatible model list (aggregated from upstreams) |
+| `GET /v1/models` | ✅ | OpenAI-compatible model list (returns downstream model aliases) |
 | `POST /api/chat` | ✅ | Ollama-compatible chat; request/response converted to/from the OpenAI upstream format; NDJSON streaming |
 | `GET /api/tags` | ✅ | Ollama-compatible model list |
+| `GET /api/version` | ✅ | Ollama-compatible version probe (returns `0.5.12`) |
 | `GET /admin/api/health` | ✅ | health check |
 | `GET /admin/api/stats` | ✅ | per-alias attempt counters (60s snapshot) |
 | `GET /admin/api/upstreams` · `POST` · `PUT /:id` · `DELETE /:id` · `POST /:id/test` | ✅ | upstream CRUD + connectivity test |
@@ -385,7 +386,7 @@ Server logs go to the file, not stdout — check the daily log under `logs/` whe
 | Requests fail with 404 / unknown model | the alias in `model` is not defined in `downstreamModels`; check the config file and the admin UI Models page |
 | Upstream unreachable → 502, then failover | verify `baseUrl` reachability (`POST /admin/api/upstreams/:id/test`), `apiKey`, and per-upstream `timeoutMs` |
 | Config edit "does nothing" | check `<userHome>/llmproxy/llmproxy.jsonc` is valid JSONC and the watcher reload succeeded (see `GET /admin/api/config/reload-error`) |
-| `GET /api/tags` or `/v1/models` stale | the model-list cache clears on config change; hit the upstream test endpoint to verify connectivity |
+| `GET /api/tags` or `/v1/models` stale | the model list returns downstream aliases directly from config (no caching); check the config file to ensure expected aliases are present |
 | Logs not on stdout | expected — logs are written to `<userHome>/llmproxy/logs/app-YYYY-MM-DD.log` |
 
 ## Development 开发说明
@@ -490,7 +491,7 @@ server 包内脚本（`pnpm --filter @llmproxy/server <script>`）：
 数据流（Ollama 路径）：客户端 → `/api/chat` → 转换器（转 OpenAI 请求）→ 上游客户端 → 上游响应 → 转换器（转 Ollama 响应 / NDJSON 流）→ 客户端。OpenAI 路径全程透传，只替换模型名。
 
 **server（装配与路由）**
-- `openai.ts`：`/v1/models`（聚合被下游引用的上游模型，60s 缓存，配置变更立即失效）与 `/v1/chat/completions`（非流式 / SSE 流式透传 + 回退）
+- `openai.ts`：`/v1/models`（返回下游别名列表）与 `/v1/chat/completions`（非流式 / SSE 流式透传 + 回退）
 - `ollama.ts`：`/api/tags` 与 `/api/chat`（转换 + 回退；`n > 1` 返回 400）
 - `admin.ts`：`/admin/api/*` 全部管理端点（上游 CRUD、连通性测试、模型映射、日志、统计、健康、配置）
 - `index.ts`：`createApp` 单端口装配：`express.json(10mb)` + 请求日志中间件 + 三组路由 + 静态 SPA + 非 API 前缀回退到 `index.html`；`startServer` 完成路径定位、配置装载与监听

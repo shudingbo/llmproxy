@@ -223,86 +223,53 @@ describe('Ollama 下游服务', () => {
     expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: true })
   })
 
-  it('GET /api/tags 聚合各上游模型，合并后转成 Ollama 模型列表', async () => {
-    const url1 = await startMock(async (req, res) => {
-      expect(req.url).toBe('/v1/models')
-      res.setHeader('Content-Type', 'application/json')
-      res.end(JSON.stringify({ data: [{ id: 'm1' }, { id: 'shared' }] }))
-    })
-    const url2 = await startMock(async (req, res) => {
-      expect(req.url).toBe('/v1/models')
-      res.setHeader('Content-Type', 'application/json')
-      res.end(JSON.stringify({ data: [{ id: 'm2' }, { id: 'shared' }] }))
-    })
-    addClient('u1', url1)
-    addClient('u2', url2)
-
+  it('GET /api/tags 返回下游别名列表（Ollama 形状）', async () => {
     const res = await request(app).get('/api/tags')
     expect(res.status).toBe(200)
     const body = res.body as {
       models: Array<{ name: string; model: string; details?: { format?: string; family?: string } }>
     }
-    // shared 在两个上游都出现，只保留一个；条目为 T16 转换后的 Ollama 形状
-    expect(body.models.map((m) => m.name).sort()).toEqual(['m1', 'm2', 'shared'])
+    // 返回的是 downstreamModels 的 key（下游别名）
+    expect(body.models).toHaveLength(1)
+    expect(body.models.map((m) => m.name)).toEqual(['gpt-4'])
+    expect(body.models[0].model).toBe('gpt-4')
     expect(body.models[0]).toMatchObject({ details: { format: 'openai', family: 'openai' } })
   })
 
-  it('模型列表 60s 缓存：重复请求不再次访问上游', async () => {
-    let u1Hits = 0
-    const url1 = await startMock(async (req, res) => {
-      u1Hits += 1
-      res.setHeader('Content-Type', 'application/json')
-      res.end(JSON.stringify({ data: [{ id: 'm1' }] }))
-    })
-    addClient('u1', url1)
-
-    await request(app).get('/api/tags')
-    await request(app).get('/api/tags')
-    // 两次请求只触发一次上游调用（第二次命中缓存）
-    expect(u1Hits).toBe(1)
+  it('多次请求 /api/tags 都返回一致的别名列表（不再访问上游）', async () => {
+    const res1 = await request(app).get('/api/tags')
+    const res2 = await request(app).get('/api/tags')
+    expect(res1.body).toEqual(res2.body)
+    expect((res1.body as { models: Array<{ name: string }> }).models.map((m) => m.name)).toEqual(['gpt-4'])
   })
 
-  it('配置变更后模型缓存立即失效', async () => {
-    let u1Hits = 0
-    const url1 = await startMock(async (req, res) => {
-      u1Hits += 1
-      res.setHeader('Content-Type', 'application/json')
-      res.end(JSON.stringify({ data: [{ id: 'm1' }] }))
-    })
-    const url2 = await startMock(async (req, res) => {
-      res.setHeader('Content-Type', 'application/json')
-      res.end(JSON.stringify({ data: [{ id: 'm2' }] }))
-    })
-    addClient('u1', url1)
-    addClient('u2', url2)
+  it('配置变更后 /api/tags 立即反映新别名（无需缓存，直接读配置）', async () => {
+    const first = await request(app).get('/api/tags')
+    expect((first.body as { models: Array<{ name: string }> }).models.map((m) => m.name)).toEqual(['gpt-4'])
 
-    await request(app).get('/api/tags')
-    expect(u1Hits).toBe(1)
-
-    // 管理端新增上游 u3（写入新模型别名），store.set 触发订阅 → 缓存失效
+    // 管理端新增别名 extra
     const current = store.get()
-    const url3 = await startMock(async (req, res) => {
-      res.setHeader('Content-Type', 'application/json')
-      res.end(JSON.stringify({ data: [{ id: 'm3' }] }))
-    })
-    addClient('u3', url3)
     store.set(
       {
         ...current,
-        upstreams: [
-          ...current.upstreams,
-          { id: 'u3', baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'k3', timeoutMs: 5000, disabled: false },
-        ],
-        downstreamModels: { ...current.downstreamModels, extra: [{ upstreamId: 'u3', model: 'm3-up' }] },
+        downstreamModels: { ...current.downstreamModels, extra: [{ upstreamId: 'u1', model: 'extra-up' }] },
       },
       { source: 'admin' },
     )
 
     const after = await request(app).get('/api/tags')
-    const ids = (after.body as { models: Array<{ name: string }> }).models.map((m) => m.name).sort()
-    expect(ids).toEqual(['m1', 'm2', 'm3'])
-    // 缓存失效后 u1 被重新拉取（计数 +1）
-    expect(u1Hits).toBe(2)
+    const names = (after.body as { models: Array<{ name: string }> }).models.map((m) => m.name).sort()
+    // 配置变更后立即返回新别名（直接读配置，无缓存）
+    expect(names).toEqual(['extra', 'gpt-4'])
+  })
+
+  it('GET /api/version 返回 Ollama 兼容版本号', async () => {
+    const res = await request(app).get('/api/version')
+    expect(res.status).toBe(200)
+    const body = res.body as { version?: string }
+    expect(body).toHaveProperty('version')
+    expect(typeof body.version).toBe('string')
+    expect(body.version!.length).toBeGreaterThan(0)
   })
 
   it('上游 500 时回退到下一个候选并最终 200', async () => {

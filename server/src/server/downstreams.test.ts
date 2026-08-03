@@ -112,9 +112,9 @@ describe('GET /admin/api/health', () => {
     const app = createApp({ store, webDistPath })
     const res = await request(app).get('/admin/api/health')
     const body = res.body as { host: string; port: number; baseUrl: string; listenSource: string }
-    expect(body.host).toBe('127.0.0.1')
+    expect(body.host).toBe('0.0.0.0')
     expect(body.port).toBe(3000)
-    expect(body.baseUrl).toBe('http://127.0.0.1:3000')
+    expect(body.baseUrl).toBe('http://0.0.0.0:3000')
     expect(body.listenSource).toBe('default')
   })
 })

@@ -1,5 +1,5 @@
 // Ollama 兼容下游的 HTTP 服务模块：/api/tags 与 /api/chat
-// 职责：模型列表聚合（带 60s 缓存）、非流式/流式转发（OpenAI 上游 → Ollama 响应形状）、顺序回退、尝试计数
+// 职责：模型列表（返回下游别名）、非流式/流式转发（OpenAI 上游 → Ollama 响应形状）、顺序回退、尝试计数
 // 请求体由装配层（T19）注入 express.json 解析；本模块不做体校验，一律转发给 T13 转换器
 // 只实现 /api/chat 与 /api/tags；/api/show、/api/generate、/api/embed、/api/create 明确不实现
 import type { Express, Request, Response } from 'express'
@@ -14,15 +14,6 @@ import { executeWithFallback, isFallbackableAxiosError } from '../router/fallbac
 import { Router } from '../router/index.js'
 import type { LoadBalancer } from '../router/load-balancer.js'
 import type { OpenAIUpstreamClient, UpstreamChatRequest } from '../upstream/openai.js'
-
-// 模型列表缓存的过期时间（毫秒）
-const MODELS_CACHE_TTL_MS = 60_000
-
-// 模型列表条目：id 必填，其余字段原样保留（按 id 去重合并）
-export interface ModelEntry {
-  id: string
-  [key: string]: unknown
-}
 
 // 依赖注入集合：由装配层（T19）构造后传入，形状与 openai.ts（T12）保持一致
 export interface OllamaDeps {
@@ -43,20 +34,11 @@ interface StreamSuccess {
 
 /**
  * 注册 Ollama 兼容下游路由（挂到传入的 Express 应用上）：
- * - GET /api/tags：聚合全部被下游模型引用的上游模型，60s 缓存，配置变更立即失效
+ * - GET /api/tags：返回下游别名列表（downstreamModels 的 key，转成 Ollama 形状）
  * - POST /api/chat：非流式/流式转发（OpenAI 上游 → Ollama 响应形状）+ 顺序回退
  */
 export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
   const { store, getUpstreamClient, loadBalancer, onAttempt } = deps
-
-  // 模型列表缓存：上游 id → { fetchedAt, models }，60 秒后过期
-  const modelsCache = new Map<string, { fetchedAt: number; models: ModelEntry[] }>()
-
-  // 配置变更（管理端写入 / 文件监听重载）→ 立即失效模型缓存，
-  // 新加入的上游下一次请求即被拉取（路由器按请求重建，天然最新）
-  store.subscribe(() => {
-    modelsCache.clear()
-  })
 
   // 按请求重建路由器：直接取 store 最新配置，避免订阅时序造成过期引用
   const buildRouter = (): Router => new Router(store.get())
@@ -90,23 +72,7 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
     return typeof status === 'number' ? status : undefined
   }
 
-  // 拉取单个上游的模型列表（60s 缓存；出错跳过，不拖垮整体列表）
-  const fetchModels = async (client: OpenAIUpstreamClient, upstreamId: string): Promise<ModelEntry[] | undefined> => {
-    const cached = modelsCache.get(upstreamId)
-    const now = Date.now()
-    if (cached !== undefined && now - cached.fetchedAt < MODELS_CACHE_TTL_MS) {
-      return cached.models
-    }
-    try {
-      const models = await client.listModels()
-      modelsCache.set(upstreamId, { fetchedAt: now, models })
-      return models
-    } catch {
-      return undefined
-    }
-  }
-
-  // 非流式转发：Ollama 形状请求 → OpenAI 上游 → 转回 Ollama 形状响应；全部候选失败返回 502
+  // 非流式转发：Ollama 形状请求 → OpenAI 上游 → 转回 Ollama 响应形状；全部候选失败返回 502
   const handleNonStream = async (
     res: Response,
     body: Record<string, unknown>,
@@ -222,32 +188,17 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
     ollamaStream.pipe(res)
   }
 
-  // 模型列表：聚合全部被下游模型引用的上游，按 id 去重合并后转成 Ollama /api/tags 结构
-  app.get('/api/tags', async (_req: Request, res: Response) => {
+  // Ollama 生态客户端连接探测端点：返回与 Ollama 兼容的版本号（如 Open WebUI 发起的首步探测）
+  app.get('/api/version', (_req: Request, res: Response) => {
+    res.json({ version: '0.5.12' })
+  })
+
+  // 模型列表：返回下游别名列表（downstreamModels 的 key），
+  // 与聊天接口可识别的模型名保持一致，不再从上游拉取
+  app.get('/api/tags', (_req: Request, res: Response) => {
     const config = store.get()
-    // 收集下游模型映射引用的全部上游 id（Set 去重）
-    const upstreamIds = new Set<string>()
-    for (const candidates of Object.values(config.downstreamModels)) {
-      for (const candidate of candidates) {
-        upstreamIds.add(candidate.upstreamId)
-      }
-    }
-    const byId = new Map<string, ModelEntry>()
-    for (const upstreamId of upstreamIds) {
-      const client = getUpstreamClient(upstreamId)
-      if (!client) {
-        continue // 客户端缺失（如配置刚删除）时跳过
-      }
-      const models = await fetchModels(client, upstreamId)
-      if (!models) {
-        continue // 单个上游拉取失败跳过，不拖垮整体列表
-      }
-      for (const model of models) {
-        byId.set(model.id, model)
-      }
-    }
-    // 合并后的 OpenAI 模型列表 → Ollama 模型列表（T16 纯数据映射）
-    const converted = convertModelsList({ data: [...byId.values()] })
+    const data = Object.keys(config.downstreamModels).map((id) => ({ id }))
+    const converted = convertModelsList({ data })
     res.json(converted)
   })
 

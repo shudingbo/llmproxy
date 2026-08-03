@@ -423,11 +423,11 @@ describe('健康检查与配置 /admin/api/health|config', () => {
     expect(res.body.upstreams).toEqual({ u1: 'healthy', u2: 'paused' })
   })
 
-  it('health 返回当前下行流的 host / port / baseUrl 与 listenSource（缺省 127.0.0.1:3000）', async () => {
+  it('health 返回当前下行流的 host / port / baseUrl 与 listenSource（缺省 0.0.0.0:3000）', async () => {
     const res = await request(app).get('/admin/api/health')
-    expect(res.body.host).toBe('127.0.0.1')
+    expect(res.body.host).toBe('0.0.0.0')
     expect(res.body.port).toBe(3000)
-    expect(res.body.baseUrl).toBe('http://127.0.0.1:3000')
+    expect(res.body.baseUrl).toBe('http://0.0.0.0:3000')
     expect(res.body.listenSource).toBe('default')
   })
 
@@ -435,9 +435,9 @@ describe('健康检查与配置 /admin/api/health|config', () => {
     vi.stubEnv('PORT', '9999')
     try {
       const res = await request(app).get('/admin/api/health')
-      expect(res.body.host).toBe('127.0.0.1')
+      expect(res.body.host).toBe('0.0.0.0')
       expect(res.body.port).toBe(9999)
-      expect(res.body.baseUrl).toBe('http://127.0.0.1:9999')
+      expect(res.body.baseUrl).toBe('http://0.0.0.0:9999')
       expect(res.body.listenSource).toBe('env')
     } finally {
       vi.unstubAllEnvs()

@@ -15,6 +15,28 @@ import { getLogger, initLogRetention, requestLogger } from '../logger/index.js'
 import { registerAdminRoutes } from './admin.js'
 import { registerOpenAIRoutes } from './openai.js'
 import { registerOllamaRoutes } from './ollama.js'
+import { DOWNSTREAM_ENDPOINTS, type DownstreamEndpoint } from './downstreams.js'
+import { resolveListen } from './listen.js'
+
+// 启动时按下游类型分组打印一份端点清单：与 admin/api/health.downstreams 同源
+function logDownstreamEndpoints(endpoints: ReadonlyArray<DownstreamEndpoint>): void {
+  const grouped = new Map<DownstreamEndpoint['type'], DownstreamEndpoint[]>()
+  for (const ep of endpoints) {
+    const list = grouped.get(ep.type) ?? []
+    list.push(ep)
+    grouped.set(ep.type, list)
+  }
+  // 三类下游按固定顺序输出，避免随机抖动
+  for (const type of ['openai', 'ollama', 'admin'] as const) {
+    const list = grouped.get(type)
+    if (list === undefined || list.length === 0) {
+      continue
+    }
+    for (const ep of list) {
+      getLogger().info({ type: ep.type, method: ep.method, path: ep.path, summary: ep.summary }, 'downstream-ready')
+    }
+  }
+}
 
 // 装配层依赖：配置存储 + 前端构建产物目录（web/dist 的绝对路径）
 export interface AppDeps {
@@ -112,9 +134,15 @@ export function startServer(): void {
   // 日志保留期清理：进程内启动每日清扫定时器
   initLogRetention(getLogDir())
 
-  const port = Number(process.env.PORT) || 3000
-  const host = process.env.HOST ?? '127.0.0.1'
-  app.listen(port, () => {
-    logger.info({ port, host }, `ready on http://${host}:${port}`)
+  const listen = resolveListen(store.get())
+  const port = listen.port
+  const host = listen.host
+  app.listen(port, host, () => {
+    logger.info(
+      { port, host, listenSource: listen.source },
+      `ready on http://${host}:${port} (source=${listen.source})`,
+    )
+    // 启动期间打印当前暴露的全部下行流端点，方便部署/排障一眼可查
+    logDownstreamEndpoints(DOWNSTREAM_ENDPOINTS)
   })
 }

@@ -52,6 +52,17 @@ describe('ConfigStore', () => {
     expect(existsSync(`${path}.tmp`)).toBe(false)
   })
 
+  it('bootstrap 示例内含 server 配置节注释（提示用户下行流监听可配置）', () => {
+    const store = new ConfigStore(path)
+    const content = readFileSync(path, 'utf-8')
+    // 注释区告诉运维下行流的 IP/端口可配，给出现成的"取消注释即可"模板
+    expect(content).toContain('"server"')
+    expect(content).toContain('"host"')
+    expect(content).toContain('"port"')
+    // bootstrap 本身不带 server 字段，缺省无侵入
+    expect(store.get().server).toBeUndefined()
+  })
+
   it('文件已存在时直接装载', () => {
     writeFileSync(path, JSON.stringify(sampleConfig), 'utf-8')
     const store = new ConfigStore(path)

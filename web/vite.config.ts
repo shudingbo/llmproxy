@@ -18,7 +18,7 @@ export default defineConfig({
     }),
   ],
   server: {
-    port: 5173,
+    port: 5175,
     // 开发代理：把 /admin/api 前缀的请求转发到后端服务
     proxy: {
       '/admin/api': {

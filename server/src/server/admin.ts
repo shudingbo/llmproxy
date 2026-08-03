@@ -12,6 +12,8 @@ import { getLogger } from '../logger/index.js'
 import { getLogDir } from '../paths.js'
 import type { StatsCounter } from '../stats/counter.js'
 import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
+import { DOWNSTREAM_ENDPOINTS } from './downstreams.js'
+import { resolveListen } from './listen.js'
 import { maskApiKey } from './admin-helpers.js'
 
 // 依赖注入集合：由装配层（T19）构造后传入
@@ -269,12 +271,25 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
   })
 
   // 健康检查：进程存活 + 版本 + 各上游健康状态（disabled → paused）
+  // 附 downstreams：与启动日志同一份端点清单，供 web Dashboard 渲染下游 API 表
+  // baseUrl / host / port / listenSource：当前进程实际生效的下行流入口（与 startServer 共用 resolveListen）
   app.get('/admin/api/health', (_req: Request, res: Response) => {
     const upstreams: Record<string, 'healthy' | 'paused'> = {}
     for (const u of store.get().upstreams) {
       upstreams[u.id] = u.disabled ? 'paused' : 'healthy'
     }
-    res.json({ status: 'ok', uptime: process.uptime(), version: getVersion(), upstreams })
+    const listen = resolveListen(store.get())
+    res.json({
+      status: 'ok',
+      uptime: process.uptime(),
+      version: getVersion(),
+      upstreams,
+      downstreams: DOWNSTREAM_ENDPOINTS,
+      host: listen.host,
+      port: listen.port,
+      baseUrl: `http://${listen.host}:${listen.port}`,
+      listenSource: listen.source,
+    })
   })
 
   // 当前生效配置：apiKey 掩码后返回

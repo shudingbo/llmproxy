@@ -1,4 +1,4 @@
-// logger 单元测试：按日分文件、日期翻转、请求日志脱敏
+// logger 单元测试：按日分文件、日期翻转、请求日志脱敏、stdout 镜像
 import { EventEmitter } from 'node:events'
 import { mkdtempSync, readFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -84,6 +84,20 @@ describe('getLogger 按日分文件', () => {
   it('getLogger 返回同一单例', () => {
     const { getLogger } = mod
     expect(getLogger()).toBe(getLogger())
+  })
+
+  it('每条日志同步镜像到 process.stdout（控制台也能看到）', () => {
+    const { getLogger, flushLoggerSync } = mod
+    vi.setSystemTime(new Date(2026, 7, 2, 12, 0, 0))
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    try {
+      getLogger().info('stdout-mirror-marker-12345')
+      flushLoggerSync()
+      const lines = stdoutSpy.mock.calls.map((call) => String(call[0])).join('')
+      expect(lines).toContain('"msg":"stdout-mirror-marker-12345"')
+    } finally {
+      stdoutSpy.mockRestore()
+    }
   })
 })
 

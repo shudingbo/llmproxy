@@ -34,13 +34,27 @@ export const UpstreamCandidateSchema = z.object({
 export const DownstreamModelSchema = z.array(UpstreamCandidateSchema).min(1)
 
 /**
+ * 下行流监听配置（控制整个 server 进程对外暴露的 IP / 端口）：
+ * - host：监听地址（IPv4 / IPv6 / Unix socket 名）；缺省 127.0.0.1
+ * - port：TCP 端口（1-65535）；缺省 3000
+ * 提示：socket 在进程启动时绑定，修改本节后必须重启进程才能生效；
+ *       进程级配置变更不会通过文件监听即时应用，以避免出现端口漂移/重复绑定
+ */
+export const ServerListenSchema = z.object({
+  host: z.string().min(1).default('127.0.0.1'),
+  port: z.number().int().min(1).max(65535).default(3000),
+})
+
+/**
  * 完整配置：
  * - upstreams：上游列表（至少 1 个）
  * - downstreamModels：别名 → 候选列表的映射
+ * - server：可选的下行流监听配置（host / port）；未指定时按缺省值
  */
 export const ConfigSchema = z.object({
   upstreams: z.array(UpstreamSchema).min(1),
   downstreamModels: z.record(z.string(), DownstreamModelSchema),
+  server: ServerListenSchema.optional(),
 })
 
 // 导出的推断类型：全项目统一使用该类型表示一份配置
@@ -48,3 +62,4 @@ export type Config = z.infer<typeof ConfigSchema>
 
 export type Upstream = z.infer<typeof UpstreamSchema>
 export type UpstreamCandidate = z.infer<typeof UpstreamCandidateSchema>
+export type ServerListen = z.infer<typeof ServerListenSchema>

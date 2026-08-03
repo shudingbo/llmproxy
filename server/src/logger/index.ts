@@ -1,5 +1,6 @@
-// pino 日志器单例：按本地日期分文件（app-YYYY-MM-DD.log），日期翻转时自动切换目标流
-// 所有日志调用都经由自定义 write 包装流，写入前检查日期是否变化，保证每日一个文件
+// pino 日志器单例：按本地日期分文件（app-YYYY-MM-DD.log），同时镜像输出到 stdout
+// 所有日志调用都经由自定义 write 包装流：先做日期翻转检查与文件目标写入，再 tee 一份到控制台
+// 控制台输出已经过 pino redact 脱敏，密钥/请求头敏感字段不会出现
 import pino, { type Logger } from 'pino'
 import { mkdirSync, openSync } from 'node:fs'
 import type { IncomingHttpHeaders } from 'node:http'
@@ -19,17 +20,32 @@ interface LogDestination {
   end?(): void
 }
 
+// stdout 控制台目标：直接写 process.stdout，确保 pino redact 已经对内容脱敏后再输出
+function createConsoleDestination(): LogDestination {
+  return {
+    write(chunk: string): void {
+      // 直接同步写：避免异步缓冲在进程退出时丢失最后几条日志
+      // 控制台输出是单进程串行源，竞态风险由 Node 单线程事件循环天然消除
+      process.stdout.write(chunk)
+    },
+    flushSync(): void {
+      // stdout 自身不需要额外的同步冲刷
+    },
+  }
+}
+
 // 模块级单例状态（惰性初始化）
 let loggerInstance: Logger | null = null
 let currentDate = ''
-let currentDest: LogDestination | null = null
+let currentFileDest: LogDestination | null = null
+let consoleDest: LogDestination | null = null
 
 /**
- * 创建指向 logPath 的目标流。
+ * 创建指向 logPath 的文件目标流。
  * 先同步建目录并打开 fd，再交给 pino.destination（async 写入）；这样目标流立即可用，
  * 避免异步打开时 fd 尚未就绪导致 flushSync 抛 "sonic boom is not ready yet"。
  */
-function createDestination(logPath: string): LogDestination {
+function createFileDestination(logPath: string): LogDestination {
   mkdirSync(dirname(logPath), { recursive: true })
   const fd = openSync(logPath, 'a')
   return pino.destination({ fd, sync: false })
@@ -42,15 +58,15 @@ function createDestination(logPath: string): LogDestination {
 function maybeRotate(): void {
   const now = new Date()
   const date = getLocalDateString(now)
-  if (currentDest !== null && currentDate === date) return
+  if (currentFileDest !== null && currentDate === date) return
   // 日期变化（或首次）：创建指向新日期文件的目标流
-  const newDest = createDestination(getLogFilePath(now))
-  if (currentDest !== null) {
+  const newDest = createFileDestination(getLogFilePath(now))
+  if (currentFileDest !== null) {
     // 先冲刷再关闭旧目标，避免异步缓冲内容丢失
-    currentDest.flushSync?.()
-    currentDest.end?.()
+    currentFileDest.flushSync?.()
+    currentFileDest.end?.()
   }
-  currentDest = newDest
+  currentFileDest = newDest
   currentDate = date
 }
 
@@ -60,10 +76,13 @@ function maybeRotate(): void {
  */
 export function getLogger(): Logger {
   if (loggerInstance !== null) return loggerInstance
+  consoleDest ??= createConsoleDestination()
   const stream: pino.DestinationStream = {
     write(chunk: string): void {
       maybeRotate()
-      currentDest?.write(chunk)
+      currentFileDest?.write(chunk)
+      // stdout 镜像：运维/tmux/docker logs 能直接看到日志
+      consoleDest?.write(chunk)
     },
   }
   loggerInstance = pino(
@@ -84,7 +103,7 @@ export function getLogger(): Logger {
  * 同步冲刷当前日志目标（测试用：确保缓冲日志落盘后可断言）。
  */
 export function flushLoggerSync(): void {
-  currentDest?.flushSync?.()
+  currentFileDest?.flushSync?.()
 }
 
 // 带 requestId 的请求 / 响应对象类型（局部扩展，避免污染全局 Express 类型声明）

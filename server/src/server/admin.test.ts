@@ -593,20 +593,7 @@ describe('健康检查与配置 /admin/api/health|config', () => {
     expect(res.body.listenSource).toBe('default')
   })
 
-  it('health 在 env PORT 覆盖时反映 env 生效值', async () => {
-    vi.stubEnv('PORT', '9999')
-    try {
-      const res = await request(app).get('/admin/api/health')
-      expect(res.body.host).toBe('0.0.0.0')
-      expect(res.body.port).toBe(9999)
-      expect(res.body.baseUrl).toBe('http://0.0.0.0:9999')
-      expect(res.body.listenSource).toBe('env')
-    } finally {
-      vi.unstubAllEnvs()
-    }
-  })
-
-  it('health 在配置文件 server 节存在时反映 config 生效值（env 不存在时）', async () => {
+  it('health 在配置文件 server 节存在时反映 config 生效值', async () => {
     store.set(
       { ...store.get(), server: { host: '0.0.0.0', port: 8080 } },
       { source: 'admin' },

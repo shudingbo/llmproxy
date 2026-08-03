@@ -36,6 +36,8 @@ if (rebuild) {
 }
 
 // 前台启动服务（阻塞直到退出）
+// 除 --check / --rebuild 外的启动参数（如 --host/--port）原样透传给 server 进程
+const serverArgs = process.argv.slice(2).filter((a) => a !== '--check' && a !== '--rebuild')
 console.log('[start] 启动服务 node server/dist/index.js')
-const s = spawnSync(process.execPath, [join(ROOT, 'server/dist/index.js')], { cwd: ROOT, stdio: 'inherit' })
+const s = spawnSync(process.execPath, [join(ROOT, 'server/dist/index.js'), ...serverArgs], { cwd: ROOT, stdio: 'inherit' })
 process.exit(s.status ?? 0)

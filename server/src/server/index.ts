@@ -152,6 +152,46 @@ export function createApp(deps: AppDeps): Express {
 }
 
 /**
+ * 解析命令行参数：--host <v> / --host=<v>、--port <v> / --port=<v>
+ * - port 非法值（非 1-65535 整数）与 host 空值一律忽略，回落到 config > default 优先级
+ * - 返回值属性缺失即未提供；startServer 无 cli 参数时行为与旧版一致
+ */
+function parseCliArgs(argv: string[]): { host?: string; port?: number } {
+  const out: { host?: string; port?: number } = {}
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    // --host <v>：值在下一元素，取到后 i++ 跳过避免重复消费
+    if (a === '--host') {
+      const v = argv[i + 1]?.trim()
+      if (v !== undefined && v !== '') {
+        out.host = v
+        i++
+      }
+      continue
+    }
+    // --host=<v>：值在同一元素内，无需跳过下一元素
+    if (a.startsWith('--host=')) {
+      const v = a.slice('--host='.length).trim()
+      if (v !== '') out.host = v
+      continue
+    }
+    if (a === '--port') {
+      const n = Number(argv[i + 1])
+      if (Number.isInteger(n) && n >= 1 && n <= 65535) {
+        out.port = n
+        i++
+      }
+      continue
+    }
+    if (a.startsWith('--port=')) {
+      const n = Number(a.slice('--port='.length))
+      if (Number.isInteger(n) && n >= 1 && n <= 65535) out.port = n
+    }
+  }
+  return out
+}
+
+/**
  * 进程引导入口（二进制入口）：定位前端产物目录、装载配置、组合应用并监听 PORT。
  * 历史重载错误不阻塞启动，仅记录告警。
  */
@@ -181,7 +221,7 @@ export function startServer(): void {
   // 日志保留期清理：进程内启动每日清扫定时器
   initLogRetention(getLogDir())
 
-  const listen = resolveListen(store.get())
+  const listen = resolveListen(store.get(), { cli: parseCliArgs(process.argv) })
   const port = listen.port
   const host = listen.host
   app.listen(port, host, () => {

@@ -4,7 +4,7 @@
 import type { Express, Request, Response } from 'express'
 import type { Readable, Writable } from 'node:stream'
 import type { ConfigStore } from '../config/store.js'
-import { responsesRequestToChat } from '../converters/responses-request.js'
+import { responsesRequestToChat, responsesToChatMessages } from '../converters/responses-request.js'
 import { chatResponseToResponses } from '../converters/responses-response.js'
 import { createResponsesStream } from '../converters/responses-stream.js'
 import type { ResponsesRequest } from '../converters/responses-types.js'
@@ -236,7 +236,11 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
   ): Promise<void> => {
     // 未知模型别名在此抛 ModelNotFoundError，由外层 catch 转 404
     const candidates = buildRouter().resolve(model)
-    const session = extractSessionKey(req, body)
+    // responses 请求体无 messages 字段（结构为 { model, input, instructions }），
+    // 先归一化为 chat messages 形状再提取会话键：header 优先逻辑不受影响（header 存在直接返回），
+    // 无 header 时用归一化后的内容前缀 hash——与 chat 的「messages 前 2 条」语义一致
+    // （responses 前 2 条 = instructions + 首条 input），跨协议同内容可匹配同一会话
+    const session = extractSessionKey(req, { messages: responsesToChatMessages(body as ResponsesRequest) })
     const ctx = {
       downstreamModel: model,
       sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,

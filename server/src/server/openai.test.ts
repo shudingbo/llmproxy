@@ -84,13 +84,15 @@ class FakeSessionStore implements SessionStoreLike {
   records = new Map<string, { upstream_id: string }>()
   bindCalls: Array<{ sessionKey: string; upstreamId: string; client: string }> = []
   rebindCalls: Array<{ sessionKey: string; upstreamId: string; upstreamModel: string }> = []
+  touchCalls: string[] = []
 
   get(sessionKey: string): { upstream_id: string } | undefined {
     const record = this.records.get(sessionKey)
     return record ? { upstream_id: record.upstream_id } : undefined
   }
 
-  touch(): boolean {
+  touch(sessionKey: string): boolean {
+    this.touchCalls.push(sessionKey)
     return true
   }
 
@@ -584,5 +586,75 @@ describe('OpenAI 会话亲和路由', () => {
     expect(res2.status).toBe(200)
     expect(hitU1).toBe(1)
     expect(hitU2).toBe(2)
+  })
+
+  it('无 header 相同 input 的两次 /v1/responses 按内容 hash 命中同一会话并 touch', async () => {
+    let hitU1 = 0
+    let hitU2 = 0
+    const url1 = await startMock(async (req, res) => {
+      hitU1++
+      await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'r1', object: 'response', output: [] }))
+    })
+    const url2 = await startMock(async (req, res) => {
+      hitU2++
+      await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'r2', object: 'response', output: [] }))
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+    const session = new FakeSessionStore()
+    buildApp(session)
+
+    const send = (): request.Test =>
+      request(app).post('/v1/responses').send({ model: 'gpt-4', input: 'hi' })
+
+    const res1 = await send()
+    expect(res1.status).toBe(200)
+    // 首次请求：无 header → 用归一化后的内容前缀 hash 作为会话键（client 标记 content-hash）
+    expect(session.bindCalls).toHaveLength(1)
+    expect(session.bindCalls[0]).toMatchObject({ upstreamId: 'u1', client: 'content-hash' })
+    const sessionKey = session.bindCalls[0].sessionKey
+    expect(sessionKey.startsWith('gpt-4::')).toBe(true)
+    expect(hitU1).toBe(1)
+
+    // 第二次同 input 请求：内容 hash 相同 → 命中已绑会话，touch 刷新并粘附 u1
+    const res2 = await send()
+    expect(res2.status).toBe(200)
+    expect(session.touchCalls).toEqual([sessionKey])
+    expect(hitU1).toBe(2)
+    expect(hitU2).toBe(0)
+  })
+
+  it('同一内容跨协议：chat messages 与 responses input 产生相同内容 hash 会话键', async () => {
+    let hitU1 = 0
+    const url = await startMock(async (req, res) => {
+      hitU1++
+      await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'c1', object: 'chat.completion', choices: [] }))
+    })
+    addClient('u1', url)
+    const session = new FakeSessionStore()
+    buildApp(session)
+
+    // chat 请求：messages 单条 user 消息 → 绑定 content-hash 会话键
+    const res1 = await request(app)
+      .post('/v1/chat/completions')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'X' }] })
+    expect(res1.status).toBe(200)
+    expect(session.bindCalls).toHaveLength(1)
+    const sessionKey = session.bindCalls[0].sessionKey
+    expect(session.bindCalls[0].client).toBe('content-hash')
+
+    // responses 请求（input:'X'）归一化后恰为单条 user 消息 → 与 chat 单条 messages 的
+    // 内容前缀 hash 相同 → 命中同一会话并 touch，不产生新绑定
+    const res2 = await request(app).post('/v1/responses').send({ model: 'gpt-4', input: 'X' })
+    expect(res2.status).toBe(200)
+    expect(session.touchCalls).toEqual([sessionKey])
+    expect(session.bindCalls).toHaveLength(1)
+    expect(hitU1).toBe(2)
   })
 })

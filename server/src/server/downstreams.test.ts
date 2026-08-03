@@ -115,7 +115,10 @@ describe('GET /admin/api/health', () => {
     const body = res.body as { host: string; port: number; baseUrl: string; listenSource: string }
     expect(body.host).toBe('0.0.0.0')
     expect(body.port).toBe(3000)
-    expect(body.baseUrl).toBe('http://0.0.0.0:3000')
+    // 通配监听下 baseUrl 用本机局域网 IP 生成（测试环境网卡 IP 不固定，只做形状断言）
+    expect(body.baseUrl.startsWith('http://')).toBe(true)
+    expect(body.baseUrl.endsWith(':3000')).toBe(true)
+    expect(body.baseUrl.includes('0.0.0.0')).toBe(false)
     expect(body.listenSource).toBe('default')
   })
 })

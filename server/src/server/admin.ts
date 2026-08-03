@@ -2,6 +2,7 @@
 // 职责：上游增删改查与连通性测试、下游模型映射替换、日志查询、统计、健康检查、配置查看与重载错误
 // 无鉴权（由部署层防护）、无 CORS（开发期走 web/vite 代理）；apiKey 一律不落日志、响应中全部掩码
 import { readFileSync } from 'node:fs'
+import { networkInterfaces } from 'node:os'
 import type { Express, Request, Response } from 'express'
 import { z, type ZodType } from 'zod'
 import type { ConfigStore } from '../config/store.js'
@@ -106,6 +107,28 @@ const extractErrorCode = (err: unknown): string => {
     return String(status)
   }
   return 'unknown'
+}
+
+// 本机首个非回环 IPv4（供通配监听时生成可访问的入口 URL）
+function getLocalIPv4(): string | undefined {
+  const nets = networkInterfaces()
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name] ?? []) {
+      if (net.family === 'IPv4' && !net.internal) {
+        return net.address
+      }
+    }
+  }
+  return undefined
+}
+
+// 生成客户端可访问的入口 URL：通配监听（0.0.0.0 / ::）时用本机 IP，否则用监听 host
+function resolvePublicBaseUrl(listen: { host: string; port: number }): string {
+  const host =
+    listen.host === '0.0.0.0' || listen.host === '::'
+      ? (getLocalIPv4() ?? '127.0.0.1')
+      : listen.host
+  return `http://${host}:${listen.port}`
 }
 
 /**
@@ -391,7 +414,7 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
       downstreams: DOWNSTREAM_ENDPOINTS,
       host: listen.host,
       port: listen.port,
-      baseUrl: `http://${listen.host}:${listen.port}`,
+      baseUrl: resolvePublicBaseUrl(listen),
       listenSource: listen.source,
     })
   })

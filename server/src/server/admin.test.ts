@@ -589,7 +589,10 @@ describe('健康检查与配置 /admin/api/health|config', () => {
     const res = await request(app).get('/admin/api/health')
     expect(res.body.host).toBe('0.0.0.0')
     expect(res.body.port).toBe(3000)
-    expect(res.body.baseUrl).toBe('http://0.0.0.0:3000')
+    // 通配监听下 baseUrl 用本机局域网 IP 生成（测试环境网卡 IP 不固定，只做形状断言）
+    expect(res.body.baseUrl.startsWith('http://')).toBe(true)
+    expect(res.body.baseUrl.endsWith(':3000')).toBe(true)
+    expect(res.body.baseUrl.includes('0.0.0.0')).toBe(false)
     expect(res.body.listenSource).toBe('default')
   })
 
@@ -601,7 +604,10 @@ describe('健康检查与配置 /admin/api/health|config', () => {
     const res = await request(app).get('/admin/api/health')
     expect(res.body.host).toBe('0.0.0.0')
     expect(res.body.port).toBe(8080)
-    expect(res.body.baseUrl).toBe('http://0.0.0.0:8080')
+    // 通配监听下 baseUrl 用本机局域网 IP 生成（测试环境网卡 IP 不固定，只做形状断言）
+    expect(res.body.baseUrl.startsWith('http://')).toBe(true)
+    expect(res.body.baseUrl.endsWith(':8080')).toBe(true)
+    expect(res.body.baseUrl.includes('0.0.0.0')).toBe(false)
     expect(res.body.listenSource).toBe('config')
   })
 

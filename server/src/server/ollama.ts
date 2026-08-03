@@ -12,7 +12,8 @@ import { createOpenAIToOllamaStream } from '../converters/openai-to-ollama-strea
 import { ModelNotFoundError } from '../router/errors.js'
 import { executeWithFallback, isFallbackableAxiosError } from '../router/fallback.js'
 import { Router } from '../router/index.js'
-import type { LoadBalancer } from '../router/load-balancer.js'
+import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
+import { extractSessionKey } from '../session/key.js'
 import type { OpenAIUpstreamClient, UpstreamChatRequest } from '../upstream/openai.js'
 
 // 依赖注入集合：由装配层（T19）构造后传入，形状与 openai.ts（T12）保持一致
@@ -24,6 +25,8 @@ export interface OllamaDeps {
   router: Router
   loadBalancer: LoadBalancer
   onAttempt: (info: { upstreamId: string; ok: boolean; durationMs: number; status?: number }) => void
+  // 可选：会话亲和存储，用于请求回退成功后把会话粘附改绑到实际成功上游；未注入则跳过改绑
+  sessionStore?: SessionStoreLike
 }
 
 // 流式成功结果：转换后的 Ollama NDJSON 流 + 拆线函数
@@ -74,6 +77,7 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
 
   // 非流式转发：Ollama 形状请求 → OpenAI 上游 → 转回 Ollama 响应形状；全部候选失败返回 502
   const handleNonStream = async (
+    req: Request,
     res: Response,
     body: Record<string, unknown>,
     model: string,
@@ -81,10 +85,18 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
   ): Promise<void> => {
     // 未知模型别名在此抛 ModelNotFoundError，由外层 catch 转 404
     const candidates = buildRouter().resolve(model)
+    // 提取会话键（header X-OpenWebUI-Chat-Id 优先，缺省内容前缀 hash）：
+    // 有会话键 → 会话亲和路由粘附同一上游；无 → ctx 缺省 sessionKey，走轮询兜底
+    const session = extractSessionKey(req, body)
+    const ctx = {
+      downstreamModel: model,
+      sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
+      client: session?.client,
+    }
     const result = await executeWithFallback<OllamaChatResponse>(
       candidates,
       loadBalancer,
-      { downstreamModel: model },
+      ctx,
       async (candidate) => {
         const attemptStart = process.hrtime.bigint()
         const client = getUpstreamClient(candidate.upstreamId)
@@ -107,6 +119,12 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
           return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
         }
       },
+      (candidate) => {
+        // 回退成功后实际成功上游 ≠ 首选时，把会话粘附改绑到成功上游
+        if (ctx.sessionKey !== undefined) {
+          deps.sessionStore?.rebind(ctx.sessionKey, candidate.upstreamId, candidate.model)
+        }
+      },
     )
     if (result.ok && result.value) {
       res.status(200).json(result.value)
@@ -121,16 +139,23 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
 
   // 流式转发：先决议候选（失败可回退），成功后再设 NDJSON 头并接管转换流
   const handleStream = async (
+    req: Request,
     res: Response,
     body: Record<string, unknown>,
     model: string,
     signal: AbortSignal,
   ): Promise<void> => {
     const candidates = buildRouter().resolve(model)
+    const session = extractSessionKey(req, body)
+    const ctx = {
+      downstreamModel: model,
+      sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
+      client: session?.client,
+    }
     const result = await executeWithFallback<StreamSuccess>(
       candidates,
       loadBalancer,
-      { downstreamModel: model },
+      ctx,
       async (candidate) => {
         const attemptStart = process.hrtime.bigint()
         const client = getUpstreamClient(candidate.upstreamId)
@@ -162,6 +187,12 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
         } catch (err) {
           reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
           return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
+        }
+      },
+      (candidate) => {
+        // 回退成功后实际成功上游 ≠ 首选时，把会话粘附改绑到成功上游
+        if (ctx.sessionKey !== undefined) {
+          deps.sessionStore?.rebind(ctx.sessionKey, candidate.upstreamId, candidate.model)
         }
       },
     )
@@ -216,10 +247,10 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
       const model = typeof body.model === 'string' ? body.model : ''
       const signal = createRequestSignal(res)
       if (body.stream === true) {
-        await handleStream(res, body, model, signal)
+        await handleStream(req, res, body, model, signal)
         return
       }
-      await handleNonStream(res, body, model, signal)
+      await handleNonStream(req, res, body, model, signal)
     } catch (err) {
       // 未知模型别名 → 404；其余异常（如候选为空）→ 502
       if (err instanceof ModelNotFoundError) {

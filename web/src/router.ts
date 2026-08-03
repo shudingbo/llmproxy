@@ -12,6 +12,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'upstreams', component: () => import('./views/Upstreams.vue'), meta: { title: 'Upstreams', icon: 'Connection' } },
       { path: 'models', component: () => import('./views/Models.vue'), meta: { title: 'Models', icon: 'Files' } },
       { path: 'logs', component: () => import('./views/Logs.vue'), meta: { title: 'Logs', icon: 'Document' } },
+      { path: 'sessions', component: () => import('./views/Sessions.vue'), meta: { title: 'Sessions', icon: 'Link' } },
       { path: 'stats', component: () => import('./views/Stats.vue'), meta: { title: 'Stats', icon: 'TrendCharts' } },
     ],
   },

@@ -29,6 +29,7 @@ import {
   Connection,
   Files,
   Document,
+  Link,
   TrendCharts,
 } from '@element-plus/icons-vue'
 
@@ -38,6 +39,7 @@ const menuItems = [
   { path: '/upstreams', title: 'Upstreams', icon: Connection },
   { path: '/models', title: 'Models', icon: Files },
   { path: '/logs', title: 'Logs', icon: Document },
+  { path: '/sessions', title: 'Sessions', icon: Link },
   { path: '/stats', title: 'Stats', icon: TrendCharts },
 ]
 

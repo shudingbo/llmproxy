@@ -7,10 +7,11 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ConfigStore } from '../config/store.js'
 import { Router } from '../router/index.js'
-import { RoundRobinLoadBalancer } from '../router/load-balancer.js'
+import { RoundRobinLoadBalancer, SessionAffinityLoadBalancer } from '../router/load-balancer.js'
+import { SessionStore } from '../session/db.js'
 import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
 import { StatsCounter } from '../stats/counter.js'
-import { getConfigPath, getLogDir } from '../paths.js'
+import { getConfigPath, getDataDir, getLogDir } from '../paths.js'
 import { getLogger, initLogRetention, requestLogger, configureLogging } from '../logger/index.js'
 import { registerAdminRoutes } from './admin.js'
 import { registerOpenAIRoutes } from './openai.js'
@@ -63,8 +64,33 @@ export function createApp(deps: AppDeps): Express {
   store.subscribe(rebuildClients)
 
   // 单例负载均衡器与统计计数器（跨请求共享）
-  const loadBalancer = new RoundRobinLoadBalancer()
+  // 会话亲和均衡器：同一会话（内容前缀 hash / Open WebUI chat_id）粘附同一上游，利用 LLM prompt cache；
+  // 无会话键的请求委托内部轮询均衡器，行为不变
+  const sessionStore = new SessionStore(join(getDataDir(), 'llmproxy.db'))
+  // 会话亲和总开关：routing.sessionAffinity.enabled 缺省为 true（schema 已给默认值），
+  // 仅当显式配置为 false 时退回纯轮询均衡器；开关在启动时确定，不做热更新重选
+  const affinityEnabled = store.get().routing?.sessionAffinity?.enabled !== false
+  const loadBalancer = affinityEnabled
+    ? new SessionAffinityLoadBalancer(sessionStore, new RoundRobinLoadBalancer())
+    : new RoundRobinLoadBalancer()
   const stats = new StatsCounter()
+
+  // 会话粘附自动清理：读配置取保留期与清理周期，启动执行一次 + 周期调度（interval 0 关闭）
+  const routing = store.get().routing?.sessionAffinity
+  const cleanupInterval = routing?.cleanupIntervalMs ?? 3600000
+  const cleanupMaxAge = routing?.cleanupMaxAgeMs ?? 604800000
+  const runCleanup = (): void => {
+    try {
+      const deleted = sessionStore.cleanup(cleanupMaxAge)
+      if (deleted > 0) getLogger().info(`会话清理完成，删除 ${deleted} 条`, 'session-cleanup')
+    } catch (err) {
+      getLogger().warn('会话清理失败', err)
+    }
+  }
+  runCleanup() // 启动执行一次
+  if (cleanupInterval > 0) {
+    setInterval(runCleanup, cleanupInterval).unref()
+  }
 
   // 每次上游尝试的统计钩子：直接计入计数器（status 字段被忽略，AttemptInfo 不需它）
   const onAttempt = (info: { upstreamId: string; ok: boolean; durationMs: number; status?: number }): void => {
@@ -82,9 +108,9 @@ export function createApp(deps: AppDeps): Express {
   // 请求日志中间件：每个请求生成 requestId 并记录方法/URL/状态码/耗时
   app.use(requestLogger)
   // 三组 API 路由：管理端 / OpenAI 兼容 / Ollama 兼容
-  registerAdminRoutes(app, { store, getUpstreamClient, stats })
-  registerOpenAIRoutes(app, { store, getUpstreamClient, router, loadBalancer, onAttempt })
-  registerOllamaRoutes(app, { store, getUpstreamClient, router, loadBalancer, onAttempt })
+  registerAdminRoutes(app, { store, getUpstreamClient, stats, sessionStore })
+  registerOpenAIRoutes(app, { store, getUpstreamClient, router, loadBalancer, onAttempt, sessionStore })
+  registerOllamaRoutes(app, { store, getUpstreamClient, router, loadBalancer, onAttempt, sessionStore })
 
   // 静态 SPA 产物（由 web 包 vite build 生成）；目录缺失时 express.static 只回 404，不抛错
   app.use(express.static(webDistPath))

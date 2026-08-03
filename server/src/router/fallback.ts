@@ -87,6 +87,7 @@ export async function executeWithFallback<T>(
   lb: LoadBalancer,
   ctx: RequestCtx,
   callFn: (candidate: UpstreamCandidate) => Promise<CallResult<T>>,
+  onSuccess?: (candidate: UpstreamCandidate) => void, // 成功时回调实际成功上游（可能 ≠ 首选），供调用方做会话映射 rebind 等处理
 ): Promise<FallbackResult<T>> {
   if (candidates.length === 0) {
     throw new EmptyCandidatesError()
@@ -115,6 +116,8 @@ export async function executeWithFallback<T>(
         durationMs,
         fallbackable: false,
       })
+      // 通知调用方实际成功的上游（回退成功后可能 ≠ 首选），由调用方决定是否 rebind 会话映射
+      onSuccess?.(candidate)
       return { ok: true, value: result.value, attemptLog }
     }
 

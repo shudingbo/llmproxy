@@ -1,8 +1,8 @@
 # llmproxy
 
-一个单端口的 LLM 网关：把多个 OpenAI 兼容上游（OpenAI、DeepSeek、Ollama 等）聚合成统一的 OpenAI 与 Ollama 兼容入口，支持模型别名、负载均衡、顺序回退、API 统计与内置管理界面。
+一个单端口的 LLM 网关：把多个 OpenAI 兼容上游（OpenAI、DeepSeek、Ollama 等）聚合成统一的 OpenAI 与 Ollama 兼容入口，支持模型别名、负载均衡、会话亲和路由、顺序回退、API 统计与内置管理界面。
 
-A single-port LLM gateway that aggregates multiple OpenAI-compatible upstreams (OpenAI, DeepSeek, Ollama, ...) behind unified OpenAI- and Ollama-compatible endpoints, with model aliases, round-robin load balancing, sequential failover, request stats, and a built-in admin UI.
+A single-port LLM gateway that aggregates multiple OpenAI-compatible upstreams (OpenAI, DeepSeek, Ollama, ...) behind unified OpenAI- and Ollama-compatible endpoints, with model aliases, round-robin load balancing, session-affinity routing, sequential failover, request stats, and a built-in admin UI.
 
 ## Quickstart
 
@@ -61,6 +61,11 @@ Schema reference — see `server/src/config/schema.ts` for the authoritative Zod
 | `downstreamModels` | record | alias → ordered candidate list (min 1 each) |
 | `downstreamModels[alias][].upstreamId` | string | must match an `upstreams[].id` |
 | `downstreamModels[alias][].model` | string | model name used on the upstream side |
+| `routing` | object (optional) | routing behavior config, currently session affinity |
+| `routing.sessionAffinity` | object | session-affinity routing; omitted = defaults |
+| `routing.sessionAffinity.enabled` | boolean | master switch, default `true` |
+| `routing.sessionAffinity.cleanupMaxAgeMs` | number | session retention period, default `604800000` (1 week); `0` = never expire |
+| `routing.sessionAffinity.cleanupIntervalMs` | number | auto-cleanup interval, default `3600000` (1 hour); `0` = disable auto cleanup |
 
 Example:
 
@@ -77,6 +82,14 @@ Example:
       { "upstreamId": "openai", "model": "gpt-4o-mini" },
       { "upstreamId": "ollama-local", "model": "qwen2.5:7b" }
     ]
+  },
+  // 路由行为（可选；省略时启用默认值）：同一会话粘附到同一上游，最大化 prompt cache 复用
+  "routing": {
+    "sessionAffinity": {
+      "enabled": true,              // 总开关，默认 true
+      "cleanupMaxAgeMs": 604800000, // 会话保留期，默认 1 周；0 = 永不过期
+      "cleanupIntervalMs": 3600000  // 自动清理周期，默认 1 小时；0 = 关闭自动清理
+    }
   }
 }
 ```
@@ -93,7 +106,7 @@ Example:
 
 ### 管理界面 Management UI
 
-管理端是 Vue 3 + Element Plus 单页应用，挂在 `/` 路径。左侧导航共 5 个页面，所有操作都通过 `/admin/api` 接口落到配置文件并立即生效。
+管理端是 Vue 3 + Element Plus 单页应用，挂在 `/` 路径。左侧导航共 6 个页面，所有操作都通过 `/admin/api` 接口并立即生效（配置类操作落到配置文件，会话粘附落到 SQLite）。
 
 #### Dashboard
 
@@ -150,6 +163,14 @@ Example:
 | Avg Latency (ms) | 平均延迟，保留 2 位小数 |
 
 明细表按上游 ID 列出 Requests / Errors / Avg Latency (ms)。副标题「Counters reset on restart」即计数器在进程重启后清零（纯内存，不落盘）。
+
+#### Sessions（会话）
+
+可视化会话亲和映射（见「路由与回退行为」下的会话亲和路由）：表格列出 Session Key、下游别名、粘附上游、上游模型、客户端、创建 / 更新时间，按更新时间倒序，每 5 秒自动刷新，支持分页与按客户端 / 关键词过滤：
+
+- **解绑**：点「解绑」调用 `DELETE /admin/api/sessions/:sessionKey`，该会话下次请求重新选上游
+- **清空全部**：调用 `DELETE /admin/api/sessions`，删除全部粘附映射
+- **立即清理**：调用 `POST /admin/api/sessions/cleanup`，立即执行一次过期清理（受 `cleanupMaxAgeMs` 约束）
 
 ### 客户端接入 Client Integration
 
@@ -238,6 +259,30 @@ curl -N http://127.0.0.1:3000/api/chat \
 - **全部失败**：返回 `502 {"error": "no_upstream"}`（附最后一次尝试的错误码）
 - **暂停的上游**（`disabled: true`）不参与路由，其候选在解析时被过滤；若某别名所有候选都被暂停，则按原列表返回并记警告，交由回退逻辑处理
 
+#### 会话亲和路由 Session Affinity
+
+会话亲和路由把**同一会话的请求粘附到同一上游**，最大化 LLM 的 prompt cache 利用率：同一段上下文反复命中同一上游，缓存命中率更高，首 token 延迟与成本都更低。
+
+**会话键来源**（优先级从高到低）：
+
+1. **HTTP header `X-OpenWebUI-Chat-Id`**：Open WebUI 专有头，值为聊天会话 UUID，命中即作为会话键
+2. **内容前缀哈希**：取请求体 `messages` 前 2 条（通常 system + 首条 user 消息）的 `role + content`，`sha256` 后作为会话键。无需 client 配合，相同前缀的请求自动汇聚到同一上游
+3. **两者都取不到**：回退原有轮询（round-robin），行为与旧版本一致
+
+**粘附映射持久化**在 SQLite：`<userHome>/llmproxy/llmproxy.db`，表 `sessions`（`session_key` / `session_id` / `client` / `downstream_model` / `upstream_id` / `upstream_model` / `created_at` / `updated_at`）。
+
+**粘附规则**：
+
+- 首次请求选定上游后固定，后续同会话请求不再参与轮询
+- 粘附的上游被**禁用 / 删除**时自动重新选择上游
+- 粘附的上游请求失败并**回退到其它上游成功**后，自动改绑到成功上游（绑定跟随实际可用性）
+
+**已知限制**：
+
+- 无会话键的请求（如 opencode 等不传会话标识的 client）走轮询，不享受会话亲和
+- 不同会话若内容前缀相同会粘到同一上游，这不影响正确性，反而最大化 cache 复用
+- 会话首条消息被编辑会导致内容哈希变化，视为新会话（会重新选上游）
+
 ### 管理 API 快速参考 Admin API Reference
 
 所有管理端点位于 `/admin/api`，返回 JSON；无鉴权（由部署层防护），请在可信网络内使用。
@@ -256,6 +301,10 @@ curl -N http://127.0.0.1:3000/api/chat \
 | GET | `/admin/api/stats` | 统计：`since` / `totals` / `perUpstream` |
 | GET | `/admin/api/config` | 当前生效配置（apiKey 已掩码） |
 | GET | `/admin/api/config/reload-error` | 最近一次配置重载错误（无则 `null`） |
+| GET | `/admin/api/sessions` | 会话粘附分页列表：`?offset&limit&client&keyword`（updated_at 倒序） |
+| DELETE | `/admin/api/sessions/:sessionKey` | 解绑单条会话（下次请求重新选上游） |
+| DELETE | `/admin/api/sessions` | 清空全部会话粘附映射 |
+| POST | `/admin/api/sessions/cleanup` | 立即执行一次过期清理 |
 
 常用 curl 示例：
 
@@ -304,13 +353,14 @@ All routes are served on the single port (default `3000`).
 | `GET /admin/api/downstream-models` · `PUT` | ✅ | alias/candidate management |
 | `GET /admin/api/logs` | ✅ | log lines with level/time/keyword filters |
 | `GET /admin/api/config` · `GET /admin/api/config/reload-error` | ✅ | config inspection + last reload error |
+| `GET /admin/api/sessions` · `DELETE /:sessionKey` · `DELETE` · `POST /cleanup` | ✅ | session-affinity mapping: list, unbind, clear-all, cleanup |
 | `/` (web UI) | ✅ | built admin SPA (requires `web/dist`, otherwise `503`) |
 
 Limitations: tool calls are stripped from upstream responses on the Ollama path (warned + dropped); `n > 1` is rejected with `400` on the Ollama path.
 
 ## Architecture
 
-The gateway is a single Node.js/Express process composed of three layers: a **gateway core** (config store + file watcher, model-alias router, round-robin load balancer, sequential failover, stats counter, pino request logger), **protocol adapters** (OpenAI-compatible and Ollama-compatible downstream routes plus OpenAI-compatible upstream clients, with dedicated converters for OpenAI ↔ Ollama request/response/stream shapes), and an **admin UI** (Vue 3 + Element Plus SPA served from the same port, managing upstreams, aliases, logs and stats through `/admin/api`). Upstream clients and the router rebuild on config change so edits apply without restart; every request is routed through the ordered candidate list with automatic failover to the next healthy upstream.
+The gateway is a single Node.js/Express process composed of three layers: a **gateway core** (config store + file watcher, model-alias router, round-robin load balancer, session-affinity routing with SQLite persistence, sequential failover, stats counter, pino request logger), **protocol adapters** (OpenAI-compatible and Ollama-compatible downstream routes plus OpenAI-compatible upstream clients, with dedicated converters for OpenAI ↔ Ollama request/response/stream shapes), and an **admin UI** (Vue 3 + Element Plus SPA served from the same port, managing upstreams, aliases, sessions, logs and stats through `/admin/api`). Upstream clients and the router rebuild on config change so edits apply without restart; every request is routed through the ordered candidate list with automatic failover to the next healthy upstream.
 
 ## Protocol Conversion
 
@@ -377,6 +427,14 @@ Server logs go to the file, not stdout — check the daily log under `logs/` whe
 4. **MUST NOT** be echoed back — no API response, error body, or admin endpoint echoes the stored key
 5. **MUST NOT** be displayed in cleartext anywhere in the UI — only the masked form is ever rendered
 
+## 部署注意事项 Deployment Notes
+
+**会话亲和路由**（功能说明见「使用说明」中的「会话亲和路由 Session Affinity」）：
+
+- **Open WebUI 需开启** `ENABLE_FORWARD_USER_INFO_HEADERS=true`（环境变量），否则 Open WebUI 不会发送 `X-OpenWebUI-Chat-Id` header，只能走内容前缀哈希兜底（仍可用，只是亲和精度略低）
+- Open WebUI 的 header 名可自定义：`FORWARD_SESSION_INFO_HEADER_CHAT_ID`（默认 `X-OpenWebUI-Chat-Id`）
+- **SQLite 依赖**：会话粘附持久化使用 better-sqlite3（Node 14+ 兼容）；DB 文件与配置文件同目录 `<userHome>/llmproxy/llmproxy.db`
+
 ## Troubleshooting
 
 | Symptom | Cause / Fix |
@@ -388,6 +446,7 @@ Server logs go to the file, not stdout — check the daily log under `logs/` whe
 | Config edit "does nothing" | check `<userHome>/llmproxy/llmproxy.jsonc` is valid JSONC and the watcher reload succeeded (see `GET /admin/api/config/reload-error`) |
 | `GET /api/tags` or `/v1/models` stale | the model list returns downstream aliases directly from config (no caching); check the config file to ensure expected aliases are present |
 | Logs not on stdout | expected — logs are written to `<userHome>/llmproxy/logs/app-YYYY-MM-DD.log` |
+| Open WebUI 会话未粘附到同一上游 | 确认已设置 `ENABLE_FORWARD_USER_INFO_HEADERS=true` 并重启 Open WebUI（见「部署注意事项」）；未开启时仅内容前缀哈希生效 |
 
 ## Development 开发说明
 
@@ -422,10 +481,10 @@ llmproxy/
     ├── index.html
     └── src/
         ├── main.ts         # 应用入口（Pinia + Router + Element Plus）
-        ├── router.ts       # 路由表（AdminLayout 下的 5 个页面）
+        ├── router.ts       # 路由表（AdminLayout 下的 6 个页面）
         ├── api/client.ts   # axios 实例，baseURL 固定 /admin/api
         ├── layouts/AdminLayout.vue   # 侧边导航 + 主内容区
-        └── views/          # Dashboard / Upstreams / Models / Logs / Stats
+        └── views/          # Dashboard / Upstreams / Models / Sessions / Logs / Stats
 ```
 
 ### 常用命令 Commands

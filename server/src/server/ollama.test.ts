@@ -12,7 +12,8 @@ import request from 'supertest'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { ConfigStore } from '../config/store.js'
 import { Router } from '../router/index.js'
-import { RoundRobinLoadBalancer } from '../router/load-balancer.js'
+import { RoundRobinLoadBalancer, SessionAffinityLoadBalancer, type SessionStoreLike } from '../router/load-balancer.js'
+import type { SessionBindInfo } from '../session/db.js'
 import { OpenAIUpstreamClient } from '../upstream/openai.js'
 import { registerOllamaRoutes, type OllamaDeps } from './ollama.js'
 
@@ -79,18 +80,46 @@ let app: Express
 let clients: Map<string, OpenAIUpstreamClient>
 const attempts: Array<{ upstreamId: string; ok: boolean; durationMs: number; status?: number }> = []
 
-// 构造被测应用：express.json（装配层职责）+ ollama 路由
-function buildApp(): void {
+// 内存 fake 会话存储：实现 SessionStoreLike（get/touch/bind/rebind）并记录调用，供会话亲和用例断言
+class FakeSessionStore implements SessionStoreLike {
+  records = new Map<string, { upstream_id: string }>()
+  bindCalls: Array<{ sessionKey: string; upstreamId: string; client: string }> = []
+  rebindCalls: Array<{ sessionKey: string; upstreamId: string; upstreamModel: string }> = []
+
+  get(sessionKey: string): { upstream_id: string } | undefined {
+    const record = this.records.get(sessionKey)
+    return record ? { upstream_id: record.upstream_id } : undefined
+  }
+
+  touch(): boolean {
+    return true
+  }
+
+  bind(sessionKey: string, info: SessionBindInfo): void {
+    this.bindCalls.push({ sessionKey, upstreamId: info.upstreamId, client: info.client })
+    this.records.set(sessionKey, { upstream_id: info.upstreamId })
+  }
+
+  rebind(sessionKey: string, upstreamId: string, upstreamModel: string): void {
+    this.rebindCalls.push({ sessionKey, upstreamId, upstreamModel })
+    this.records.set(sessionKey, { upstream_id: upstreamId })
+  }
+}
+
+// 构造被测应用：express.json（装配层职责）+ ollama 路由；传入会话存储时启用会话亲和均衡器
+function buildApp(session?: SessionStoreLike): void {
   app = express()
   app.use(express.json())
   registerOllamaRoutes(app, {
     store,
     getUpstreamClient: (id) => clients.get(id),
     router: new Router(store.get()),
-    loadBalancer: new RoundRobinLoadBalancer(),
+    loadBalancer:
+      session !== undefined ? new SessionAffinityLoadBalancer(session, new RoundRobinLoadBalancer()) : new RoundRobinLoadBalancer(),
     onAttempt: (info) => {
       attempts.push(info)
     },
+    sessionStore: session,
   } satisfies OllamaDeps)
 }
 
@@ -344,5 +373,111 @@ describe('Ollama 下游服务', () => {
     // 未注册路由 → Express 默认 404（不落入本模块的任何处理器）
     expect(res.status).toBe(404)
     expect(attempts).toHaveLength(0)
+  })
+})
+
+describe('Ollama 会话亲和路由', () => {
+  it('带 X-OpenWebUI-Chat-Id 的请求按会话粘附同一上游', async () => {
+    let hitU1 = 0
+    let hitU2 = 0
+    const url1 = await startMock(async (req, res) => {
+      hitU1++
+      await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'c1',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        }),
+      )
+    })
+    const url2 = await startMock(async (req, res) => {
+      hitU2++
+      await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'c2',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        }),
+      )
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+    const session = new FakeSessionStore()
+    buildApp(session)
+
+    const send = (): request.Test =>
+      request(app)
+        .post('/api/chat')
+        .set('X-OpenWebUI-Chat-Id', 'chat-1')
+        .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }] })
+
+    const res1 = await send()
+    expect(res1.status).toBe(200)
+    // 首次请求绑定会话：会话键格式 ${下游模型}::${raw}，client 标记 open-webui
+    expect(session.bindCalls).toHaveLength(1)
+    expect(session.bindCalls[0]).toMatchObject({
+      sessionKey: 'gpt-4::chat-1',
+      upstreamId: 'u1',
+      client: 'open-webui',
+    })
+    expect(hitU1).toBe(1)
+
+    // 第二次同会话请求：粘附 u1，不触碰 u2
+    const res2 = await send()
+    expect(res2.status).toBe(200)
+    expect(hitU1).toBe(2)
+    expect(hitU2).toBe(0)
+  })
+
+  it('首选上游失败回退成功后，会话粘附改绑到实际成功上游', async () => {
+    let hitU1 = 0
+    let hitU2 = 0
+    const url1 = await startMock(async (req, res) => {
+      hitU1++
+      await readBody(req)
+      res.statusCode = 500
+      res.end('boom')
+    })
+    const url2 = await startMock(async (req, res) => {
+      hitU2++
+      await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'ok',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        }),
+      )
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+    const session = new FakeSessionStore()
+    buildApp(session)
+
+    const send = (): request.Test =>
+      request(app)
+        .post('/api/chat')
+        .set('X-OpenWebUI-Chat-Id', 'chat-2')
+        .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }] })
+
+    const res1 = await send()
+    expect(res1.status).toBe(200)
+    // 首次：先绑 u1（轮询首选）→ u1 500 回退 u2 成功 → rebind 到 u2
+    expect(session.bindCalls).toHaveLength(1)
+    expect(session.bindCalls[0].upstreamId).toBe('u1')
+    expect(session.rebindCalls).toEqual([
+      { sessionKey: 'gpt-4::chat-2', upstreamId: 'u2', upstreamModel: 'gpt-4-u2' },
+    ])
+
+    // 第二次同会话请求：直达 u2，不再先试 u1
+    const res2 = await send()
+    expect(res2.status).toBe(200)
+    expect(hitU1).toBe(1)
+    expect(hitU2).toBe(2)
   })
 })

@@ -7,7 +7,8 @@ import type { ConfigStore } from '../config/store.js'
 import { ModelNotFoundError } from '../router/errors.js'
 import { executeWithFallback, isFallbackableAxiosError } from '../router/fallback.js'
 import { Router } from '../router/index.js'
-import type { LoadBalancer } from '../router/load-balancer.js'
+import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
+import { extractSessionKey } from '../session/key.js'
 import type { OpenAIUpstreamClient, UpstreamChatRequest } from '../upstream/openai.js'
 
 // 依赖注入集合：由装配层（T19）构造后传入
@@ -19,6 +20,8 @@ export interface OpenAIDeps {
   router: Router
   loadBalancer: LoadBalancer
   onAttempt: (info: { upstreamId: string; ok: boolean; durationMs: number; status?: number }) => void
+  // 可选：会话亲和存储，用于请求回退成功后把会话粘附改绑到实际成功上游；未注入则跳过改绑
+  sessionStore?: SessionStoreLike
 }
 
 // 非流式成功响应的包络：上游客户端只暴露响应体（axios 非 2xx 即抛错），status 恒为 2xx
@@ -84,10 +87,18 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
   ): Promise<void> => {
     // 未知模型别名在此抛 ModelNotFoundError，由外层 catch 转 404
     const candidates = buildRouter().resolve(model)
+    // 提取会话键（header X-OpenWebUI-Chat-Id 优先，缺省内容前缀 hash）：
+    // 有会话键 → 会话亲和路由粘附同一上游；无 → ctx 缺省 sessionKey，走轮询兜底
+    const session = extractSessionKey(req, body)
+    const ctx = {
+      downstreamModel: model,
+      sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
+      client: session?.client,
+    }
     const result = await executeWithFallback<ChatSuccess>(
       candidates,
       loadBalancer,
-      { downstreamModel: model },
+      ctx,
       async (candidate) => {
         const attemptStart = process.hrtime.bigint()
         const client = getUpstreamClient(candidate.upstreamId)
@@ -106,6 +117,12 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
         } catch (err) {
           reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
           return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
+        }
+      },
+      (candidate) => {
+        // 回退成功后实际成功上游 ≠ 首选时，把会话粘附改绑到成功上游
+        if (ctx.sessionKey !== undefined) {
+          deps.sessionStore?.rebind(ctx.sessionKey, candidate.upstreamId, candidate.model)
         }
       },
     )
@@ -129,10 +146,16 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     signal: AbortSignal,
   ): Promise<void> => {
     const candidates = buildRouter().resolve(model)
+    const session = extractSessionKey(req, body)
+    const ctx = {
+      downstreamModel: model,
+      sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
+      client: session?.client,
+    }
     const result = await executeWithFallback<StreamSuccess>(
       candidates,
       loadBalancer,
-      { downstreamModel: model },
+      ctx,
       async (candidate) => {
         const attemptStart = process.hrtime.bigint()
         const client = getUpstreamClient(candidate.upstreamId)
@@ -163,6 +186,12 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
         } catch (err) {
           reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
           return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
+        }
+      },
+      (candidate) => {
+        // 回退成功后实际成功上游 ≠ 首选时，把会话粘附改绑到成功上游
+        if (ctx.sessionKey !== undefined) {
+          deps.sessionStore?.rebind(ctx.sessionKey, candidate.upstreamId, candidate.model)
         }
       },
     )

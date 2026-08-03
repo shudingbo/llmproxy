@@ -9,6 +9,7 @@ import { DownstreamModelSchema, UpstreamSchema, type UpstreamCandidate } from '.
 import { getLogger } from '../logger/index.js'
 import { getApiLogFilePath, getAppLogFilePath } from '../paths.js'
 import type { StatsCounter } from '../stats/counter.js'
+import { SessionStore } from '../session/db.js'
 import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
 import { DOWNSTREAM_ENDPOINTS } from './downstreams.js'
 import { resolveListen } from './listen.js'
@@ -19,6 +20,8 @@ export interface AdminDeps {
   store: ConfigStore
   getUpstreamClient: (id: string) => OpenAIUpstreamClient | undefined
   stats: StatsCounter
+  // 会话粘附存储：列表/删除/清空/过期清理都由 SessionStore 提供，路由层不直接碰 SQLite
+  sessionStore: SessionStore
 }
 
 // 日志查询参数（date 必填且必须是 YYYY-MM-DD；type 区分 app/api；level/keyword 可选）
@@ -39,6 +42,23 @@ const LogQuerySchema: ZodType<LogQuery> = z.object({
   level: z.string().optional().default('info'),
   keyword: z.string().optional(),
   // query 参数均为字符串，用 coerce 转数字；int/min 校验不通过返回 400
+  offset: z.coerce.number().int().min(0).default(0),
+  limit: z.coerce.number().int().min(1).max(500).default(100),
+})
+
+// 会话粘附查询参数：client 精确匹配、keyword 模糊匹配 session_id/upstream_id（过滤由 SessionStore.list 实现）
+// offset/limit 游标分页：最新（updated_at 倒序）在前，offset 默认 0，limit 默认 100 上限 500
+interface SessionQuery {
+  client?: string
+  keyword?: string
+  offset: number
+  limit: number
+}
+
+const SessionQuerySchema: ZodType<SessionQuery> = z.object({
+  client: z.string().optional(),
+  keyword: z.string().optional(),
+  // query 参数均为字符串，用 coerce 转数字；int/min/max 校验不通过返回 400
   offset: z.coerce.number().int().min(0).default(0),
   limit: z.coerce.number().int().min(1).max(500).default(100),
 })
@@ -225,7 +245,7 @@ const extractErrorCode = (err: unknown): string => {
  * 假定装配层已注入 express.json（10mb）与请求日志中间件。
  */
 export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
-  const { store, getUpstreamClient, stats } = deps
+  const { store, getUpstreamClient, stats, sessionStore } = deps
 
   // 上游列表：apiKey 掩码后返回（仅展示用途，绝不回传明文）
   app.get('/admin/api/upstreams', (_req: Request, res: Response) => {
@@ -399,6 +419,61 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
       totals: { requests, errors, avgLatencyMs: requests > 0 ? totalLatencyMs / requests : 0 },
       perUpstream,
     })
+  })
+
+  // 会话粘附映射分页列表：updated_at 倒序（由 SessionStore.list 实现）；client 精确匹配、keyword 模糊匹配
+  // session_id/upstream_id；offset/limit 游标分页，total 为满足筛选条件的总数（不含分页）
+  app.get('/admin/api/sessions', (req: Request, res: Response) => {
+    const parsed = SessionQuerySchema.safeParse(req.query)
+    if (!parsed.success) {
+      res.status(400).json({ error: 'invalid_query', issues: parsed.error.issues.map((i) => i.message) })
+      return
+    }
+    const { client, keyword, offset, limit } = parsed.data
+    try {
+      const { rows, total } = sessionStore.list({ offset, limit, client, keyword })
+      res.json({ rows, total })
+    } catch (err) {
+      getLogger().warn({ err }, '会话粘附列表查询失败')
+      res.status(500).json({ error: 'session_list_failed' })
+    }
+  })
+
+  // 删除单条会话粘附（解绑）：下次请求重新选上游；幂等，不存在也返回 200 { deleted: false }
+  app.delete('/admin/api/sessions/:sessionKey', (req: Request, res: Response) => {
+    const sessionKey = String(req.params.sessionKey)
+    try {
+      res.json({ deleted: sessionStore.delete(sessionKey) })
+    } catch (err) {
+      getLogger().warn({ err, sessionKey }, '会话粘附删除失败')
+      res.status(500).json({ error: 'session_delete_failed' })
+    }
+  })
+
+  // 清空全部会话粘附：返回删除条数
+  app.delete('/admin/api/sessions', (_req: Request, res: Response) => {
+    try {
+      res.json({ deleted: sessionStore.clear() })
+    } catch (err) {
+      getLogger().warn({ err }, '会话粘附清空失败')
+      res.status(500).json({ error: 'session_clear_failed' })
+    }
+  })
+
+  // 立即手动清理过期会话：保留期从配置 routing.sessionAffinity.cleanupMaxAgeMs 读取（缺省 1 周）；
+  // 0 表示会话永不过期（与 schema 语义一致），此时跳过清理
+  app.post('/admin/api/sessions/cleanup', (_req: Request, res: Response) => {
+    const maxAgeMs = store.get().routing?.sessionAffinity?.cleanupMaxAgeMs ?? 604800000
+    if (maxAgeMs === 0) {
+      res.json({ deleted: 0 })
+      return
+    }
+    try {
+      res.json({ deleted: sessionStore.cleanup(maxAgeMs) })
+    } catch (err) {
+      getLogger().warn({ err, maxAgeMs }, '会话粘附过期清理失败')
+      res.status(500).json({ error: 'session_cleanup_failed' })
+    }
   })
 
   // 健康检查：进程存活 + 版本 + 各上游健康状态（disabled → paused）

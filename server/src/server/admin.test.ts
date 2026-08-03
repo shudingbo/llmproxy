@@ -7,10 +7,12 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import Database from 'better-sqlite3'
 import express, { type Express } from 'express'
 import request from 'supertest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ConfigStore } from '../config/store.js'
+import { SessionStore, type SessionBindInfo } from '../session/db.js'
 import { StatsCounter } from '../stats/counter.js'
 import type { OpenAIUpstreamClient } from '../upstream/openai.js'
 import { registerAdminRoutes } from './admin.js'
@@ -62,10 +64,32 @@ const errWithCode = (code: string): Error => Object.assign(new Error(code), { co
 // 带 status 属性的错误（模拟 HTTP 错误）
 const errWithStatus = (status: number): Error => Object.assign(new Error(String(status)), { status })
 
+// 直接用 SQL 改写某条记录的 updated_at（模拟时间流逝；SessionStore 不暴露裸 SQL）
+const setSessionUpdatedAt = (dbPath: string, sessionKey: string, updatedAt: number): void => {
+  const db = new Database(dbPath)
+  try {
+    db.prepare('UPDATE sessions SET updated_at = ? WHERE session_key = ?').run(updatedAt, sessionKey)
+  } finally {
+    db.close()
+  }
+}
+
+// 构造默认 bind 入参（可覆盖部分字段）
+const makeSessionInfo = (over: Partial<SessionBindInfo> = {}): SessionBindInfo => ({
+  sessionId: 'chat-uuid-1',
+  client: 'open-webui',
+  downstreamModel: 'gpt-4o',
+  upstreamId: 'up-1',
+  upstreamModel: 'gpt-4o-azure',
+  ...over,
+})
+
 // 每次测试的共享状态
 let tmpDir = ''
 let store: ConfigStore
 let stats: StatsCounter
+let sessionStore: SessionStore
+let sessionDbPath: string
 let app: Express
 let clients: Map<string, OpenAIUpstreamClient>
 
@@ -77,6 +101,7 @@ function buildApp(): void {
     store,
     getUpstreamClient: (id) => clients.get(id),
     stats,
+    sessionStore,
   })
 }
 
@@ -87,6 +112,9 @@ beforeEach(() => {
   writeFileSync(cfgPath, JSON.stringify(BASE_CONFIG))
   store = new ConfigStore(cfgPath)
   stats = new StatsCounter()
+  // 会话粘附存储：真实 SessionStore + 临时 DB 文件（WAL 伴生文件随 tmpDir 一并删除）
+  sessionDbPath = join(tmpDir, 'sessions.db')
+  sessionStore = new SessionStore(sessionDbPath)
   clients = new Map()
   buildApp()
   // Windows 读 USERPROFILE，POSIX 读 HOME：两个都 stub 才跨平台生效
@@ -96,6 +124,12 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.unstubAllEnvs()
+  // 先关会话库再删目录：WAL 模式下文件句柄保持打开，先关连接避免删除竞态
+  try {
+    sessionStore.close()
+  } catch {
+    // 连接已关闭，无需处理
+  }
   for (const srv of servers) {
     if (srv.listening) {
       srv.closeAllConnections()
@@ -603,5 +637,145 @@ describe('健康检查与配置 /admin/api/health|config', () => {
     store.setRecentReloadError(new Error('watcher boom'))
     const res2 = await request(app).get('/admin/api/config/reload-error')
     expect(res2.body).toEqual({ error: 'watcher boom' })
+  })
+})
+
+describe('会话粘附映射 /admin/api/sessions', () => {
+  it('GET 空库返回 rows=[] 且 total=0；bind 两条后倒序返回且 total 正确', async () => {
+    const empty = await request(app).get('/admin/api/sessions')
+    expect(empty.status).toBe(200)
+    expect(empty.body).toEqual({ rows: [], total: 0 })
+
+    sessionStore.bind('gpt-4o::chat-1', makeSessionInfo({ sessionId: 'sess-a', upstreamId: 'up-a' }))
+    sessionStore.bind('gpt-4o::chat-2', makeSessionInfo({ sessionId: 'sess-b', upstreamId: 'up-b' }))
+    // 手动错开 updated_at，保证倒序断言确定（不依赖 bind 的先后时序）
+    setSessionUpdatedAt(sessionDbPath, 'gpt-4o::chat-1', 100)
+    setSessionUpdatedAt(sessionDbPath, 'gpt-4o::chat-2', 200)
+
+    const res = await request(app).get('/admin/api/sessions')
+    expect(res.status).toBe(200)
+    expect(res.body.total).toBe(2)
+    expect(res.body.rows.map((r: { session_key: string }) => r.session_key)).toEqual([
+      'gpt-4o::chat-2',
+      'gpt-4o::chat-1',
+    ])
+    expect(res.body.rows[0].session_id).toBe('sess-b')
+    expect(res.body.rows[0].upstream_id).toBe('up-b')
+  })
+
+  it('GET client 精确过滤、keyword 模糊匹配 session_id/upstream_id、offset/limit 分页', async () => {
+    sessionStore.bind('gpt-4o::chat-1', makeSessionInfo({ sessionId: 'sess-alpha', upstreamId: 'up-alpha' }))
+    sessionStore.bind(
+      'gpt-4o::chat-2',
+      makeSessionInfo({ sessionId: 'sess-beta', upstreamId: 'up-beta', client: 'content-hash' }),
+    )
+    sessionStore.bind('gpt-4o::chat-3', makeSessionInfo({ sessionId: 'sess-gamma', upstreamId: 'up-gamma' }))
+    setSessionUpdatedAt(sessionDbPath, 'gpt-4o::chat-1', 100)
+    setSessionUpdatedAt(sessionDbPath, 'gpt-4o::chat-2', 200)
+    setSessionUpdatedAt(sessionDbPath, 'gpt-4o::chat-3', 300)
+
+    // client 精确匹配
+    const byClient = await request(app).get('/admin/api/sessions?client=open-webui')
+    expect(byClient.body.total).toBe(2)
+    expect(byClient.body.rows.map((r: { session_key: string }) => r.session_key)).toEqual([
+      'gpt-4o::chat-3',
+      'gpt-4o::chat-1',
+    ])
+
+    // keyword 命中 session_id
+    const bySession = await request(app).get('/admin/api/sessions?keyword=beta')
+    expect(bySession.body.total).toBe(1)
+    expect(bySession.body.rows[0].session_id).toBe('sess-beta')
+
+    // keyword 命中 upstream_id
+    const byUpstream = await request(app).get('/admin/api/sessions?keyword=up-gamma')
+    expect(byUpstream.body.total).toBe(1)
+    expect(byUpstream.body.rows[0].upstream_id).toBe('up-gamma')
+
+    // offset/limit 分页：跳过最新两条后只剩最旧一条
+    const page = await request(app).get('/admin/api/sessions?offset=2&limit=1')
+    expect(page.body.rows.map((r: { session_key: string }) => r.session_key)).toEqual(['gpt-4o::chat-1'])
+    expect(page.body.total).toBe(3)
+  })
+
+  it('GET 非法 offset/limit 返回 400', async () => {
+    const neg = await request(app).get('/admin/api/sessions?offset=-1')
+    expect(neg.status).toBe(400)
+    expect(neg.body.error).toBe('invalid_query')
+
+    const zero = await request(app).get('/admin/api/sessions?limit=0')
+    expect(zero.status).toBe(400)
+    expect(zero.body.error).toBe('invalid_query')
+
+    const over = await request(app).get('/admin/api/sessions?limit=501')
+    expect(over.status).toBe(400)
+    expect(over.body.error).toBe('invalid_query')
+  })
+
+  it('DELETE 单条：存在返回 { deleted: true } 且记录消失；不存在返回 { deleted: false }', async () => {
+    sessionStore.bind('gpt-4o::chat-1', makeSessionInfo({ sessionId: 'sess-a' }))
+
+    const gone = await request(app).delete('/admin/api/sessions/gpt-4o::chat-1')
+    expect(gone.status).toBe(200)
+    expect(gone.body).toEqual({ deleted: true })
+    expect(sessionStore.get('gpt-4o::chat-1')).toBeUndefined()
+
+    const missing = await request(app).delete('/admin/api/sessions/gpt-4o::no-such')
+    expect(missing.status).toBe(200)
+    expect(missing.body).toEqual({ deleted: false })
+  })
+
+  it('DELETE 清空返回删除条数；再次清空返回 0', async () => {
+    sessionStore.bind('gpt-4o::chat-a', makeSessionInfo({ sessionId: 'sess-a' }))
+    sessionStore.bind('gpt-4o::chat-b', makeSessionInfo({ sessionId: 'sess-b' }))
+
+    const res = await request(app).delete('/admin/api/sessions')
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ deleted: 2 })
+
+    const again = await request(app).delete('/admin/api/sessions')
+    expect(again.body).toEqual({ deleted: 0 })
+  })
+
+  it('POST cleanup 只删过期记录并返回删除数（保留期取配置缺省 1 周）', async () => {
+    const now = Date.now()
+    sessionStore.bind('gpt-4o::chat-old', makeSessionInfo({ sessionId: 'sess-old' }))
+    sessionStore.bind('gpt-4o::chat-new', makeSessionInfo({ sessionId: 'sess-new' }))
+    // 模拟时间流逝：旧记录 10 万 ms 前、新记录 1 千 ms 前（均早于缺省保留期 1 周=604800000ms → 未过期）
+    setSessionUpdatedAt(sessionDbPath, 'gpt-4o::chat-old', now - 100_000)
+    setSessionUpdatedAt(sessionDbPath, 'gpt-4o::chat-new', now - 1_000)
+
+    // 缺省保留期 604800000ms（1 周）：两条都未过期 → 删 0
+    const none = await request(app).post('/admin/api/sessions/cleanup')
+    expect(none.status).toBe(200)
+    expect(none.body).toEqual({ deleted: 0 })
+
+    // 配置把保留期缩短为 5 万 ms：旧记录过期被删，新记录保留
+    store.set(
+      {
+        ...store.get(),
+        routing: { sessionAffinity: { enabled: true, cleanupMaxAgeMs: 50_000, cleanupIntervalMs: 3600000 } },
+      },
+      { source: 'admin' },
+    )
+    const res = await request(app).post('/admin/api/sessions/cleanup')
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ deleted: 1 })
+    expect(sessionStore.get('gpt-4o::chat-old')).toBeUndefined()
+    expect(sessionStore.get('gpt-4o::chat-new')).toBeDefined()
+  })
+
+  it('POST cleanup 配置保留期为 0（永不过期）时跳过清理', async () => {
+    sessionStore.bind('gpt-4o::chat-old', makeSessionInfo({ sessionId: 'sess-old' }))
+    setSessionUpdatedAt(sessionDbPath, 'gpt-4o::chat-old', Date.now() - 100_000)
+
+    store.set(
+      { ...store.get(), routing: { sessionAffinity: { enabled: true, cleanupMaxAgeMs: 0, cleanupIntervalMs: 0 } } },
+      { source: 'admin' },
+    )
+    const res = await request(app).post('/admin/api/sessions/cleanup')
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ deleted: 0 })
+    expect(sessionStore.get('gpt-4o::chat-old')).toBeDefined()
   })
 })

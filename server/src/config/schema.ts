@@ -46,15 +46,37 @@ export const ServerListenSchema = z.object({
 })
 
 /**
+ * 路由配置（可选）：
+ * - sessionAffinity：会话亲和路由的开关与自动清理参数
+ *   - enabled：总开关，缺省 true
+ *   - cleanupMaxAgeMs：会话保留期（毫秒），缺省 1 周；0 表示会话永不过期
+ *   - cleanupIntervalMs：清理周期（毫秒），缺省 1 小时；0 表示关闭自动清理调度
+ * 允许只写部分键，其余取默认；整个 routing 可缺省
+ * 注：zod v4 中 `.default()` 不会把默认值再过一遍 schema（内部字段默认值不生效），
+ *     故用 `.prefault({})` 让缺省的空对象先进入 schema 解析，从而级联内部默认值
+ */
+export const RoutingSchema = z.object({
+  sessionAffinity: z
+    .object({
+      enabled: z.boolean().default(true),
+      cleanupMaxAgeMs: z.number().int().min(0).default(604800000),
+      cleanupIntervalMs: z.number().int().min(0).default(3600000),
+    })
+    .prefault({}),
+})
+
+/**
  * 完整配置：
  * - upstreams：上游列表（至少 1 个）
  * - downstreamModels：别名 → 候选列表的映射
  * - server：可选的下行流监听配置（host / port）；未指定时按缺省值
+ * - routing：可选的路由配置（会话亲和等）；未指定时按缺省值
  */
 export const ConfigSchema = z.object({
   upstreams: z.array(UpstreamSchema).min(1),
   downstreamModels: z.record(z.string(), DownstreamModelSchema),
   server: ServerListenSchema.optional(),
+  routing: RoutingSchema.optional(),
 })
 
 // 导出的推断类型：全项目统一使用该类型表示一份配置
@@ -63,3 +85,4 @@ export type Config = z.infer<typeof ConfigSchema>
 export type Upstream = z.infer<typeof UpstreamSchema>
 export type UpstreamCandidate = z.infer<typeof UpstreamCandidateSchema>
 export type ServerListen = z.infer<typeof ServerListenSchema>
+export type Routing = z.infer<typeof RoutingSchema>

@@ -1,6 +1,6 @@
 // 模式测试：默认值补齐、非法字段拒绝
 import { describe, expect, it } from 'vitest'
-import { ConfigSchema, UpstreamSchema } from './schema.js'
+import { ConfigSchema, RoutingSchema, UpstreamSchema } from './schema.js'
 
 // 一份完整合法的配置样本（各测试复用）
 const validConfig = {
@@ -141,5 +141,116 @@ describe('server 配置节（下行流监听）', () => {
     expect(
       ConfigSchema.safeParse({ ...validConfig, server: { host: '127.0.0.1', port: 65535 } }).success,
     ).toBe(true)
+  })
+})
+
+describe('routing 配置节（会话亲和）', () => {
+  it('未指定 routing 时 ConfigSchema 仍接受（向上兼容旧配置）', () => {
+    const result = ConfigSchema.safeParse(validConfig)
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.routing).toBeUndefined()
+  })
+
+  it('旧配置结构（upstreams + downstreamModels + server）不含 routing 仍 parse 成功', () => {
+    const oldConfig = {
+      ...validConfig,
+      server: { host: '0.0.0.0', port: 8080 },
+    }
+    const result = ConfigSchema.safeParse(oldConfig)
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.routing).toBeUndefined()
+    expect(result.data.server).toEqual({ host: '0.0.0.0', port: 8080 })
+  })
+
+  it('routing.sessionAffinity 缺省时全部取默认值', () => {
+    const result = ConfigSchema.safeParse({ ...validConfig, routing: {} })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.routing?.sessionAffinity).toEqual({
+      enabled: true,
+      cleanupMaxAgeMs: 604800000,
+      cleanupIntervalMs: 3600000,
+    })
+  })
+
+  it('只写 sessionAffinity.enabled=false 时其余键取默认值', () => {
+    const result = ConfigSchema.safeParse({
+      ...validConfig,
+      routing: { sessionAffinity: { enabled: false } },
+    })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.routing?.sessionAffinity).toEqual({
+      enabled: false,
+      cleanupMaxAgeMs: 604800000,
+      cleanupIntervalMs: 3600000,
+    })
+  })
+
+  it('cleanupMaxAgeMs / cleanupIntervalMs 显式给出时原样保留', () => {
+    const result = ConfigSchema.safeParse({
+      ...validConfig,
+      routing: { sessionAffinity: { cleanupMaxAgeMs: 0, cleanupIntervalMs: 0 } },
+    })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.routing?.sessionAffinity).toEqual({
+      enabled: true,
+      cleanupMaxAgeMs: 0,
+      cleanupIntervalMs: 0,
+    })
+  })
+
+  it('cleanupMaxAgeMs 为负数或字符串时拒绝', () => {
+    expect(
+      ConfigSchema.safeParse({
+        ...validConfig,
+        routing: { sessionAffinity: { cleanupMaxAgeMs: -1 } },
+      }).success,
+    ).toBe(false)
+    expect(
+      ConfigSchema.safeParse({
+        ...validConfig,
+        routing: { sessionAffinity: { cleanupMaxAgeMs: '604800000' } },
+      }).success,
+    ).toBe(false)
+  })
+
+  it('cleanupIntervalMs 为负数或小数时拒绝', () => {
+    expect(
+      ConfigSchema.safeParse({
+        ...validConfig,
+        routing: { sessionAffinity: { cleanupIntervalMs: -1 } },
+      }).success,
+    ).toBe(false)
+    expect(
+      ConfigSchema.safeParse({
+        ...validConfig,
+        routing: { sessionAffinity: { cleanupIntervalMs: 1.5 } },
+      }).success,
+    ).toBe(false)
+  })
+
+  it('enabled 为字符串时拒绝', () => {
+    const result = ConfigSchema.safeParse({
+      ...validConfig,
+      routing: { sessionAffinity: { enabled: 'false' } },
+    })
+    expect(result.success).toBe(false)
+  })
+})
+
+describe('RoutingSchema', () => {
+  it('空对象解析成功且取全部默认值', () => {
+    const result = RoutingSchema.safeParse({})
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.sessionAffinity).toEqual({
+      enabled: true,
+      cleanupMaxAgeMs: 604800000,
+      cleanupIntervalMs: 3600000,
+    })
   })
 })

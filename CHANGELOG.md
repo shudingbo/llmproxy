@@ -2,6 +2,18 @@
 
 本项目所有值得记录的变更都会汇总到本文件。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-08-04
+
+### 新增
+
+- 上游 `max_context_length` 配置（模型最大上下文，可手动设置或自动探测；`null` 显式清空，缺省不设）；管理界面新增「最大上下文」字段与「自动」按钮，点「自动」调用探测接口自动填写
+- 新增探测接口 `POST /admin/api/upstreams/probe-context`：body 可传 `id`（编辑模式，用配置真实密钥）或 `baseUrl` / `apiKey`（新增模式覆盖）；自动探测支持 llama.cpp（`/v1/models` 的 `data[].meta.n_ctx`）与 LM Studio（`/api/v1/models` 的 `models[].loaded_instances[].config.context_length`），并行取首个成功
+- 下游模型列表聚合 `meta.n_ctx`：`GET /v1/models` 与 `GET /api/tags` 返回的每个模型带 `meta: { n_ctx }`，值为该别名分组内候选上游 `max_context_length` 的最小值；所有候选均未配置时该模型不带 meta
+
+### 修复
+
+- 修复 LM Studio 探测在未指定模型时必失败的问题（相对参考实现，未指定模型时从已加载实例中取上下文长度）
+
 ## [0.2.0] - 2026-08-03
 
 ### 新增

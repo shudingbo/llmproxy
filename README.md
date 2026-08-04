@@ -58,6 +58,7 @@ Schema reference — see `server/src/config/schema.ts` for the authoritative Zod
 | `upstreams[].apiKey` | string | plaintext key (stored 0600 in the config file) |
 | `upstreams[].timeoutMs` | number | request timeout in ms, default `30000` |
 | `upstreams[].disabled` | boolean | pause switch, default `false` |
+| `upstreams[].max_context_length` | number \| null | model max context length, optional; admin UI can auto-detect from llama.cpp / LM Studio |
 | `downstreamModels` | record | alias → ordered candidate list (min 1 each) |
 | `downstreamModels[alias][].upstreamId` | string | must match an `upstreams[].id` |
 | `downstreamModels[alias][].model` | string | model name used on the upstream side |
@@ -75,6 +76,8 @@ Example:
   "upstreams": [
     { "id": "openai", "baseUrl": "https://api.openai.com/v1", "apiKey": "sk-...", "timeoutMs": 30000 },
     { "id": "ollama-local", "baseUrl": "http://127.0.0.1:11434/v1", "apiKey": "dummy" }
+    // 可选：模型最大上下文 max_context_length（可手动设置；管理界面可点「自动」调用后端探测接口自动填写，支持 llama.cpp / LM Studio）
+    // 例：{ "id": "llama-cpp", "baseUrl": "http://127.0.0.1:8080/v1", "apiKey": "dummy", "max_context_length": 32768 }
   ],
   // 下游别名 → 有序候选（按顺序尝试，失败自动切换到下一个）
   "downstreamModels": {
@@ -125,8 +128,8 @@ Example:
 
 表格列出全部上游：ID、Base URL、Type（固定 `openai`）、Status（`Healthy` / `Paused`）、Disabled（是/否）。**被暂停的行灰底显示并带 `Paused` 标签**，不会被隐藏。
 
-- **新增**：点「新增上游」，填写 ID（唯一）、Base URL（合法 URL）、API Key（新增时必填）、超时（ms，默认 30000）、是否暂停
-- **编辑**：点「编辑」。编辑模式下 ID 不可修改；**API Key 输入框留空表示「保持原密钥不变」**，仅当非空时才会上传覆盖（避免掩码值覆盖明文）
+- **新增**：点「新增上游」，填写 ID（唯一）、Base URL（合法 URL）、API Key（新增时必填）、超时（ms，默认 30000）、最大上下文（可选，模型最大上下文 `max_context_length`；可手动输入，或点「自动」按钮调用后端探测接口自动填写，支持 llama.cpp / LM Studio）、是否暂停
+- **编辑**：点「编辑」。编辑模式下 ID 不可修改；**API Key 输入框留空表示「保持原密钥不变」**，仅当非空时才会上传覆盖（避免掩码值覆盖明文）；最大上下文同样可改，清空输入表示显式置空（`null`）
 - **暂停 / 恢复**：点「暂停」或「恢复」只切换 `disabled` 字段，暂停后的上游不再参与路由
 - **测试**：点「测试」调用 `POST /admin/api/upstreams/:id/test`，弹窗展示状态（成功/失败）、延迟（ms）、HTTP 状态码、模型数，失败时附错误码（如 `ECONNREFUSED`）
 - **删除**：点「删除」需二次确认。删除后所有模型别名中引用该上游的候选会被级联清理（候选被清空的别名整体删除）；**最后一个上游不允许删除**
@@ -298,6 +301,7 @@ curl -N http://127.0.0.1:3000/api/chat \
 | PUT | `/admin/api/upstreams/:id` | 部分更新上游（ID 以路径为准；apiKey 留空保持原值） |
 | DELETE | `/admin/api/upstreams/:id` | 删除上游（级联清理候选；最后一个上游拒绝删除） |
 | POST | `/admin/api/upstreams/:id/test` | 连通性测试（可用 body 覆盖 baseUrl / apiKey） |
+| POST | `/admin/api/upstreams/probe-context` | 探测上游模型最大上下文（body 可传 `id` 用配置真实密钥，或 `baseUrl` / `apiKey` 覆盖；成功 `{ ok: true, max_context_length }`，探测不到 `{ ok: false, error: 'context_not_found' }`，缺参 400 `invalid_request`） |
 | GET | `/admin/api/downstream-models` | 查看别名 → 候选映射 |
 | PUT | `/admin/api/downstream-models` | 全量替换映射（每个别名至少 1 个候选） |
 | GET | `/admin/api/logs` | 日志查询（走 SQLite）：`?type=app|api&date=YYYY-MM-DD&level=info&keyword=xx&offset=0&limit=100`，返回 `lines` / `hasMore` |

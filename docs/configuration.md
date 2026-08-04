@@ -27,6 +27,7 @@
 | `upstreams[].apiKey` | string | 是 | — | 明文密钥（配置文件 0600 权限落盘） |
 | `upstreams[].timeoutMs` | number | 否 | `30000` | 请求超时（毫秒），必须为正整数 |
 | `upstreams[].disabled` | boolean | 否 | `false` | 暂停开关，`true` 时该上游不参与路由 |
+| `upstreams[].max_context_length` | number | 否 | — | 模型最大上下文（正整数）；可手动设置或管理端「自动」按钮探测（llama.cpp / LM Studio）；`null` 显式清空，缺省不设 |
 | `downstreamModels` | object | 是 | — | 下游模型别名映射：key = 虚拟模型别名，value = 候选数组 |
 | `downstreamModels[alias][]` | array | 是（至少 1 个候选） | — | 一个别名对应的有序候选列表 |
 | `downstreamModels[alias][].upstreamId` | string | 是 | — | 须与某个 `upstreams[].id` 对应 |
@@ -62,7 +63,8 @@
       "baseUrl": "http://222.18.149.200:1234/",   // 基础地址，必须是合法 URL
       "apiKey": "sk-REPLACE_ME",                  // 明文密钥（配置文件 0600 权限）
       "timeoutMs": 30000,                         // 请求超时（毫秒），默认 30000
-      "disabled": false                           // 暂停开关，默认 false
+      "disabled": false,                          // 暂停开关，默认 false
+      "max_context_length": 32768,                // 可选：模型最大上下文；可点管理端「自动」按钮探测（llama.cpp / LM Studio），缺省不设
     },
     {
       "id": "qwen3.5-9b-backup",
@@ -117,6 +119,7 @@
 - **`apiKey`**：明文存放。配置文件以 `0600` 权限落盘以保护密钥。密钥**绝不**出现在日志、管理接口响应或错误体中（管理接口只返回掩码值）。
 - **`timeoutMs`**：单次上游请求的超时（毫秒），缺省 `30000`。超时属于可回退错误，会触发故障切换。
 - **`disabled`**：暂停开关，缺省 `false`。暂停的上游在候选解析时被过滤，不再参与路由；管理界面显示 `Paused` 标签。
+- **`max_context_length`**：可选，模型最大上下文（正整数）。可手动填写，或点管理端「自动」按钮调用 `POST /admin/api/upstreams/probe-context` 探测（仅支持 llama.cpp / LM Studio 格式，其它上游探测不到返回 `context_not_found`）。显式 `null` 表示清空。下游模型列表（`/v1/models`、`/api/tags`）会按别名分组取各候选上游该值的**最小值**作为 `meta.n_ctx` 返回；所有候选均未配置时该模型不带 meta。
 
 ### downstreamModels（下游别名）
 

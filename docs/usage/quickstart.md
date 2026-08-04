@@ -85,8 +85,9 @@ node scripts/start.js --host 0.0.0.0 --port 8080
 
 ```jsonc
 {
+  // max_context_length 为可选：模型最大上下文，可手动设置或管理端「自动」按钮探测（llama.cpp / LM Studio），缺省不设
   "upstreams": [
-    { "id": "openai", "baseUrl": "https://api.openai.com/v1", "apiKey": "sk-...", "timeoutMs": 30000 },
+    { "id": "openai", "baseUrl": "https://api.openai.com/v1", "apiKey": "sk-...", "timeoutMs": 30000, "max_context_length": 32768 },
     { "id": "ollama-local", "baseUrl": "http://127.0.0.1:11434/v1", "apiKey": "dummy" }
   ],
   "downstreamModels": {

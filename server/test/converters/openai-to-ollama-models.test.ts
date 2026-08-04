@@ -36,4 +36,46 @@ describe('convertModelsList', () => {
     expect(result.models.map((m) => m.name)).toEqual(['gpt-4o', 'gpt-4o-mini'])
     expect(result.models).toHaveLength(2)
   })
+
+  it('传入 metaById 且命中时条目附加 meta 字段', () => {
+    const result = convertModelsList({ data: [{ id: 'gpt-4', object: 'model' }] }, { 'gpt-4': { n_ctx: 8192 } })
+    expect(result).toEqual({
+      models: [
+        {
+          name: 'gpt-4',
+          model: 'gpt-4',
+          modified_at: '2026-01-01T00:00:00Z',
+          size: 0,
+          details: {
+            format: 'openai',
+            family: 'openai',
+          },
+          meta: { n_ctx: 8192 },
+        },
+      ],
+    })
+  })
+
+  it('传入 metaById 但未命中时条目不带 meta 字段', () => {
+    const result = convertModelsList({ data: [{ id: 'gpt-4', object: 'model' }] }, { 'other-alias': { n_ctx: 4096 } })
+    expect(result).toEqual({
+      models: [
+        {
+          name: 'gpt-4',
+          model: 'gpt-4',
+          modified_at: '2026-01-01T00:00:00Z',
+          size: 0,
+          details: {
+            format: 'openai',
+            family: 'openai',
+          },
+        },
+      ],
+    })
+  })
+
+  it('不传 metaById 时条目不带 meta 字段（与原有行为一致）', () => {
+    const result = convertModelsList({ data: [{ id: 'gpt-4', object: 'model' }] })
+    expect(result.models[0]).not.toHaveProperty('meta')
+  })
 })

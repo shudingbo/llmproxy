@@ -8,6 +8,8 @@ export interface OllamaModel {
   model: string
   modified_at: string
   size: number
+  // 聚合后的上下文大小（下游别名分组内候选上游 max_context_length 的最小值）
+  meta?: { n_ctx: number }
   // digest 由真实 Ollama 返回；stub 阶段可缺省
   digest?: string
   details: {

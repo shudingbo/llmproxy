@@ -20,17 +20,28 @@ const PLACEHOLDER_MODIFIED_AT = '2026-01-01T00:00:00Z'
 /**
  * 把 OpenAI 模型列表转换为 Ollama /api/tags 响应结构。
  * name/model 复用 OpenAI 的 id；其余字段为占位 stub（不发起任何上游请求）。
+ * metaById：别名 → 聚合上下文映射；条目命中时附加 meta 字段，未命中/不传时输出与原来一致
  */
-export function convertModelsList(openaiResp: OpenAIModelsResponse): OllamaTagsResponse {
-  const models: OllamaModel[] = openaiResp.data.map((entry) => ({
-    name: entry.id,
-    model: entry.id,
-    modified_at: PLACEHOLDER_MODIFIED_AT,
-    size: 0,
-    details: {
-      format: 'openai',
-      family: 'openai',
-    },
-  }))
+export function convertModelsList(
+  openaiResp: OpenAIModelsResponse,
+  metaById?: Readonly<Record<string, { n_ctx: number }>>,
+): OllamaTagsResponse {
+  const models: OllamaModel[] = openaiResp.data.map((entry) => {
+    const model: OllamaModel = {
+      name: entry.id,
+      model: entry.id,
+      modified_at: PLACEHOLDER_MODIFIED_AT,
+      size: 0,
+      details: {
+        format: 'openai',
+        family: 'openai',
+      },
+    }
+    const meta = metaById?.[entry.id]
+    if (meta !== undefined) {
+      model.meta = meta
+    }
+    return model
+  })
   return { models }
 }

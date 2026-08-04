@@ -4,7 +4,7 @@
   "private": true,
   "version": "0.3.0",
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "packageManager": "pnpm@9.15.4",
   "license": "MIT",
@@ -24,7 +24,8 @@
   "pnpm": {
     "overrides": {
       "vite": "^6.4.3"
-    }
+    },
+    "onlyBuiltDependencies": []
   },
   "devDependencies": {
     "concurrently": "^10.0.4"

@@ -5,7 +5,7 @@
 ## 1. 仓库结构（pnpm workspace）
 
 - 两个子包：`server`（`@llmproxy/server`，Express 5 + TypeScript ESM）与 `web`（`@llmproxy/web`，Vue 3 + Element Plus + Pinia）。根 `package.json` 只放聚合脚本，没有业务代码。
-- Node ≥ 18，固定 `packageManager: pnpm@9.15.4`。本仓库 `npm` / `yarn` 不可用。
+- Node ≥ 22，固定 `packageManager: pnpm@9.15.4`。本仓库 `npm` / `yarn` 不可用。
 - ESM（`type: "module"`），TS `NodeNext` 模块解析：**跨文件 import 必须带 `.js` 后缀**（如 `import { getLogger } from '../logger/index.js'`），运行时不会自动加。
 
 ## 2. 数据目录（**不在 repo 内**，最容易踩坑）

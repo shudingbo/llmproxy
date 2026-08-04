@@ -14,6 +14,7 @@ import { Router } from '../router/index.js'
 import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
 import { extractSessionKey } from '../session/key.js'
 import type { OpenAIUpstreamClient, UpstreamChatRequest } from '../upstream/openai.js'
+import { buildAliasMetaMap } from './model-meta.js'
 
 // 依赖注入集合：由装配层（T19）构造后传入
 export interface OpenAIDeps {
@@ -368,14 +369,23 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
   }
 
   // 模型列表：返回下游别名列表（downstreamModels 的 key），
-  // 与聊天接口可识别的模型名保持一致，不再从上游拉取
+  // 与聊天接口可识别的模型名保持一致，不再从上游拉取；
+  // 别名能聚合出候选上游 max_context_length 时附加 meta: { n_ctx: 最小值 }
   app.get('/v1/models', (_req: Request, res: Response) => {
     const config = store.get()
-    const data = Object.keys(config.downstreamModels).map((id) => ({
-      id,
-      object: 'model',
-      owned_by: 'gateway',
-    }))
+    const metaMap = buildAliasMetaMap(config)
+    const data = Object.keys(config.downstreamModels).map((id) => {
+      const entry: { id: string; object: string; owned_by: string; meta?: { n_ctx: number } } = {
+        id,
+        object: 'model',
+        owned_by: 'llmproxy',
+      }
+      const meta: { n_ctx: number } | undefined = metaMap[id]
+      if (meta !== undefined) {
+        entry.meta = meta
+      }
+      return entry
+    })
     res.json({ object: 'list', data })
   })
 

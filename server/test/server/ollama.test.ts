@@ -292,6 +292,51 @@ describe('Ollama 下游服务', () => {
     expect(names).toEqual(['extra', 'gpt-4'])
   })
 
+  it('GET /api/tags 附加聚合 n_ctx：取候选上游最小值，忽略未配置的上游', async () => {
+    // u1 配置 8192，u2 未配置：别名 gpt-4（候选含 u1+u2）应取 u1 的 8192（u2 无值被忽略）
+    const current = store.get()
+    store.set(
+      {
+        ...current,
+        upstreams: [{ ...current.upstreams[0], max_context_length: 8192 }, current.upstreams[1]],
+      },
+      { source: 'admin' },
+    )
+
+    const res = await request(app).get('/api/tags')
+    expect(res.status).toBe(200)
+    const body = res.body as { models: Array<{ name: string; meta?: { n_ctx: number } }> }
+    expect(body.models[0].name).toBe('gpt-4')
+    expect(body.models[0].meta).toEqual({ n_ctx: 8192 })
+  })
+
+  it('GET /api/tags 多候选上游均配置时取最小 n_ctx', async () => {
+    // u1 配置 8192、u2 配置 16384：别名 gpt-4 聚合应为两者最小值 8192
+    const current = store.get()
+    store.set(
+      {
+        ...current,
+        upstreams: [
+          { ...current.upstreams[0], max_context_length: 8192 },
+          { ...current.upstreams[1], max_context_length: 16384 },
+        ],
+      },
+      { source: 'admin' },
+    )
+
+    const res = await request(app).get('/api/tags')
+    const body = res.body as { models: Array<{ name: string; meta?: { n_ctx: number } }> }
+    expect(body.models[0].meta).toEqual({ n_ctx: 8192 })
+  })
+
+  it('GET /api/tags 全部上游未配置 max_context_length 时条目不带 meta 字段', async () => {
+    // BASE_CONFIG 中 u1/u2 均未配置 max_context_length：别名无法聚合，不应出现 meta
+    const res = await request(app).get('/api/tags')
+    expect(res.status).toBe(200)
+    const body = res.body as { models: Array<{ name: string; meta?: { n_ctx: number } }> }
+    expect(body.models[0]).not.toHaveProperty('meta')
+  })
+
   it('GET /api/version 返回 Ollama 兼容版本号', async () => {
     const res = await request(app).get('/api/version')
     expect(res.status).toBe(200)

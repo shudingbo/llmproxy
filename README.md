@@ -4,6 +4,98 @@
 
 A single-port LLM gateway that aggregates multiple OpenAI-compatible upstreams (OpenAI, DeepSeek, Ollama, ...) behind unified OpenAI- and Ollama-compatible endpoints, with model aliases, round-robin load balancing, session-affinity routing, sequential failover, request stats, and a built-in admin UI.
 
+## Features
+
+- **Single-port gateway** — `OpenAI /v1`, `Ollama /api`, admin `/admin/api`, and the built-in SPA all live on one port (default `0.0.0.0:3000`). One process, one socket, hot-reload everything.
+- **Model aliases** — decouple the model name in the client request from the upstream's real model id. The same client-facing alias (`my-alias`) can fan out to an ordered candidate list across heterogeneous backends (OpenAI, DeepSeek, Ollama, vLLM, llama.cpp, ...).
+- **Session-affinity routing** — same-session requests stick to the same upstream, so the upstream's prompt cache stays hot. See the detailed section below.
+- **Round-robin + sequential failover** — per-alias round-robin pick; if the chosen upstream fails (network error / timeout / `429` / `5xx`), try the next candidate in declared order. Non-recoverable `4xx` (`401` / `403` / `404`) aborts immediately. All candidates exhausted → `502 {"error": "no_upstream"}`.
+- **Hot-reload config** — edits to `<userHome>/llmproxy/llmproxy.jsonc` are picked up by a `chokidar` watcher; no restart. Add or disable upstreams → effective immediately. Invalid edits keep the old config and surface as a warning.
+- **Dual-write logs** — every log line goes to both a date-rotated file (`logs/app-*.log` text + `logs/api-*.log` JSON) **and** SQLite (`llmproxy.db` `logs` table). DB writes never block business logic; the admin UI queries SQLite directly.
+- **Built-in admin SPA** — Vue 3 + Element Plus, six pages: Dashboard / Upstreams / Models / Sessions / Logs / Stats. Auto-imported Vue / Element Plus APIs (no manual `import { ElButton } from ...`).
+- **API key safety** — never logged (header-side filter + SQLite sanitizer at any nesting depth), never forwarded from a client `Authorization` header, never echoed in cleartext (admin endpoints return masked values, edit leaves the key untouched when blank).
+- **Context-length probing** — `POST /admin/api/candidates/probe-context` reads `n_ctx` straight from llama.cpp (`/v1/models` → `data[].meta.n_ctx`) or LM Studio (`/api/v1/models` → `models[].loaded_instances[].config.context_length`). `/v1/models` and `/api/tags` aggregate per-alias `meta.n_ctx = min(candidates.max_context_length)`.
+
+### Session-affinity routing — mechanism
+
+Session affinity pins a chat (or any bounded request sequence) to the same upstream so the upstream's prompt cache stays warm across turns. Without it, every turn risks landing on a different upstream → cache miss → higher latency + cost.
+
+#### Session key extraction
+
+The router derives a session key from the request. The first source that matches wins; if neither matches, the request falls back to plain round-robin.
+
+| Priority | Source | Implementation | `client` tag |
+| --- | --- | --- | --- |
+| 1 | HTTP header `X-OpenWebUI-Chat-Id` | case-insensitive header read, value used as-is (typically the Open WebUI chat UUID) | `open-webui` |
+| 2 | Content-prefix hash | `sha256(role + content)` over the first two messages (typically `system` + first `user` turn), JSON-stringified for multimodal payloads (arrays / objects / `null` fields preserved) | `content-hash` |
+| 3 | *(none)* | falls back to round-robin | — |
+
+Open WebUI users get the strongest key (explicit UUID) **when** `ENABLE_FORWARD_USER_INFO_HEADERS=true` is set on the Open WebUI side; otherwise they fall through to the content hash, which is still correct but may re-bind if the user edits their first message.
+
+#### The binding — what sticks
+
+- A binding is a row in SQLite (`<userHome>/llmproxy/llmproxy.db`, table `sessions`):
+  ```
+  session_key          text  -- e.g. "<downstreamModel>::<rawKey>"
+  session_id           text  -- the per-turn ID (e.g. Open WebUI chat id, or a content-hash)
+  client               text  -- 'open-webui' | 'content-hash'
+  downstream_model     text  -- the alias
+  upstream_id          text  -- the currently bound upstream
+  upstream_model       text  -- the model name on that upstream
+  created_at / updated_at  int  -- epoch ms; auto-cleanup uses updated_at
+  ```
+- The key stored is `<downstreamModel>::<rawKey>`, so the same upstream-facing chat stays bound per-alias — switching aliases (or merging two aliases pointing at the same upstream) gives an independent binding.
+
+#### Lifecycle of a binding
+
+```
+1. First request for a session key
+   → no row in `sessions`
+   → router picks an upstream via round-robin over the alias's candidate list
+   → bind: insert row (upstream_id, upstream_model = picked)
+
+2. Subsequent requests (same key)
+   → read row → bind upstream is still in the alias's candidate list
+     • yes → touch (update updated_at) → upstream chosen
+     • no  → the bound upstream has been disabled / deleted
+            → rebind: re-run round-robin → insert update row
+   → request flies to chosen upstream
+
+3. Bound upstream fails during a request
+   → router triggers sequential failover (next candidate in order)
+   → if a later candidate succeeds
+       → caller's onSuccess hook → sessionStore.rebind(sessionKey, new_upstream_id, new_model)
+       → binding now points to the actually-working upstream (binding follows availability)
+```
+
+This is the key safety property: **a binding never points at a dead upstream for long**. As soon as the upstream is unreachable and fallback succeeds, the binding follows the success.
+
+#### Configuration
+
+```jsonc
+"routing": {
+  "sessionAffinity": {
+    "enabled": true,              // master switch; default true (judged by !== false)
+    "cleanupMaxAgeMs": 604800000, // retention; default 1 week; 0 = never expire
+    "cleanupIntervalMs": 3600000  // auto-cleanup interval; default 1 hour; 0 = disable scheduler
+  }
+}
+```
+
+The master switch is read **once at process start** — changing it requires a restart. Per-alias candidates, disabled flags, and bindings themselves hot-reload (config watcher + manual rebind).
+
+#### Cleanup & retention
+
+- `cleanupMaxAgeMs` rows with `updated_at < now - retention` are deleted on each tick.
+- The cleanup interval is `unref()`'d, so it never blocks process exit.
+- `cleanupIntervalMs = 0` disables the scheduler (manual cleanup via `POST /admin/api/sessions/cleanup` still works).
+
+#### Known limits
+
+- Clients without a session identifier (e.g. some CLI tools, ad-hoc curl) fall through to round-robin and get **no** affinity.
+- Two distinct chats whose first two messages are byte-identical will share a binding (and the same upstream's cache). This is a feature, not a bug — cache hit rate goes up.
+- Editing the first message of a content-hash-keyed chat changes the key → re-bind. Open WebUI's UUID key is immune.
+
 ## Quickstart
 
 ```bash

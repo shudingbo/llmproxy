@@ -582,7 +582,7 @@ describe('健康检查与配置 /admin/api/health|config', () => {
     expect(res.status).toBe(200)
     expect(res.body.status).toBe('ok')
     expect(typeof res.body.uptime).toBe('number')
-    expect(res.body.version).toBe('0.1.0')
+    expect(res.body.version).toBe('0.3.0')
     expect(res.body.upstreams).toEqual({ u1: 'healthy', u2: 'paused' })
   })
 

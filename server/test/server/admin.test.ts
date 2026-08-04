@@ -1,5 +1,6 @@
 // 管理端 REST 接口测试：supertest + 真实 ConfigStore（临时目录）+ 可注入假客户端
 // 覆盖：上游 CRUD 与密钥掩码、级联删除、最后一个上游保护、连通性测试（覆盖/配置两种模式、各类错误代号）、
+//       上下文探测（新增/编辑模式、缺参 400、探测不到、网络错误、防御分支错误代号）、
 //       下游模型映射整体替换、日志 SQLite 查询（倒序/级别/关键词过滤/offset 翻页/limit/hasMore/日期过滤）、统计汇总、健康检查、配置掩码与重载错误
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
@@ -15,8 +16,16 @@ import { ConfigStore } from '../../src/config/store.js'
 import { LogStore, type LogEntry } from '../../src/logstore/index.js'
 import { SessionStore, type SessionBindInfo } from '../../src/session/db.js'
 import { StatsCounter } from '../../src/stats/counter.js'
+import { probeMaxContext } from '../../src/upstream/context.js'
 import type { OpenAIUpstreamClient } from '../../src/upstream/openai.js'
 import { registerAdminRoutes } from '../../src/server/admin.js'
+
+// probeMaxContext 包一层可替换的 mock：默认透传真实实现（其余用例不受影响），
+// 仅「防御分支」用例改为抛错，验证端点 try/catch → extractErrorCode 的错误代号回退
+vi.mock('../../src/upstream/context.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../../src/upstream/context.js')>()
+  return { ...original, probeMaxContext: vi.fn(original.probeMaxContext) }
+})
 
 // 基础配置模板：u1 健康 / u2 暂停；gpt-4 别名引用两者，only-u2 别名仅引用 u2（用于级联删除断言）
 const BASE_CONFIG = {
@@ -327,6 +336,128 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
     const res = await request(app).post('/admin/api/upstreams/u1/test')
     expect(res.body.ok).toBe(false)
     expect(res.body.error).toBe('503')
+  })
+})
+
+describe('上游上下文探测 /admin/api/upstreams/probe-context', () => {
+  // llama.cpp 格式 mock：/v1/models 返回 data[].meta.n_ctx；其余路径（含 LM Studio）返回空 data
+  const llamaCppMock = (nCtx: number): MockHandler => (req, res) => {
+    res.setHeader('Content-Type', 'application/json')
+    if (req.url === '/v1/models') {
+      res.end(JSON.stringify({ data: [{ id: 'llama3', meta: { n_ctx: nCtx } }] }))
+      return
+    }
+    res.end(JSON.stringify({ data: [] }))
+  }
+
+  it('新增模式：body baseUrl 指向 llama.cpp mock → 探测到上下文长度', async () => {
+    const url = await startMock(llamaCppMock(8192))
+    const res = await request(app).post('/admin/api/upstreams/probe-context').send({ baseUrl: url })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: true, max_context_length: 8192 })
+  })
+
+  it('编辑模式：id 命中配置 → 用配置的 baseUrl 与真实密钥探测', async () => {
+    let capturedAuth = ''
+    const url = await startMock((req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      if (req.url === '/v1/models') {
+        capturedAuth = req.headers.authorization ?? ''
+        res.end(JSON.stringify({ data: [{ id: 'm', meta: { n_ctx: 32768 } }] }))
+        return
+      }
+      res.end(JSON.stringify({ data: [] }))
+    })
+    // 把 u1 的 baseUrl 指到 mock（BASE_CONFIG 里 u1 原本指向 127.0.0.1:1）
+    const config = store.get()
+    store.set(
+      { ...config, upstreams: config.upstreams.map((u) => (u.id === 'u1' ? { ...u, baseUrl: url } : u)) },
+      { source: 'admin' },
+    )
+    const res = await request(app).post('/admin/api/upstreams/probe-context').send({ id: 'u1' })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: true, max_context_length: 32768 })
+    // 隐含证明用的是配置里的真实密钥（sk-long-1234），而非前端掩码值
+    expect(capturedAuth).toBe('Bearer sk-long-1234')
+  })
+
+  it('编辑模式：body 中非空 baseUrl/apiKey 覆盖配置值', async () => {
+    let capturedAuth = ''
+    const url = await startMock((req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      if (req.url === '/v1/models') {
+        capturedAuth = req.headers.authorization ?? ''
+        res.end(JSON.stringify({ data: [{ id: 'm', meta: { n_ctx: 4096 } }] }))
+        return
+      }
+      res.end(JSON.stringify({ data: [] }))
+    })
+    // u1 配置指向 127.0.0.1:1（不可达），仅靠 body 覆盖 baseUrl 才能探测成功
+    const res = await request(app)
+      .post('/admin/api/upstreams/probe-context')
+      .send({ id: 'u1', baseUrl: url, apiKey: 'sk-ovr' })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: true, max_context_length: 4096 })
+    expect(capturedAuth).toBe('Bearer sk-ovr')
+  })
+
+  it('无 id 且无 baseUrl（新增模式缺参）返回 400 invalid_request', async () => {
+    const empty = await request(app).post('/admin/api/upstreams/probe-context').send({})
+    expect(empty.status).toBe(400)
+    expect(empty.body.error).toBe('invalid_request')
+
+    // id 未命中配置 + 无 baseUrl 同样 400
+    const unknown = await request(app).post('/admin/api/upstreams/probe-context').send({ id: 'nope' })
+    expect(unknown.status).toBe(400)
+    expect(unknown.body.error).toBe('invalid_request')
+  })
+
+  it('探测不到（mock 返回空 data）→ context_not_found', async () => {
+    const url = await startMock((_req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ data: [] }))
+    })
+    const res = await request(app).post('/admin/api/upstreams/probe-context').send({ baseUrl: url })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: false, error: 'context_not_found' })
+  })
+
+  it('探测不到（mock 返回 404）→ context_not_found', async () => {
+    const url = await startMock((_req, res) => {
+      res.statusCode = 404
+      res.end('not found')
+    })
+    const res = await request(app).post('/admin/api/upstreams/probe-context').send({ baseUrl: url })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: false, error: 'context_not_found' })
+  })
+
+  it('网络错误（baseUrl 指向 127.0.0.1:1）→ 探测失败呈现 context_not_found', async () => {
+    const res = await request(app)
+      .post('/admin/api/upstreams/probe-context')
+      .send({ baseUrl: 'http://127.0.0.1:1/v1' })
+    expect(res.status).toBe(200)
+    expect(res.body.ok).toBe(false)
+    // probeMaxContext 把 ECONNREFUSED 等网络错误吞成 null（T2 约定），端点统一按「探测不到」呈现
+    expect(res.body.error).toBe('context_not_found')
+  })
+
+  it('防御分支：probeMaxContext 抛网络错误 → 返回错误代号（extractErrorCode）', async () => {
+    vi.mocked(probeMaxContext).mockRejectedValueOnce(errWithCode('ECONNREFUSED'))
+    const res = await request(app)
+      .post('/admin/api/upstreams/probe-context')
+      .send({ baseUrl: 'http://127.0.0.1:1/v1' })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: false, error: 'ECONNREFUSED' })
+  })
+
+  it('防御分支：probeMaxContext 抛无代号错误 → 回退 probe_failed', async () => {
+    vi.mocked(probeMaxContext).mockRejectedValueOnce(new Error('boom'))
+    const res = await request(app)
+      .post('/admin/api/upstreams/probe-context')
+      .send({ baseUrl: 'http://127.0.0.1:1/v1' })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: false, error: 'probe_failed' })
   })
 })
 

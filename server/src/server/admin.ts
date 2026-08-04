@@ -13,6 +13,7 @@ import { LogStore } from '../logstore/index.js'
 import { getLogDir } from '../paths.js'
 import type { StatsCounter } from '../stats/counter.js'
 import { SessionStore } from '../session/db.js'
+import { probeMaxContext } from '../upstream/context.js'
 import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
 import { DOWNSTREAM_ENDPOINTS } from './downstreams.js'
 import { resolveListen, type CliArgs } from './listen.js'
@@ -235,6 +236,57 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     } catch (err) {
       const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6
       res.json({ ok: false, latencyMs, modelCount: 0, error: extractErrorCode(err) })
+    }
+  })
+
+  // 上游模型上下文探测（llama.cpp / LM Studio）：
+  // 编辑模式（id 非空且命中配置）→ 以配置的 baseUrl/apiKey 为基座，body 中非空字符串覆盖
+  //   （编辑模式下前端拿不到明文密钥，必须走 id 让后端用配置里的真实密钥探测）
+  // 新增模式 → 必须提供非空 baseUrl，否则 400；apiKey 缺省 ''
+  // timeoutMs 缺省取配置上游的值（无配置则 5000），body 传正数时覆盖
+  app.post('/admin/api/upstreams/probe-context', async (req: Request, res: Response) => {
+    const config = store.get()
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const configured =
+      typeof body.id === 'string' && body.id !== '' ? config.upstreams.find((u) => u.id === body.id) : undefined
+    let baseUrl: string
+    let apiKey = ''
+    let timeoutMs = 5000
+    if (configured) {
+      baseUrl = configured.baseUrl
+      apiKey = configured.apiKey
+      timeoutMs = configured.timeoutMs ?? 5000
+      // body 中非空 baseUrl/apiKey 覆盖配置值（临时指到其它地址 / 换密钥测试）
+      if (typeof body.baseUrl === 'string' && body.baseUrl !== '') {
+        baseUrl = body.baseUrl
+      }
+      if (typeof body.apiKey === 'string' && body.apiKey !== '') {
+        apiKey = body.apiKey
+      }
+    } else {
+      // 新增模式：baseUrl 必填（id 未命中配置时也按新增处理）
+      if (typeof body.baseUrl !== 'string' || body.baseUrl === '') {
+        res.status(400).json({ error: 'invalid_request' })
+        return
+      }
+      baseUrl = body.baseUrl
+      apiKey = typeof body.apiKey === 'string' ? body.apiKey : ''
+    }
+    if (typeof body.timeoutMs === 'number' && body.timeoutMs > 0) {
+      timeoutMs = body.timeoutMs
+    }
+    try {
+      const maxContextLength = await probeMaxContext(baseUrl, { apiKey, timeoutMs })
+      if (maxContextLength === null) {
+        // 探测不到：两端点均失败 / 无 n_ctx 值；网络错误也被 probeMaxContext 吞成 null，统一呈现为 context_not_found
+        res.json({ ok: false, error: 'context_not_found' })
+        return
+      }
+      res.json({ ok: true, max_context_length: maxContextLength })
+    } catch (err) {
+      // 防御分支：probeMaxContext 约定不抛错，真抛了按错误代号返回（未知代号回退 probe_failed）
+      const code = extractErrorCode(err)
+      res.json({ ok: false, error: code === 'unknown' ? 'probe_failed' : code })
     }
   })
 

@@ -32,7 +32,9 @@ const BOOTSTRAP_JSONC = `{
       // 上游请求超时（毫秒），缺省 30000
       "timeoutMs": 60000,
       // 暂停开关：true 时该上游不参与路由
-      "disabled": false
+      "disabled": false,
+      // 模型最大上下文（可经管理端「自动」按钮探测 llama.cpp/LM Studio），缺省不设；null 表示清空
+      // "max_context_length": 32768,
     }
   ],
 

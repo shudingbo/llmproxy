@@ -9,8 +9,9 @@ import { z } from 'zod'
  * - apiKey：明文密钥（配置文件以 0600 权限落盘）
  * - timeoutMs：请求超时（毫秒），缺省 30000
  * - disabled：暂停开关，缺省 false
- * - max_context_length：模型最大上下文，可经管理端自动探测或手动设置；
- *   显式 null 表示清空（回到未设置状态），缺省即未设置
+ *
+ * 注意：max_context_length 是「模型 × 该上游实例」的属性，已移到 UpstreamCandidate；
+ * 同一上游跑不同模型时，每个模型各自独立配置上下文大小。
  */
 export const UpstreamSchema = z.object({
   id: z.string().min(1),
@@ -18,17 +19,20 @@ export const UpstreamSchema = z.object({
   apiKey: z.string().min(1),
   timeoutMs: z.number().int().positive().default(30000),
   disabled: z.boolean().default(false),
-  max_context_length: z.number().int().positive().nullable().optional(),
 })
 
 /**
  * 一个下游模型别名指向的单个候选上游：
  * - upstreamId：上游 id（须与 upstreams 中的条目对应）
  * - model：在上游侧使用的模型名
+ * - max_context_length：该上游上跑该模型时的最大上下文；
+ *   可经管理端自动探测或手动设置；显式 null 表示清空，缺省即未设置
+ *   （同一上游跑不同模型时各自独立，配置粒度对齐到候选而非上游）
  */
 export const UpstreamCandidateSchema = z.object({
   upstreamId: z.string(),
   model: z.string(),
+  max_context_length: z.number().int().positive().nullable().optional(),
 })
 
 /**

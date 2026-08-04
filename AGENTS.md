@@ -5,7 +5,7 @@
 ## 1. 仓库结构（pnpm workspace）
 
 - 两个子包：`server`（`@llmproxy/server`，Express 5 + TypeScript ESM）与 `web`（`@llmproxy/web`，Vue 3 + Element Plus + Pinia）。根 `package.json` 只放聚合脚本，没有业务代码。
-- Node ≥ 22，固定 `packageManager: pnpm@9.15.4`。本仓库 `npm` / `yarn` 不可用。
+- Node ≥ 22（`better-sqlite3@13.x` 强制要求；旧版 Node 18/20 已不支持），固定 `packageManager: pnpm@9.15.4`。本仓库 `npm` / `yarn` 不可用。
 - ESM（`type: "module"`），TS `NodeNext` 模块解析：**跨文件 import 必须带 `.js` 后缀**（如 `import { getLogger } from '../logger/index.js'`），运行时不会自动加。
 
 ## 2. 数据目录（**不在 repo 内**，最容易踩坑）
@@ -19,6 +19,8 @@
 ├── logs/              # app-YYYY-MM-DD.log（文本）+ api-YYYY-MM-DD.log（JSON）
 └── log4js.json        # 首次启动自动写入默认值，可手动编辑
 ```
+
+仓库根 `.npmrc` 设了 `ignore-scripts=true`：better-sqlite3 v13.0.2 自带 prebuilds（`package/prebuilds/*.node`），`require()` 时由 `lib/binding.js` 直接按 `process.platform-arch` 加载，**无需 install script 触发 node-gyp 编译**。该配置同时兼容 npm / pnpm，规避 npm publish 时隐式注入 `"install": "node-gyp rebuild"` 后触发 `find VS` 失败的 bug（[WiseLibs/better-sqlite3#1503](https://github.com/WiseLibs/better-sqlite3/issues/1503)）。
 
 - 想「重置」就是删这个目录；新克隆仓库后 **没有任何 llmproxy.jsonc**，需要先 `pnpm start` 让它 bootstrap。
 - 配置文件由 `chokidar` 监听热重载，**不需重启**。新增 / 禁用上游即时生效（见 `server/src/server/index.ts` 的 `rebuildClients`）。
@@ -94,7 +96,14 @@ express 应用（单进程，单端口）
 - **绝不**写日志（文件侧过滤头 + SQLite `sanitizeRawValue` 深度剔除双重保险）。
 - **绝不**转发客户端 `Authorization` 到上游——上游鉴权头只来自配置的 `apiKey`。
 - **绝不**以明文回显：`/admin/api/upstreams` 系列 apiKey 一律掩码返回；编辑时留空 = 保持原值。
-- 上游编辑实测时清空 `max_context_length` 输入框 = 显式 `null`（不是缺省）。
+
+## 9.5. 模型上下文长度（`max_context_length`）
+
+字段位置：**`UpstreamCandidate`（候选层）**，不在 `Upstream`。原因：同一上游跑不同模型时各自的 n_ctx 不同（LM Studio 同时加载 qwen2.5:7b-base 32k + llama3.1:8b 128k），按候选粒度配置。
+
+探测端点：`POST /admin/api/candidates/probe-context`，body 必传 `upstreamId` + `model`（候选身份），`baseUrl`/`apiKey` 缺省从配置上游取，非空字符串覆盖。
+
+聚合语义（`server/src/server/model-meta.ts`）：别名分组内候选 `max_context_length` 取**最小值**作为对外 `n_ctx`，全部未配置则该别名无 meta。
 
 ## 10. 前端要点（`web/`）
 

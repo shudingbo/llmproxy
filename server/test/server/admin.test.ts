@@ -339,25 +339,27 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
   })
 })
 
-describe('上游上下文探测 /admin/api/upstreams/probe-context', () => {
+describe('候选上下文探测 /admin/api/candidates/probe-context', () => {
   // llama.cpp 格式 mock：/v1/models 返回 data[].meta.n_ctx；其余路径（含 LM Studio）返回空 data
-  const llamaCppMock = (nCtx: number): MockHandler => (req, res) => {
+  const llamaCppMock = (nCtx: number, modelId = 'llama3'): MockHandler => (req, res) => {
     res.setHeader('Content-Type', 'application/json')
     if (req.url === '/v1/models') {
-      res.end(JSON.stringify({ data: [{ id: 'llama3', meta: { n_ctx: nCtx } }] }))
+      res.end(JSON.stringify({ data: [{ id: modelId, meta: { n_ctx: nCtx } }] }))
       return
     }
     res.end(JSON.stringify({ data: [] }))
   }
 
-  it('新增模式：body baseUrl 指向 llama.cpp mock → 探测到上下文长度', async () => {
+  it('新增模式：upstreamId 未命中配置 + 显式 baseUrl → 用 baseUrl 探测', async () => {
     const url = await startMock(llamaCppMock(8192))
-    const res = await request(app).post('/admin/api/upstreams/probe-context').send({ baseUrl: url })
+    const res = await request(app)
+      .post('/admin/api/candidates/probe-context')
+      .send({ upstreamId: 'new-u', model: 'llama3', baseUrl: url })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ ok: true, max_context_length: 8192 })
   })
 
-  it('编辑模式：id 命中配置 → 用配置的 baseUrl 与真实密钥探测', async () => {
+  it('编辑模式：upstreamId 命中配置 → 用配置的 baseUrl 与真实密钥探测', async () => {
     let capturedAuth = ''
     const url = await startMock((req, res) => {
       res.setHeader('Content-Type', 'application/json')
@@ -374,7 +376,9 @@ describe('上游上下文探测 /admin/api/upstreams/probe-context', () => {
       { ...config, upstreams: config.upstreams.map((u) => (u.id === 'u1' ? { ...u, baseUrl: url } : u)) },
       { source: 'admin' },
     )
-    const res = await request(app).post('/admin/api/upstreams/probe-context').send({ id: 'u1' })
+    const res = await request(app)
+      .post('/admin/api/candidates/probe-context')
+      .send({ upstreamId: 'u1', model: 'm' })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ ok: true, max_context_length: 32768 })
     // 隐含证明用的是配置里的真实密钥（sk-long-1234），而非前端掩码值
@@ -394,22 +398,34 @@ describe('上游上下文探测 /admin/api/upstreams/probe-context', () => {
     })
     // u1 配置指向 127.0.0.1:1（不可达），仅靠 body 覆盖 baseUrl 才能探测成功
     const res = await request(app)
-      .post('/admin/api/upstreams/probe-context')
-      .send({ id: 'u1', baseUrl: url, apiKey: 'sk-ovr' })
+      .post('/admin/api/candidates/probe-context')
+      .send({ upstreamId: 'u1', model: 'm', baseUrl: url, apiKey: 'sk-ovr' })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ ok: true, max_context_length: 4096 })
     expect(capturedAuth).toBe('Bearer sk-ovr')
   })
 
-  it('无 id 且无 baseUrl（新增模式缺参）返回 400 invalid_request', async () => {
-    const empty = await request(app).post('/admin/api/upstreams/probe-context').send({})
-    expect(empty.status).toBe(400)
-    expect(empty.body.error).toBe('invalid_request')
+  it('缺 upstreamId 返回 400 invalid_request + field=upstreamId', async () => {
+    const res = await request(app).post('/admin/api/candidates/probe-context').send({ model: 'm' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('invalid_request')
+    expect(res.body.field).toBe('upstreamId')
+  })
 
-    // id 未命中配置 + 无 baseUrl 同样 400
-    const unknown = await request(app).post('/admin/api/upstreams/probe-context').send({ id: 'nope' })
-    expect(unknown.status).toBe(400)
-    expect(unknown.body.error).toBe('invalid_request')
+  it('缺 model 返回 400 invalid_request + field=model', async () => {
+    const res = await request(app).post('/admin/api/candidates/probe-context').send({ upstreamId: 'u1' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('invalid_request')
+    expect(res.body.field).toBe('model')
+  })
+
+  it('upstreamId 未命中 + 无 baseUrl 返回 400 invalid_request + field=baseUrl', async () => {
+    const res = await request(app)
+      .post('/admin/api/candidates/probe-context')
+      .send({ upstreamId: 'nope', model: 'm' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('invalid_request')
+    expect(res.body.field).toBe('baseUrl')
   })
 
   it('探测不到（mock 返回空 data）→ context_not_found', async () => {
@@ -417,7 +433,9 @@ describe('上游上下文探测 /admin/api/upstreams/probe-context', () => {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ data: [] }))
     })
-    const res = await request(app).post('/admin/api/upstreams/probe-context').send({ baseUrl: url })
+    const res = await request(app)
+      .post('/admin/api/candidates/probe-context')
+      .send({ upstreamId: 'new-u', model: 'm', baseUrl: url })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ ok: false, error: 'context_not_found' })
   })
@@ -427,26 +445,52 @@ describe('上游上下文探测 /admin/api/upstreams/probe-context', () => {
       res.statusCode = 404
       res.end('not found')
     })
-    const res = await request(app).post('/admin/api/upstreams/probe-context').send({ baseUrl: url })
+    const res = await request(app)
+      .post('/admin/api/candidates/probe-context')
+      .send({ upstreamId: 'new-u', model: 'm', baseUrl: url })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ ok: false, error: 'context_not_found' })
   })
 
+  it('按 model 过滤：mock 同时支持两个端点 → 取 LM Studio 中 model=b 的上下文', async () => {
+    const urlWithLm = await startMock((req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      if (req.url === '/v1/models') {
+        res.end(JSON.stringify({ data: [{ id: 'a', meta: { n_ctx: 8192 } }] }))
+        return
+      }
+      if (req.url === '/api/v1/models') {
+        res.end(
+          JSON.stringify({
+            models: [{ id: 'b', loaded_instances: [{ id: 'b', config: { context_length: 16384 } }] }],
+          }),
+        )
+        return
+      }
+      res.end(JSON.stringify({ data: [] }))
+    })
+    const res = await request(app)
+      .post('/admin/api/candidates/probe-context')
+      .send({ upstreamId: 'new-u', model: 'b', baseUrl: urlWithLm })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: true, max_context_length: 16384 })
+  })
+
   it('网络错误（baseUrl 指向 127.0.0.1:1）→ 探测失败呈现 context_not_found', async () => {
     const res = await request(app)
-      .post('/admin/api/upstreams/probe-context')
-      .send({ baseUrl: 'http://127.0.0.1:1/v1' })
+      .post('/admin/api/candidates/probe-context')
+      .send({ upstreamId: 'new-u', model: 'm', baseUrl: 'http://127.0.0.1:1/v1' })
     expect(res.status).toBe(200)
     expect(res.body.ok).toBe(false)
-    // probeMaxContext 把 ECONNREFUSED 等网络错误吞成 null（T2 约定），端点统一按「探测不到」呈现
+    // probeMaxContext 把 ECONNREFUSED 等网络错误吞成 null，端点统一按「探测不到」呈现
     expect(res.body.error).toBe('context_not_found')
   })
 
   it('防御分支：probeMaxContext 抛网络错误 → 返回错误代号（extractErrorCode）', async () => {
     vi.mocked(probeMaxContext).mockRejectedValueOnce(errWithCode('ECONNREFUSED'))
     const res = await request(app)
-      .post('/admin/api/upstreams/probe-context')
-      .send({ baseUrl: 'http://127.0.0.1:1/v1' })
+      .post('/admin/api/candidates/probe-context')
+      .send({ upstreamId: 'new-u', model: 'm', baseUrl: 'http://127.0.0.1:1/v1' })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ ok: false, error: 'ECONNREFUSED' })
   })
@@ -454,8 +498,8 @@ describe('上游上下文探测 /admin/api/upstreams/probe-context', () => {
   it('防御分支：probeMaxContext 抛无代号错误 → 回退 probe_failed', async () => {
     vi.mocked(probeMaxContext).mockRejectedValueOnce(new Error('boom'))
     const res = await request(app)
-      .post('/admin/api/upstreams/probe-context')
-      .send({ baseUrl: 'http://127.0.0.1:1/v1' })
+      .post('/admin/api/candidates/probe-context')
+      .send({ upstreamId: 'new-u', model: 'm', baseUrl: 'http://127.0.0.1:1/v1' })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ ok: false, error: 'probe_failed' })
   })

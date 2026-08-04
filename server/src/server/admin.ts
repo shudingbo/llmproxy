@@ -239,16 +239,19 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     }
   })
 
-  // 上游模型上下文探测（llama.cpp / LM Studio）：
-  // 编辑模式（id 非空且命中配置）→ 以配置的 baseUrl/apiKey 为基座，body 中非空字符串覆盖
-  //   （编辑模式下前端拿不到明文密钥，必须走 id 让后端用配置里的真实密钥探测）
-  // 新增模式 → 必须提供非空 baseUrl，否则 400；apiKey 缺省 ''
-  // timeoutMs 缺省取配置上游的值（无配置则 5000），body 传正数时覆盖
-  app.post('/admin/api/upstreams/probe-context', async (req: Request, res: Response) => {
+  // 候选模型上下文探测（llama.cpp / LM Studio）
+  app.post('/admin/api/candidates/probe-context', async (req: Request, res: Response) => {
     const config = store.get()
     const body = (req.body ?? {}) as Record<string, unknown>
-    const configured =
-      typeof body.id === 'string' && body.id !== '' ? config.upstreams.find((u) => u.id === body.id) : undefined
+    if (typeof body.upstreamId !== 'string' || body.upstreamId === '') {
+      res.status(400).json({ error: 'invalid_request', field: 'upstreamId' })
+      return
+    }
+    if (typeof body.model !== 'string' || body.model === '') {
+      res.status(400).json({ error: 'invalid_request', field: 'model' })
+      return
+    }
+    const configured = config.upstreams.find((u) => u.id === body.upstreamId)
     let baseUrl: string
     let apiKey = ''
     let timeoutMs = 5000
@@ -256,7 +259,6 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
       baseUrl = configured.baseUrl
       apiKey = configured.apiKey
       timeoutMs = configured.timeoutMs ?? 5000
-      // body 中非空 baseUrl/apiKey 覆盖配置值（临时指到其它地址 / 换密钥测试）
       if (typeof body.baseUrl === 'string' && body.baseUrl !== '') {
         baseUrl = body.baseUrl
       }
@@ -264,9 +266,8 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
         apiKey = body.apiKey
       }
     } else {
-      // 新增模式：baseUrl 必填（id 未命中配置时也按新增处理）
       if (typeof body.baseUrl !== 'string' || body.baseUrl === '') {
-        res.status(400).json({ error: 'invalid_request' })
+        res.status(400).json({ error: 'invalid_request', field: 'baseUrl' })
         return
       }
       baseUrl = body.baseUrl
@@ -276,7 +277,11 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
       timeoutMs = body.timeoutMs
     }
     try {
-      const maxContextLength = await probeMaxContext(baseUrl, { apiKey, timeoutMs })
+      const maxContextLength = await probeMaxContext(baseUrl, {
+        apiKey,
+        timeoutMs,
+        model: body.model,
+      })
       if (maxContextLength === null) {
         // 探测不到：两端点均失败 / 无 n_ctx 值；网络错误也被 probeMaxContext 吞成 null，统一呈现为 context_not_found
         res.json({ ok: false, error: 'context_not_found' })

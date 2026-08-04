@@ -1,6 +1,11 @@
 // 模式测试：默认值补齐、非法字段拒绝
 import { describe, expect, it } from 'vitest'
-import { ConfigSchema, RoutingSchema, UpstreamSchema } from '../../src/config/schema.js'
+import {
+  ConfigSchema,
+  RoutingSchema,
+  UpstreamCandidateSchema,
+  UpstreamSchema,
+} from '../../src/config/schema.js'
 
 // 一份完整合法的配置样本（各测试复用）
 const validConfig = {
@@ -78,11 +83,24 @@ describe('UpstreamSchema', () => {
     expect(UpstreamSchema.safeParse({ ...base, timeoutMs: '30000' }).success).toBe(false)
   })
 
-  it('max_context_length 为合法正整数时原样保留', () => {
+  it('max_context_length 不再属于 UpstreamSchema（已迁移到 UpstreamCandidate）', () => {
     const result = UpstreamSchema.safeParse({
       id: 'a',
       baseUrl: 'https://x.example',
       apiKey: 'k',
+      max_context_length: 32768,
+    } as unknown)
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect((result.data as Record<string, unknown>).max_context_length).toBeUndefined()
+  })
+})
+
+describe('UpstreamCandidateSchema.max_context_length', () => {
+  it('为合法正整数时原样保留', () => {
+    const result = UpstreamCandidateSchema.safeParse({
+      upstreamId: 'a',
+      model: 'm1',
       max_context_length: 32768,
     })
     expect(result.success).toBe(true)
@@ -90,18 +108,17 @@ describe('UpstreamSchema', () => {
     expect(result.data.max_context_length).toBe(32768)
   })
 
-  it('max_context_length 缺省时为 undefined（不报错）', () => {
-    const result = UpstreamSchema.safeParse({ id: 'a', baseUrl: 'https://x.example', apiKey: 'k' })
+  it('缺省时为 undefined（不报错）', () => {
+    const result = UpstreamCandidateSchema.safeParse({ upstreamId: 'a', model: 'm1' })
     expect(result.success).toBe(true)
     if (!result.success) return
     expect(result.data.max_context_length).toBeUndefined()
   })
 
-  it('max_context_length 为 null 时接受（显式清空）', () => {
-    const result = UpstreamSchema.safeParse({
-      id: 'a',
-      baseUrl: 'https://x.example',
-      apiKey: 'k',
+  it('为 null 时接受（显式清空）', () => {
+    const result = UpstreamCandidateSchema.safeParse({
+      upstreamId: 'a',
+      model: 'm1',
       max_context_length: null,
     })
     expect(result.success).toBe(true)
@@ -109,12 +126,12 @@ describe('UpstreamSchema', () => {
     expect(result.data.max_context_length).toBeNull()
   })
 
-  it('max_context_length 为负数 / 0 / 小数 / 字符串时拒绝', () => {
-    const base = { id: 'a', baseUrl: 'https://x.example', apiKey: 'k' }
-    expect(UpstreamSchema.safeParse({ ...base, max_context_length: -1 }).success).toBe(false)
-    expect(UpstreamSchema.safeParse({ ...base, max_context_length: 0 }).success).toBe(false)
-    expect(UpstreamSchema.safeParse({ ...base, max_context_length: 1.5 }).success).toBe(false)
-    expect(UpstreamSchema.safeParse({ ...base, max_context_length: '32768' }).success).toBe(false)
+  it('为负数 / 0 / 小数 / 字符串时拒绝', () => {
+    const base = { upstreamId: 'a', model: 'm1' }
+    expect(UpstreamCandidateSchema.safeParse({ ...base, max_context_length: -1 }).success).toBe(false)
+    expect(UpstreamCandidateSchema.safeParse({ ...base, max_context_length: 0 }).success).toBe(false)
+    expect(UpstreamCandidateSchema.safeParse({ ...base, max_context_length: 1.5 }).success).toBe(false)
+    expect(UpstreamCandidateSchema.safeParse({ ...base, max_context_length: '32768' }).success).toBe(false)
   })
 })
 

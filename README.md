@@ -58,10 +58,10 @@ Schema reference — see `server/src/config/schema.ts` for the authoritative Zod
 | `upstreams[].apiKey` | string | plaintext key (stored 0600 in the config file) |
 | `upstreams[].timeoutMs` | number | request timeout in ms, default `30000` |
 | `upstreams[].disabled` | boolean | pause switch, default `false` |
-| `upstreams[].max_context_length` | number \| null | model max context length, optional; admin UI can auto-detect from llama.cpp / LM Studio |
 | `downstreamModels` | record | alias → ordered candidate list (min 1 each) |
 | `downstreamModels[alias][].upstreamId` | string | must match an `upstreams[].id` |
 | `downstreamModels[alias][].model` | string | model name used on the upstream side |
+| `downstreamModels[alias][].max_context_length` | number \| null | max context for that candidate (upstream × model); optional; admin UI can auto-detect from llama.cpp / LM Studio. Same upstream may host different models, each with its own n_ctx |
 | `routing` | object (optional) | routing behavior config, currently session affinity |
 | `routing.sessionAffinity` | object | session-affinity routing; omitted = defaults |
 | `routing.sessionAffinity.enabled` | boolean | master switch, default `true` |
@@ -75,12 +75,14 @@ Example:
   // 上游：OpenAI 兼容服务
   "upstreams": [
     { "id": "openai", "baseUrl": "https://api.openai.com/v1", "apiKey": "sk-...", "timeoutMs": 30000 },
-    { "id": "ollama-local", "baseUrl": "http://127.0.0.1:11434/v1", "apiKey": "dummy" }
-    // 可选：模型最大上下文 max_context_length（可手动设置；管理界面可点「自动」调用后端探测接口自动填写，支持 llama.cpp / LM Studio）
-    // 例：{ "id": "llama-cpp", "baseUrl": "http://127.0.0.1:8080/v1", "apiKey": "dummy", "max_context_length": 32768 }
+    { "id": "ollama-local", "baseUrl": "http://127.0.0.1:11434/v1", "apiKey": "dummy" },
+    { "id": "llama-cpp", "baseUrl": "http://127.0.0.1:8080/v1", "apiKey": "dummy" }
   ],
   // 下游别名 → 有序候选（按顺序尝试，失败自动切换到下一个）
   "downstreamModels": {
+    // 可选：每个候选可配 max_context_length = 该上游跑该模型时的最大上下文；
+    // 管理界面可在 Models 页面对单个候选点「自动」调用后端探测接口自动填写（支持 llama.cpp / LM Studio）
+    // 例：{ "upstreamId": "llama-cpp", "model": "qwen2.5:7b", "max_context_length": 32768 }
     "my-alias": [
       { "upstreamId": "openai", "model": "gpt-4o-mini" },
       { "upstreamId": "ollama-local", "model": "qwen2.5:7b" }
@@ -101,7 +103,7 @@ Example:
 
 ### 首次启动 First Run
 
-1. **安装依赖**：`pnpm install`（需要 Node ≥ 18 与 pnpm 9.x，见下文「开发说明」）
+1. **安装依赖**：`pnpm install`（需要 Node ≥ 22 与 pnpm 9.x，见下文「开发说明」）
 2. **构建管理端**：`pnpm --filter @llmproxy/web build`，或直接执行 `pnpm start`（产物缺失时启动前自动构建 web）
 3. **启动服务**：`pnpm start`，默认监听 `0.0.0.0:3000`（本机访问 `http://127.0.0.1:3000`）；可用命令行参数覆盖：`pnpm start -- --host 0.0.0.0 --port 8080`（或 `node scripts/start.js --host 0.0.0.0 --port 8080`，`--host=0.0.0.0` / `--port=8080` 等号形式亦可）
 4. **配置文件自动生成**：首次启动会在 `<userHome>/llmproxy/llmproxy.jsonc` 生成一份带注释的示例配置（Windows 为 `C:\Users\<you>\llmproxy\llmproxy.jsonc`，POSIX 为 `$HOME/llmproxy/llmproxy.jsonc`，权限 `0600`）。示例中的 `apiKey` 默认是 `sk-REPLACE_ME`，请替换成真实密钥。改完保存即被热重载，无需重启
@@ -128,7 +130,7 @@ Example:
 
 表格列出全部上游：ID、Base URL、Type（固定 `openai`）、Status（`Healthy` / `Paused`）、Disabled（是/否）。**被暂停的行灰底显示并带 `Paused` 标签**，不会被隐藏。
 
-- **新增**：点「新增上游」，填写 ID（唯一）、Base URL（合法 URL）、API Key（新增时必填）、超时（ms，默认 30000）、最大上下文（可选，模型最大上下文 `max_context_length`；可手动输入，或点「自动」按钮调用后端探测接口自动填写，支持 llama.cpp / LM Studio）、是否暂停
+- **新增**：点「新增上游」，填写 ID（唯一）、Base URL（合法 URL）、API Key（新增时必填）、超时（ms，默认 30000）、是否暂停
 - **编辑**：点「编辑」。编辑模式下 ID 不可修改；**API Key 输入框留空表示「保持原密钥不变」**，仅当非空时才会上传覆盖（避免掩码值覆盖明文）；最大上下文同样可改，清空输入表示显式置空（`null`）
 - **暂停 / 恢复**：点「暂停」或「恢复」只切换 `disabled` 字段，暂停后的上游不再参与路由
 - **测试**：点「测试」调用 `POST /admin/api/upstreams/:id/test`，弹窗展示状态（成功/失败）、延迟（ms）、HTTP 状态码、模型数，失败时附错误码（如 `ECONNREFUSED`）
@@ -301,7 +303,7 @@ curl -N http://127.0.0.1:3000/api/chat \
 | PUT | `/admin/api/upstreams/:id` | 部分更新上游（ID 以路径为准；apiKey 留空保持原值） |
 | DELETE | `/admin/api/upstreams/:id` | 删除上游（级联清理候选；最后一个上游拒绝删除） |
 | POST | `/admin/api/upstreams/:id/test` | 连通性测试（可用 body 覆盖 baseUrl / apiKey） |
-| POST | `/admin/api/upstreams/probe-context` | 探测上游模型最大上下文（body 可传 `id` 用配置真实密钥，或 `baseUrl` / `apiKey` 覆盖；成功 `{ ok: true, max_context_length }`，探测不到 `{ ok: false, error: 'context_not_found' }`，缺参 400 `invalid_request`） |
+| POST | `/admin/api/candidates/probe-context` | 探测候选 `(upstreamId, model)` 的最大上下文（body 必传 `upstreamId` + `model`；`baseUrl` / `apiKey` 缺省取配置上游，非空字符串覆盖；成功 `{ ok: true, max_context_length }`，探测不到 `{ ok: false, error: 'context_not_found' }`，缺参 400 `invalid_request` + `field`） |
 | GET | `/admin/api/downstream-models` | 查看别名 → 候选映射 |
 | PUT | `/admin/api/downstream-models` | 全量替换映射（每个别名至少 1 个候选） |
 | GET | `/admin/api/logs` | 日志查询（走 SQLite）：`?type=app|api&date=YYYY-MM-DD&level=info&keyword=xx&offset=0&limit=100`，返回 `lines` / `hasMore` |
@@ -462,7 +464,7 @@ The `/v1/chat/completions` endpoint is passthrough: requests go to the upstream 
 
 ### 环境要求 Prerequisites
 
-- **Node.js ≥ 18**：根 `package.json` 的 `engines` 约束，服务端目标 ES2022
+- **Node.js ≥ 22**：根 `package.json` 的 `engines` 约束，服务端目标 ES2022。`better-sqlite3@13.x` 的 `engines: ">=22"` 强制要求（prebuilds 只覆盖 Node 22+，旧版本需本地编译 Visual Studio Build Tools，详见仓库根 `.npmrc`）
 - **pnpm 9.x**：仓库固定 `packageManager: "pnpm@9.15.4"`。推荐用 corepack 启用：`corepack enable`；已有 pnpm 的直接 `npm i -g pnpm@9` 对齐版本
 
 ### 仓库结构 Repository Layout

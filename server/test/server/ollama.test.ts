@@ -292,13 +292,19 @@ describe('Ollama 下游服务', () => {
     expect(names).toEqual(['extra', 'gpt-4'])
   })
 
-  it('GET /api/tags 附加聚合 n_ctx：取候选上游最小值，忽略未配置的上游', async () => {
-    // u1 配置 8192，u2 未配置：别名 gpt-4（候选含 u1+u2）应取 u1 的 8192（u2 无值被忽略）
+  it('GET /api/tags 附加聚合 n_ctx：取候选上游最小值，忽略未配置的候选', async () => {
+    // gpt-4 的候选 0（u1 上跑 gpt-4-u1）配置 8192，候选 1 未配置 → 取候选 0 的 8192（候选 1 被忽略）
     const current = store.get()
     store.set(
       {
         ...current,
-        upstreams: [{ ...current.upstreams[0], max_context_length: 8192 }, current.upstreams[1]],
+        downstreamModels: {
+          ...current.downstreamModels,
+          'gpt-4': [
+            { upstreamId: 'u1', model: 'gpt-4-u1', max_context_length: 8192 },
+            { upstreamId: 'u2', model: 'gpt-4-u2' },
+          ],
+        },
       },
       { source: 'admin' },
     )
@@ -311,15 +317,18 @@ describe('Ollama 下游服务', () => {
   })
 
   it('GET /api/tags 多候选上游均配置时取最小 n_ctx', async () => {
-    // u1 配置 8192、u2 配置 16384：别名 gpt-4 聚合应为两者最小值 8192
+    // 两个候选分别配 8192 / 16384：聚合取最小 8192
     const current = store.get()
     store.set(
       {
         ...current,
-        upstreams: [
-          { ...current.upstreams[0], max_context_length: 8192 },
-          { ...current.upstreams[1], max_context_length: 16384 },
-        ],
+        downstreamModels: {
+          ...current.downstreamModels,
+          'gpt-4': [
+            { upstreamId: 'u1', model: 'gpt-4-u1', max_context_length: 8192 },
+            { upstreamId: 'u2', model: 'gpt-4-u2', max_context_length: 16384 },
+          ],
+        },
       },
       { source: 'admin' },
     )
@@ -329,8 +338,8 @@ describe('Ollama 下游服务', () => {
     expect(body.models[0].meta).toEqual({ n_ctx: 8192 })
   })
 
-  it('GET /api/tags 全部上游未配置 max_context_length 时条目不带 meta 字段', async () => {
-    // BASE_CONFIG 中 u1/u2 均未配置 max_context_length：别名无法聚合，不应出现 meta
+  it('GET /api/tags 全部候选未配置 max_context_length 时条目不带 meta 字段', async () => {
+    // BASE_CONFIG 中 gpt-4 的两个候选均未配置 max_context_length：别名无法聚合，不应出现 meta
     const res = await request(app).get('/api/tags')
     expect(res.status).toBe(200)
     const body = res.body as { models: Array<{ name: string; meta?: { n_ctx: number } }> }

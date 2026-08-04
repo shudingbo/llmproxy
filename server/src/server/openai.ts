@@ -370,7 +370,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
 
   // 模型列表：返回下游别名列表（downstreamModels 的 key），
   // 与聊天接口可识别的模型名保持一致，不再从上游拉取；
-  // 别名能聚合出候选上游 max_context_length 时附加 meta: { n_ctx: 最小值 }
+  // 别名能聚合出候选 max_context_length 时附加 meta: { n_ctx: 最小值 }
   app.get('/v1/models', (_req: Request, res: Response) => {
     const config = store.get()
     const metaMap = buildAliasMetaMap(config)

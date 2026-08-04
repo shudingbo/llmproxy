@@ -2,6 +2,24 @@
 
 本项目所有值得记录的变更都会汇总到本文件。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - unreleased
+
+### ⚠ BREAKING CHANGES
+
+- **配置字段位置变更**：`max_context_length` 从 `Upstream` 移到 `UpstreamCandidate`（候选层）。同一上游跑不同模型时，各自的上下文大小需要各自配置。**0.3.x 配置中的上游 `max_context_length` 字段会被 zod 静默丢弃**——升级前需手动把字段挪到对应候选行。
+- **探测接口变更**：`POST /admin/api/upstreams/probe-context` 改为 `POST /admin/api/candidates/probe-context`。请求体从 `{ id | baseUrl, apiKey? }` 改为 `{ upstreamId, model, baseUrl?, apiKey? }`（探测粒度对齐到候选 `(upstreamId, model)` 二元组）。
+- **Node 最低版本**：`>=18` 收紧到 `>=22`（与 `better-sqlite3@13.x` 的 `engines: ">=22"` 对齐）。
+
+### 新增
+
+- 仓库根 `.npmrc` 新增 `ignore-scripts=true`：better-sqlite3 v13.0.2 自带 prebuilds（`package/prebuilds/*.node`），`require()` 时直接按 `process.platform-arch` 加载，**不依赖 install script 触发 node-gyp**。规避 npm publish 时隐式注入 `"install": "node-gyp rebuild"` 后触发 `find VS` 失败的 bug（[WiseLibs/better-sqlite3#1503](https://github.com/WiseLibs/better-sqlite3/issues/1503)）。
+- 根 `package.json` 新增 `pnpm.onlyBuiltDependencies: []`：双保险，确保 pnpm 也不跑任何 build script。
+
+### 移除
+
+- 管理端「新增/编辑上游」对话框移除「最大上下文」字段与「自动」按钮（字段已迁到候选层）
+- 管理端「Models」页每个候选行新增「最大上下文」输入框 + 「自动」按钮（调 `/candidates/probe-context`）
+
 ## [0.3.0] - 2026-08-04
 
 ### 新增

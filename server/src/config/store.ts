@@ -32,9 +32,7 @@ const BOOTSTRAP_JSONC = `{
       // 上游请求超时（毫秒），缺省 30000
       "timeoutMs": 60000,
       // 暂停开关：true 时该上游不参与路由
-      "disabled": false,
-      // 模型最大上下文（可经管理端「自动」按钮探测 llama.cpp/LM Studio），缺省不设；null 表示清空
-      // "max_context_length": 32768,
+      "disabled": false
     }
   ],
 
@@ -42,6 +40,9 @@ const BOOTSTRAP_JSONC = `{
   "downstreamModels": {
     // 示例：别名 gpt-4 请求 openai-main 上游的 gpt-4 模型
     "gpt-4": [
+      // 候选级可选字段：max_context_length = 该上游跑该模型时的最大上下文；
+      // 可经管理端「自动」按钮探测 llama.cpp/LM Studio，缺省不设；null 表示显式清空
+      // { "upstreamId": "openai-main", "model": "gpt-4", "max_context_length": 32768 }
       { "upstreamId": "openai-main", "model": "gpt-4" }
     ],
     // 示例：本地模型别名，可再添加更多候选上游实现回退

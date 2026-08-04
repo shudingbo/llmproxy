@@ -38,6 +38,23 @@
                     <el-option v-for="u in upstreams" :key="u.id" :label="u.id" :value="u.id" />
                   </el-select>
                   <el-input v-model="element.model" placeholder="上游侧模型名" />
+                  <el-input-number
+                    v-model="element.max_context_length"
+                    class="nctx-input"
+                    :min="1"
+                    :step="1024"
+                    :value-on-clear="null"
+                    clearable
+                    placeholder="Max Context"
+                  />
+                  <el-button
+                    size="small"
+                    :loading="probingKey === element._key"
+                    :disabled="!element.upstreamId || !element.model"
+                    @click="probeCandidate(element)"
+                  >
+                    自动
+                  </el-button>
                   <el-button :icon="Delete" text type="danger" @click="removeCandidate(alias, index)" />
                 </div>
               </template>
@@ -67,11 +84,12 @@ import { Delete, Plus, Rank } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
 import { api } from '../api/client'
 
-// 候选条目：上游 id + 上游侧模型名；_key 仅用于拖拽排序的稳定 Vue key，保存时剔除
+// 候选条目：上游 id + 上游侧模型名 + 最大上下文；_key 仅用于拖拽排序的稳定 Vue key，保存时剔除
 interface Candidate {
   _key: number
   upstreamId: string
   model: string
+  max_context_length?: number | null
 }
 
 // 上游信息（管理端接口返回的 apiKey 已脱敏）
@@ -93,6 +111,7 @@ const upstreams = ref<Upstream[]>([])
 const models = reactive<DownstreamModels>({})
 const loading = ref(false)
 const saving = ref(false)
+const probingKey = ref<number | null>(null) // 正在探测的候选 _key（用于按钮 loading）
 const activeNames = ref<string[]>([])
 
 // vuedraggable itemKey：候选对象自带稳定 _key
@@ -150,7 +169,12 @@ function removeAlias(alias: string) {
 
 // 新增候选：默认选中第一个上游，名称留空待填
 function addCandidate(alias: string) {
-  models[alias].push({ _key: ++seq, upstreamId: upstreams.value[0]?.id ?? '', model: '' })
+  models[alias].push({
+    _key: ++seq,
+    upstreamId: upstreams.value[0]?.id ?? '',
+    model: '',
+    max_context_length: null,
+  })
 }
 
 // 删除候选
@@ -179,10 +203,16 @@ async function save() {
   }
   saving.value = true
   try {
-    // 剔除 _key 后提交，后端 zod 校验每个别名至少 1 个候选
-    const payload: Record<string, { upstreamId: string; model: string }[]> = {}
+    // 剔除 _key 后提交：max_context_length 为 null / undefined 都剔除（避免无意义字段）
+    const payload: Record<string, Array<Record<string, unknown>>> = {}
     for (const [alias, candidates] of entries) {
-      payload[alias] = candidates.map(({ upstreamId, model }) => ({ upstreamId, model }))
+      payload[alias] = candidates.map((c) => {
+        const row: Record<string, unknown> = { upstreamId: c.upstreamId, model: c.model }
+        if (typeof c.max_context_length === 'number') {
+          row.max_context_length = c.max_context_length
+        }
+        return row
+      })
     }
     await api.put('/downstream-models', payload)
     ElMessage.success('已保存')
@@ -190,6 +220,35 @@ async function save() {
     ElMessage.error(`保存失败：${errMsg(err)}`)
   } finally {
     saving.value = false
+  }
+}
+
+// 自动探测候选的 max_context_length：调 POST /candidates/probe-context（upstreamId + model）
+async function probeCandidate(candidate: Candidate) {
+  if (!candidate.upstreamId || !candidate.model.trim()) {
+    ElMessage.error('请先填写上游与模型名')
+    return
+  }
+  probingKey.value = candidate._key
+  try {
+    const { data } = await api.post<{
+      ok: boolean
+      max_context_length?: number
+      error?: string
+    }>('/candidates/probe-context', {
+      upstreamId: candidate.upstreamId,
+      model: candidate.model.trim(),
+    })
+    if (data.ok && typeof data.max_context_length === 'number') {
+      candidate.max_context_length = data.max_context_length
+      ElMessage.success(`已自动填充：${data.max_context_length}`)
+    } else {
+      ElMessage.error(`探测失败：${data.error ?? 'unknown'}`)
+    }
+  } catch (err: any) {
+    ElMessage.error(`探测失败：${err?.response?.data?.error ?? err.message}`)
+  } finally {
+    probingKey.value = null
   }
 }
 
@@ -240,6 +299,12 @@ onMounted(load)
 
 .candidate-row .el-input {
   flex: 1;
+  min-width: 120px;
+}
+
+.candidate-row .nctx-input {
+  width: 160px;
+  flex-shrink: 0;
 }
 
 .drag-handle {

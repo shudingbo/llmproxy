@@ -27,11 +27,11 @@
 | `upstreams[].apiKey` | string | 是 | — | 明文密钥（配置文件 0600 权限落盘） |
 | `upstreams[].timeoutMs` | number | 否 | `30000` | 请求超时（毫秒），必须为正整数 |
 | `upstreams[].disabled` | boolean | 否 | `false` | 暂停开关，`true` 时该上游不参与路由 |
-| `upstreams[].max_context_length` | number | 否 | — | 模型最大上下文（正整数）；可手动设置或管理端「自动」按钮探测（llama.cpp / LM Studio）；`null` 显式清空，缺省不设 |
 | `downstreamModels` | object | 是 | — | 下游模型别名映射：key = 虚拟模型别名，value = 候选数组 |
 | `downstreamModels[alias][]` | array | 是（至少 1 个候选） | — | 一个别名对应的有序候选列表 |
 | `downstreamModels[alias][].upstreamId` | string | 是 | — | 须与某个 `upstreams[].id` 对应 |
 | `downstreamModels[alias][].model` | string | 是 | — | 在上游侧使用的模型名 |
+| `downstreamModels[alias][].max_context_length` | number | 否 | — | 下游模型最大上下文（正整数）；可手动设置或管理端「自动」按钮探测（llama.cpp / LM Studio）；`null` 显式清空，缺省不设 |
 | `server` | object | 否 | — | 下行流监听配置（整节可缺省） |
 | `server.host` | string | 否 | `127.0.0.1` | 监听地址（IPv4 / IPv6 / Unix socket 名） |
 | `server.port` | number | 否 | `3000` | TCP 端口（1–65535） |

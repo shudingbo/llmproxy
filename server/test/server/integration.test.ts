@@ -4,12 +4,13 @@
 // 注意：日志器单例的目标流在首次写日志时固定，因此整个文件共享一个临时目录（beforeAll stub 环境变量）
 import { once } from 'node:events'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import request from 'supertest'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { FSWatcher } from 'chokidar'
+import Database from 'better-sqlite3'
 import { ConfigStore } from '../../src/config/store.js'
 import { startConfigWatcher } from '../../src/config/watcher.js'
 import { configureLogging, flushLoggerSync } from '../../src/logger/index.js'
@@ -199,6 +200,14 @@ beforeAll(() => {
 beforeEach(() => {
   mocks.length = 0
   watcher = null
+  // 整个文件共享 tmpDir（同源 SQLite db），前一个用例 bind 的会话粘附会污染后续用例
+  // （多个测试复用 'hi' 内容时 hash 相同，会话键会跨用例命中），所以按用例清空 sessions 表
+  const sessionDbPath = join(tmpDir, 'llmproxy', 'llmproxy.db')
+  if (existsSync(sessionDbPath)) {
+    const sessionDb = new Database(sessionDbPath)
+    sessionDb.exec('DELETE FROM sessions')
+    sessionDb.close()
+  }
 })
 
 afterAll(async () => {

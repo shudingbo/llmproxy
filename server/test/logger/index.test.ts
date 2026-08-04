@@ -22,6 +22,10 @@ beforeEach(async () => {
   vi.stubEnv('USERPROFILE', tmp)
   // 假时钟只覆盖 Date，控制跨日；保留真实定时器让 fs 落盘
   vi.useFakeTimers({ toFake: ['Date'] })
+  // streamroller 在 configureLogging 时同步构造并以"今天"建第一个日志文件，
+  // 因此 fake Date 必须在 configureLogging 之前固定到目标日期，否则构造时拿到真实日期，
+  // 跨日切分用例的文件名断言会失败（与代码无关，是 streamroller 与 fake timer 的交互）
+  vi.setSystemTime(new Date(2026, 7, 2, 10, 0, 0))
   vi.resetModules()
   mod = await import('../../src/logger/index.js')
   // 每个用例都重新配置 log4js，logDir 会指向新的 tmp/<userid>/llmproxy/logs

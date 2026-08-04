@@ -37,6 +37,12 @@
           {{ row.disabled ? '是' : '否' }}
         </template>
       </el-table-column>
+      <!-- 模型最大上下文长度：未设置 / null 显示占位符 -->
+      <el-table-column label="Max Context" width="120">
+        <template #default="{ row }">
+          {{ row.max_context_length ?? '—' }}
+        </template>
+      </el-table-column>
       <el-table-column label="Actions" width="320" fixed="right">
         <template #default="{ row }">
           <!-- 连通性测试：调用后端测试接口，结果弹窗展示 -->
@@ -78,6 +84,20 @@
         <el-form-item label="超时(ms)" prop="timeoutMs">
           <el-input-number v-model="form.timeoutMs" :min="1" :step="1000" />
         </el-form-item>
+        <!-- 最大上下文：可手动输入或点「自动」调用后端探测（llama.cpp / LM Studio） -->
+        <el-form-item label="最大上下文" prop="max_context_length">
+          <div class="probe-row">
+            <el-input-number
+              v-model="form.max_context_length"
+              :min="1"
+              :step="1024"
+              :value-on-clear="null"
+              clearable
+              placeholder="自动或手动填写（Max Context）"
+            />
+            <el-button :loading="probing" :disabled="!form.baseUrl" @click="probeMaxContext">自动</el-button>
+          </div>
+        </el-form-item>
         <el-form-item label="暂停" prop="disabled">
           <el-switch v-model="form.disabled" />
         </el-form-item>
@@ -103,23 +123,27 @@ interface UpstreamItem {
   apiKey: string
   timeoutMs: number
   disabled: boolean
+  // 模型最大上下文长度：null=显式清空，undefined=未设置，正整数=已配置
+  max_context_length?: number | null
 }
 
 const loading = ref(false) // 列表加载中
 const upstreams = ref<UpstreamItem[]>([]) // 上游列表
 const testingId = ref('') // 正在测试的上游 id（用于按钮 loading）
 const saving = ref(false) // 表单保存中
+const probing = ref(false) // 探测 max_context_length 中（用于「自动」按钮 loading）
 const dialogVisible = ref(false) // 弹窗开关
 const editingId = ref<string | null>(null) // 当前编辑的上游 id，null 表示新增
 const formRef = ref<FormInstance>()
 
-// 表单数据：apiKey 编辑模式留空表示不修改
+// 表单数据：apiKey 编辑模式留空表示不修改；max_context_length null 表示显式清空
 const form = reactive({
   id: '',
   baseUrl: '',
   apiKey: '',
   timeoutMs: 30000,
   disabled: false,
+  max_context_length: null as number | null,
 })
 
 // 表单校验规则：编辑模式 id 不可改；apiKey 仅新增时必填
@@ -174,6 +198,9 @@ function openEdit(row: UpstreamItem) {
   form.apiKey = row.apiKey
   form.timeoutMs = row.timeoutMs
   form.disabled = row.disabled
+  // 已存储的 max_context_length：null/undefined 都按 null 渲染以便「清空」编辑
+  form.max_context_length =
+    typeof row.max_context_length === 'number' ? row.max_context_length : null
   dialogVisible.value = true
 }
 
@@ -184,6 +211,7 @@ function resetForm() {
   form.apiKey = ''
   form.timeoutMs = 30000
   form.disabled = false
+  form.max_context_length = null
   formRef.value?.clearValidate()
 }
 
@@ -193,20 +221,27 @@ async function save() {
   saving.value = true
   try {
     if (editingId.value === null) {
-      await api.post('/upstreams', {
+      // 新增模式：max_context_length 非 null 才下发（null 视为未设置，避免无意义字段）
+      const payload: Record<string, unknown> = {
         id: form.id,
         baseUrl: form.baseUrl,
         apiKey: form.apiKey,
         timeoutMs: form.timeoutMs,
         disabled: form.disabled,
-      })
+      }
+      if (form.max_context_length !== null) {
+        payload.max_context_length = form.max_context_length
+      }
+      await api.post('/upstreams', payload)
       ElMessage.success('上游已新增')
     } else {
-      // 编辑模式：apiKey 为空串表示保持原密钥，不发送（避免掩码值覆盖明文）
+      // 编辑模式：apiKey 为空串表示保持原密钥，不发送（避免掩码值覆盖明文）；
+      // max_context_length 始终下发（含 null），用于显式清空已存值
       const payload: Record<string, unknown> = {
         baseUrl: form.baseUrl,
         timeoutMs: form.timeoutMs,
         disabled: form.disabled,
+        max_context_length: form.max_context_length,
       }
       if (form.apiKey !== '') {
         payload.apiKey = form.apiKey
@@ -220,6 +255,38 @@ async function save() {
     ElMessage.error(`保存失败：${err?.response?.data?.error ?? err.message}`)
   } finally {
     saving.value = false
+  }
+}
+
+// 自动探测 max_context_length：新增模式传 baseUrl+apiKey；编辑模式传 id+baseUrl 让后端用配置真实密钥
+async function probeMaxContext() {
+  if (!form.baseUrl) {
+    ElMessage.error('请先填写 Base URL')
+    return
+  }
+  probing.value = true
+  try {
+    const body: Record<string, unknown> = { baseUrl: form.baseUrl }
+    if (editingId.value !== null) {
+      body.id = editingId.value
+    } else {
+      body.apiKey = form.apiKey
+    }
+    const { data } = await api.post<{
+      ok: boolean
+      max_context_length?: number
+      error?: string
+    }>('/upstreams/probe-context', body)
+    if (data.ok && typeof data.max_context_length === 'number') {
+      form.max_context_length = data.max_context_length
+      ElMessage.success(`已自动填充：${data.max_context_length}`)
+    } else {
+      ElMessage.error(`探测失败：${data.error ?? 'unknown'}`)
+    }
+  } catch (err: any) {
+    ElMessage.error(`探测失败：${err?.response?.data?.error ?? err.message}`)
+  } finally {
+    probing.value = false
   }
 }
 
@@ -298,5 +365,12 @@ onMounted(fetchUpstreams)
 :deep(.paused-row) {
   background-color: #f0f0f0;
   color: #909399;
+}
+
+/* Max Context 输入 + 自动按钮水平排列 */
+.probe-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>

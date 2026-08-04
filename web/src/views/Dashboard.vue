@@ -141,6 +141,17 @@ async function load(): Promise<void> {
   }
 }
 
+const isLinkPath = (path: string): boolean => {
+  const linkPaths = ['api/tags', '/api/version', '/v1/models'];
+  for( const linkPath of linkPaths) {
+    if (path.indexOf(linkPath) !== -1) {
+      return true
+    }
+  }
+
+  return false
+}
+
 // 自动刷新定时器句柄（组件卸载时清理）
 let timer: number | undefined
 
@@ -206,10 +217,7 @@ onUnmounted(() => {
         <!-- 当前进程生效的下行流入口 + 来源标签：方便运维一眼看到访问地址与生效来源 -->
         <div v-if="baseUrl" class="base-url-pill" :title="`来源：${sourceLabel(listenSource)}`">
           <span class="base-url-label">Base URL</span>
-          <code class="base-url-value">{{ baseUrl }}</code>
-          <el-tag size="small" :type="listenSourceTagType(listenSource)" effect="plain">
-            {{ sourceLabel(listenSource) }}
-          </el-tag>
+          <a :href="baseUrl" target="_blank" class="base-url-value">{{ baseUrl }}</a>
         </div>
       </div>
       <el-row :gutter="16">
@@ -229,7 +237,8 @@ onUnmounted(() => {
               </el-table-column>
               <el-table-column label="Path" min-width="180">
                 <template #default="{ row }">
-                  <code class="path-code">{{ row.path }}</code>
+                    <a v-if="isLinkPath(row.path)" class="path-code" :href="baseUrl + row.path" target="_blank">{{ row.path }}</a>
+                   <code v-else class="path-code">{{ row.path }}</code>
                 </template>
               </el-table-column>
               <el-table-column label="Description" min-width="200">
@@ -312,7 +321,6 @@ onUnmounted(() => {
   background-color: var(--el-fill-color-light);
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 6px;
-  cursor: copy;
   user-select: all;
 }
 
@@ -354,6 +362,6 @@ onUnmounted(() => {
 
 .endpoint-summary {
   color: var(--el-text-color-regular);
-  font-size: 12px;
+  font-size: 11px;
 }
 </style>

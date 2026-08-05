@@ -114,6 +114,8 @@ interface SessionListResponse {
 const clientOptions = [
   { value: '', label: '全部' },
   { value: 'open-webui', label: 'open-webui' },
+  { value: 'x-session-id', label: 'x-session-id' },
+  { value: 'ywnrs', label: 'ywnrs' },
   { value: 'content-hash', label: 'content-hash' },
   { value: 'unknown', label: 'unknown' },
 ]
@@ -129,11 +131,15 @@ const page = ref(1)
 const limit = ref(20)
 const offset = ref(0)
 
-// 客户端类型 → el-tag 颜色：open-webui=蓝、content-hash=绿、unknown=橙，其余=灰
+// 客户端类型 → el-tag 颜色：open-webui=蓝、x-session-id=深蓝、ywnrs=紫、content-hash=绿、unknown=橙，其余=灰
 function clientTag(c: string): 'primary' | 'success' | 'info' | 'warning' | 'danger' {
   switch (c) {
     case 'open-webui':
       return 'primary'
+    case 'x-session-id':
+      return 'info'
+    case 'ywnrs':
+      return 'danger'
     case 'content-hash':
       return 'success'
     case 'unknown':

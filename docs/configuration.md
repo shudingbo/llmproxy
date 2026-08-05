@@ -143,7 +143,7 @@
   - **`enabled`**：总开关，缺省 `true`。关闭后所有请求回到轮询 + 回退行为。
   - **`cleanupMaxAgeMs`**：会话保留期（毫秒），缺省 `604800000`（1 周）。超过该时长的粘附映射会被清理；`0` 表示会话永不过期。
   - **`cleanupIntervalMs`**：自动清理的调度周期（毫秒），缺省 `3600000`（1 小时）；`0` 表示关闭自动清理调度（仍可手动触发，见管理端 Sessions 页的「立即清理」）。
-- 会话键来源（优先级从高到低）：HTTP header `X-OpenWebUI-Chat-Id` → 请求体前 2 条消息的 `role + content` 的 sha256 → 都取不到则回退轮询。粘附映射持久化在 SQLite（`<userHome>/llmproxy/llmproxy.db` 的 `sessions` 表）。
+- 会话键来源（优先级从高到低）：HTTP header `X-OpenWebUI-Chat-Id` → HTTP header `X-Session-Id`（值以 `ywnrs` 开头时 Client 记为 `ywnrs`，否则记为 `x-session-id`） → 请求体前 2 条消息的 `role + content` 的 sha256 → 都取不到则回退轮询。粘附映射持久化在 SQLite（`<userHome>/llmproxy/llmproxy.db` 的 `sessions` 表）。
 - 粘附的上游被禁用 / 删除时自动重新选择；粘附请求回退到其它上游成功后自动改绑（绑定跟随实际可用性）。
 
 ### 热重载

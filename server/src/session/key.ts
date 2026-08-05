@@ -6,7 +6,7 @@ import type { Request } from 'express'
 // 会话键提取结果：raw 为原始会话键值（header 值或内容 hash 十六进制），client 标记来源
 export interface SessionKeyResult {
   raw: string
-  client: 'open-webui' | 'content-hash'
+  client: 'open-webui' | 'x-session-id' | 'ywnrs' | 'content-hash'
 }
 
 // header 名大小写不敏感查找（Express 已将 header 名小写化，此处兜底直接构造的请求对象）
@@ -56,16 +56,31 @@ const hashContentPrefix = (body: Record<string, unknown>): string | undefined =>
 /**
  * 提取会话键（优先级从高到低，返回第一个命中）：
  * 1. header X-OpenWebUI-Chat-Id 非空 → { raw: 值.trim(), client: 'open-webui' }
- * 2. body.messages 为数组且长度 ≥ 1 → 前 2 条内容前缀 sha256 → { raw: hashHex, client: 'content-hash' }
- * 3. 都不满足 → undefined（调用方走轮询兜底）
+ * 2. header X-Session-Id 非空 → 值以 'ywnrs' 开头 → { raw: 值.trim(), client: 'ywnrs' }；
+ *    否则 → { raw: 值.trim(), client: 'x-session-id' }
+ * 3. body.messages 为数组且长度 ≥ 1 → 前 2 条内容前缀 sha256 → { raw: hashHex, client: 'content-hash' }
+ * 4. 都不满足 → undefined（调用方走轮询兜底）
  */
 export function extractSessionKey(
   req: Request, // express Request（只读 headers）
   body: Record<string, unknown>, // 已解析的请求体（JSON）
 ): SessionKeyResult | undefined {
-  const headerValue = findHeaderValue(req, 'x-openwebui-chat-id')
-  if (headerValue !== undefined && headerValue.trim() !== '') {
-    return { raw: headerValue.trim(), client: 'open-webui' }
+  const openWebuiHeader = findHeaderValue(req, 'x-openwebui-chat-id')
+  if (openWebuiHeader !== undefined ) {
+    let trimmed = openWebuiHeader.trim()
+    if( trimmed !== '' ) {
+      return { raw: trimmed, client: 'open-webui' }
+    }
+  }
+
+  // 通用会话头：部分 client 把 session id 放在 X-Session-Id；
+  // 以 'ywnrs' 开头的值归类为独立的 ywnrs 客户端，便于运维按客户端来源筛选
+  const sessionIdHeader = findHeaderValue(req, 'x-session-id')
+  if (sessionIdHeader !== undefined ) {
+    let trimmed = sessionIdHeader.trim()
+    if( trimmed !== '' ) {
+      return { raw: trimmed, client: trimmed.startsWith('ywnrs') ? 'ywnrs' : 'x-session-id' }
+    }
   }
 
   const hashHex = hashContentPrefix(body)

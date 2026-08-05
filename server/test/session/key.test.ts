@@ -113,4 +113,44 @@ describe('extractSessionKey', () => {
     const body = { messages: [{ role: 'user', content: '你好' }] }
     expect(extractSessionKey(req, body)).toEqual({ raw: 'chat-uuid-456', client: 'open-webui' })
   })
+
+  it('header X-Session-Id 非 ywnrs 前缀 → client=x-session-id，值 trim', () => {
+    const req = makeReq({ 'x-session-id': '  abc-123  ' })
+    expect(extractSessionKey(req, {})).toEqual({ raw: 'abc-123', client: 'x-session-id' })
+  })
+
+  it('header X-Session-Id 大小写不敏感（X-SESSION-ID）→ 命中', () => {
+    const req = makeReq({ 'X-SESSION-ID': 'sess-789' })
+    expect(extractSessionKey(req, {})).toEqual({ raw: 'sess-789', client: 'x-session-id' })
+  })
+
+  it('header X-Session-Id 值以 ywnrs 开头 → client=ywnrs', () => {
+    const req = makeReq({ 'x-session-id': 'ywnrs-uuid-001' })
+    expect(extractSessionKey(req, {})).toEqual({ raw: 'ywnrs-uuid-001', client: 'ywnrs' })
+  })
+
+  it('header X-Session-Id 值以 YWNRS 大写开头 → 区分大小写不归类 ywnrs', () => {
+    const req = makeReq({ 'x-session-id': 'YWNRS-uuid-001' })
+    expect(extractSessionKey(req, {})).toEqual({ raw: 'YWNRS-uuid-001', client: 'x-session-id' })
+  })
+
+  it('header X-Session-Id 值为空白 → 不命中，走内容 hash 兜底', () => {
+    const req = makeReq({ 'x-session-id': '   ' })
+    const body = { messages: [{ role: 'user', content: '你好' }] }
+    expect(extractSessionKey(req, body)?.client).toBe('content-hash')
+  })
+
+  it('优先级：X-OpenWebUI-Chat-Id 优先于 X-Session-Id → 返回 open-webui', () => {
+    const req = makeReq({
+      'x-openwebui-chat-id': 'chat-uuid-789',
+      'x-session-id': 'sess-abc',
+    })
+    expect(extractSessionKey(req, {})).toEqual({ raw: 'chat-uuid-789', client: 'open-webui' })
+  })
+
+  it('优先级：X-Session-Id 优先于内容前缀 hash', () => {
+    const req = makeReq({ 'x-session-id': 'sess-xyz' })
+    const body = { messages: [{ role: 'user', content: '你好' }] }
+    expect(extractSessionKey(req, body)).toEqual({ raw: 'sess-xyz', client: 'x-session-id' })
+  })
 })

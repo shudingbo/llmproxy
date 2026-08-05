@@ -14,7 +14,7 @@
 | --- | --- |
 | 会话 ID | 会话原始标识（如 Open WebUI 的聊天会话 UUID，或内容哈希），表格内显示前 10 位，悬停看全量 |
 | 会话键 | 网关内部使用的粘附键，格式为 `虚拟模型::会话原始值`，表格内显示前 32 位 |
-| Client | 会话键来源，彩色标签：`open-webui`（蓝）、`content-hash`（绿）、`unknown`（橙） |
+| Client | 会话键来源，彩色标签：`open-webui`（蓝）、`x-session-id`（深蓝）、`ywnrs`（红）、`content-hash`（绿）、`unknown`（橙） |
 | 虚拟模型 | 下游模型别名（`downstreamModels` 的键） |
 | 粘附上游 | 该会话当前粘附的上游 ID 与上游侧模型名 |
 | 创建时间 / 更新时间 | 映射的创建与最近一次命中时间（本地时区） |
@@ -24,7 +24,7 @@
 
 | 条件 | 说明 |
 | --- | --- |
-| **客户端** | 下拉：全部 / `open-webui` / `content-hash` / `unknown`，**精确匹配** |
+| **客户端** | 下拉：全部 / `open-webui` / `x-session-id` / `ywnrs` / `content-hash` / `unknown`，**精确匹配** |
 | **关键字** | 对 `session_id` 或 `upstream_id` 做模糊匹配，输入后回车或点「查询」立即生效 |
 
 筛选条件变更同样防抖 300ms 自动刷新。列表按**更新时间倒序**（最近活动的会话在最前）。
@@ -72,8 +72,9 @@
 会话键由下游别名与会话原始值拼接：`虚拟模型::会话原始值`。会话原始值按优先级取自：
 
 1. **HTTP header `X-OpenWebUI-Chat-Id`**（Open WebUI 专有头）：命中即作为会话值，Client 记为 `open-webui`
-2. **内容前缀哈希**：取请求体 `messages` 前 2 条（通常 system + 首条 user 消息）的 `role + content` 做 `sha256`，Client 记为 `content-hash`。无需客户端配合，相同前缀的请求自动汇聚到同一上游
-3. **两者都取不到**：不建立粘附，走轮询，Client 记为 `unknown`
+2. **HTTP header `X-Session-Id`**（部分客户端把会话 id 放在该通用 header）：命中即作为会话值。**值以 `ywnrs` 开头时**Client 记为 `ywnrs`，便于按客户端来源单独筛选；其余记为 `x-session-id`
+3. **内容前缀哈希**：取请求体 `messages` 前 2 条（通常 system + 首条 user 消息）的 `role + content` 做 `sha256`，Client 记为 `content-hash`。无需客户端配合，相同前缀的请求自动汇聚到同一上游
+4. **以上都取不到**：不建立粘附，走轮询，Client 记为 `unknown`
 
 > 会话首条消息被编辑会导致内容哈希变化，视为新会话（会重新选上游）。这不影响正确性，反而最大化 cache 复用。
 

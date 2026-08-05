@@ -2,7 +2,11 @@
 
 本项目所有值得记录的变更都会汇总到本文件。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [0.4.0] - unreleased
+## [0.4.1] / 2026-08-05
+
+- 会话亲和新增 `X-Session-Id` header 提取：部分客户端把会话 id 放在该通用 header；值以 `ywnrs` 开头时 Client 记为 `ywnrs`，否则记为 `x-session-id`。优先级在 `X-OpenWebUI-Chat-Id` 之后、内容前缀哈希之前；管理端 Sessions 页客户端筛选新增对应选项
+
+## [0.4.0] / 2026-08-04
 
 ### ⚠ BREAKING CHANGES
 
@@ -11,7 +15,6 @@
 - **Node 最低版本**：`>=18` 收紧到 `>=22`（与 `better-sqlite3@13.x` 的 `engines: ">=22"` 对齐）。
 
 ### 新增
-
 - 仓库根 `.npmrc` 新增 `ignore-scripts=true`：better-sqlite3 v13.0.2 自带 prebuilds（`package/prebuilds/*.node`），`require()` 时直接按 `process.platform-arch` 加载，**不依赖 install script 触发 node-gyp**。规避 npm publish 时隐式注入 `"install": "node-gyp rebuild"` 后触发 `find VS` 失败的 bug（[WiseLibs/better-sqlite3#1503](https://github.com/WiseLibs/better-sqlite3/issues/1503)）。
 - 根 `package.json` 新增 `pnpm.onlyBuiltDependencies: []`：双保险，确保 pnpm 也不跑任何 build script。
 

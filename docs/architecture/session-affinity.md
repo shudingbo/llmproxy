@@ -9,10 +9,12 @@
 flowchart LR
     REQ[请求体 + headers] --> KEY[session/key.ts<br/>extractSessionKey]
     KEY -->|X-OpenWebUI-Chat-Id| K1[raw = header 值<br/>client = open-webui]
+    KEY -->|X-Session-Id| K4[raw = header 值<br/>值以 ywnrs 开头 → client = ywnrs<br/>否则 → client = x-session-id]
     KEY -->|内容前缀 hash| K2[raw = sha256 hex<br/>client = content-hash]
     KEY -->|都没有| K3[无会话键 → 轮询兜底]
 
     K1 --> JOIN[会话键 = `${downstreamModel}::${raw}`]
+    K4 --> JOIN
     K2 --> JOIN
     JOIN --> LB[SessionAffinityLoadBalancer.pick]
     LB -->|命中且在候选| TOUCH[touch 刷新 updated_at<br/>返回粘附上游]
@@ -38,8 +40,9 @@ const ctx = {
 `extractSessionKey(req, body): SessionKeyResult | undefined`，优先级从高到低，返回第一个命中：
 
 1. **header `X-OpenWebUI-Chat-Id`**（大小写不敏感查找，重复 header 取第一个；值 trim 后非空才生效）→ `{ raw: header值, client: 'open-webui' }`
-2. **内容前缀 hash**：`body.messages` 为数组且长度 ≥ 1 → 取**前 2 条消息**的 `[role, content]` 二元组做 sha256 → `{ raw: hashHex, client: 'content-hash' }`
-3. 都不满足 → `undefined`（调用方走轮询兜底）
+2. **header `X-Session-Id`**（部分客户端把会话 id 放在这个通用 header；大小写不敏感查找；trim 后非空）→ 值以 `ywnrs` 开头 → `{ raw: header值, client: 'ywnrs' }`；否则 → `{ raw: header值, client: 'x-session-id' }`
+3. **内容前缀 hash**：`body.messages` 为数组且长度 ≥ 1 → 取**前 2 条消息**的 `[role, content]` 二元组做 sha256 → `{ raw: hashHex, client: 'content-hash' }`
+4. 都不满足 → `undefined`（调用方走轮询兜底）
 
 内容前缀 hash 的稳定规则（`hashContentPrefix`）：
 
@@ -63,7 +66,7 @@ return createHash('sha256').update(JSON.stringify(prefix)).digest('hex')
 CREATE TABLE IF NOT EXISTS sessions (
   session_key      TEXT PRIMARY KEY,   -- `${downstreamModel}::${raw}`
   session_id       TEXT NOT NULL,      -- 原始会话键值（header 值或 hash hex）
-  client           TEXT NOT NULL,      -- 'open-webui' | 'content-hash' | 'unknown'
+  client           TEXT NOT NULL,      -- 'open-webui' | 'x-session-id' | 'ywnrs' | 'content-hash' | 'unknown'
   downstream_model TEXT NOT NULL,
   upstream_id      TEXT NOT NULL,      -- 粘附的上游 id
   upstream_model   TEXT NOT NULL,

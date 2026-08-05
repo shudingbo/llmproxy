@@ -130,7 +130,7 @@ web 端职责一句话：纯管理界面，所有数据经 `/admin/api` 获取�
 
 | 文件 | 职责 | 关键导出 |
 | --- | --- | --- |
-| `key.ts` | `extractSessionKey(req, body)`：优先级 1 取 `X-OpenWebUI-Chat-Id` header（client=`open-webui`）；优先级 2 对 messages 前 2 条内容前缀做 sha256（client=`content-hash`）；都不满足返回 `undefined`。只做提取，消费方自行拼接 `${downstreamModel}::${raw}` | `extractSessionKey`、`SessionKeyResult` |
+| `key.ts` | `extractSessionKey(req, body)`：优先级 1 取 `X-OpenWebUI-Chat-Id` header（client=`open-webui`）；优先级 2 取 `X-Session-Id` header（值以 `ywnrs` 开头 → client=`ywnrs`，否则 client=`x-session-id`）；优先级 3 对 messages 前 2 条内容前缀做 sha256（client=`content-hash`）；都不满足返回 `undefined`。只做提取，消费方自行拼接 `${downstreamModel}::${raw}` | `extractSessionKey`、`SessionKeyResult` |
 | `db.ts` | `SessionStore`：会话粘附的 SQLite 存储（`llmproxy.db` 的 `sessions` 表）。WAL 模式；预编译语句（better-sqlite3 同步 API）。提供 `get` / `bind`（UPSERT 覆盖）/ `touch` / `rebind` / `list`（分页 + client 精确匹配 + keyword 模糊）/ `delete` / `clear` / `cleanup`（按 `updated_at` 过期删除）/ `close` | `SessionStore`、`SessionRow`、`SessionBindInfo`、`SessionListResult` |
 
 依赖关系：`db.ts` 依赖 `better-sqlite3`；`load-balancer.ts` 通过 `SessionStoreLike` 接口消费它（解耦路由决策与存储）。DB 文件路径由装配层传入（`join(getDataDir(), 'llmproxy.db')`）。

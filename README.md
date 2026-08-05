@@ -27,8 +27,9 @@ The router derives a session key from the request. The first source that matches
 | Priority | Source | Implementation | `client` tag |
 | --- | --- | --- | --- |
 | 1 | HTTP header `X-OpenWebUI-Chat-Id` | case-insensitive header read, value used as-is (typically the Open WebUI chat UUID) | `open-webui` |
-| 2 | Content-prefix hash | `sha256(role + content)` over the first two messages (typically `system` + first `user` turn), JSON-stringified for multimodal payloads (arrays / objects / `null` fields preserved) | `content-hash` |
-| 3 | *(none)* | falls back to round-robin | — |
+| 2 | HTTP header `X-Session-Id` | case-insensitive header read, value used as-is; if the trimmed value starts with `ywnrs` the row is tagged `ywnrs` (so a specific client family can be filtered out), otherwise `x-session-id` | `x-session-id` / `ywnrs` |
+| 3 | Content-prefix hash | `sha256(role + content)` over the first two messages (typically `system` + first `user` turn), JSON-stringified for multimodal payloads (arrays / objects / `null` fields preserved) | `content-hash` |
+| 4 | *(none)* | falls back to round-robin | — |
 
 Open WebUI users get the strongest key (explicit UUID) **when** `ENABLE_FORWARD_USER_INFO_HEADERS=true` is set on the Open WebUI side; otherwise they fall through to the content hash, which is still correct but may re-bind if the user edits their first message.
 
@@ -38,7 +39,7 @@ Open WebUI users get the strongest key (explicit UUID) **when** `ENABLE_FORWARD_
   ```
   session_key          text  -- e.g. "<downstreamModel>::<rawKey>"
   session_id           text  -- the per-turn ID (e.g. Open WebUI chat id, or a content-hash)
-  client               text  -- 'open-webui' | 'content-hash'
+  client               text  -- 'open-webui' | 'x-session-id' | 'ywnrs' | 'content-hash'
   downstream_model     text  -- the alias
   upstream_id          text  -- the currently bound upstream
   upstream_model       text  -- the model name on that upstream

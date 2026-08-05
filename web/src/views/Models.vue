@@ -15,7 +15,7 @@
         <el-collapse v-model="activeNames">
           <el-collapse-item v-for="alias in Object.keys(models)" :key="alias" :name="alias">
             <template #title>
-              <span class="alias-title">{{ alias }}</span>
+              <CopyText class="alias-title" :copy-text="alias">{{ alias }}</CopyText>
             </template>
 
             <!-- 候选列表：拖拽手柄排序，vuedraggable 的 :list 会在拖拽结束时原地重排 -->
@@ -82,6 +82,7 @@ import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Plus, Rank } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
+import CopyText from '../components/CopyText.vue'
 import { api } from '../api/client'
 
 // 候选条目：上游 id + 上游侧模型名 + 最大上下文；_key 仅用于拖拽排序的稳定 Vue key，保存时剔除

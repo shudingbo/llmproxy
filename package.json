@@ -10,6 +10,8 @@
   "license": "MIT",
   "scripts": {
     "dev": "concurrently -k -n server,web \"pnpm --filter @llmproxy/server dev\" \"pnpm --filter @llmproxy/web dev\"",
+    "dev:server": "pnpm --filter @llmproxy/server dev",
+    "dev:web": "pnpm --filter @llmproxy/web dev",
     "start": "node scripts/start.js",
     "start:rebuild": "node scripts/start.js --rebuild",
     "build": "pnpm --filter @llmproxy/web build && pnpm --filter @llmproxy/server build",

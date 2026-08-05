@@ -13,7 +13,7 @@ import { executeWithFallback, isFallbackableAxiosError } from '../router/fallbac
 import { Router } from '../router/index.js'
 import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
 import { extractSessionKey } from '../session/key.js'
-import type { OpenAIUpstreamClient, UpstreamChatRequest } from '../upstream/openai.js'
+import type { OpenAIUpstreamClient, UpstreamChatRequest, UpstreamResponsesRequest } from '../upstream/openai.js'
 import { buildAliasMetaMap } from './model-meta.js'
 
 // 依赖注入集合：由装配层（T19）构造后传入
@@ -226,7 +226,9 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
   }
 
   // Responses API（POST /v1/responses）：非流式/流式两条路径，结构对齐 chat 处理器
-  // 网关边界转换：responses 请求 → chat 请求（responsesRequestToChat），上游统一走 chatCompletion；
+  // 每条路径内部按配置 responsesApi 分流：'native' → 请求体原样透传（仅改写 model 与强制 stream），
+  // 响应/事件流原样回转；缺省/convert → 网关边界转换：
+  // responses 请求 → chat 请求（responsesRequestToChat）走 chatCompletion，
   // 响应回转：chat 非流式响应 → responses 对象 / chat SSE 流 → responses SSE 事件流
   const handleResponses = async (
     req: Request,
@@ -261,7 +263,45 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
             reportAttempt(candidate.upstreamId, false, attemptStart)
             return { ok: false, error: new Error('upstream_client_missing'), fallbackable: true }
           }
-          // 转换请求：responses → chat，模型名换成上游侧名称，强制流式（includeUsage 让上游补发 usage 块）
+          // 按配置分流：mode = upstreamCfg?.responsesApi ?? 'convert'（缺省 convert，防御性保留 ??）
+          // native → 原生透传 /v1/responses；convert/未配置 → 转换路径（responses → chat）
+          const upstreamCfg = store.get().upstreams.find((u) => u.id === candidate.upstreamId)
+          const mode = upstreamCfg?.responsesApi ?? 'convert'
+          // ---------- response（原生透传）：请求体原样（仅改写 model）+ 强制流式，响应事件原样 pipe ----------
+          if (mode === 'native') {
+            try {
+              const { stream, abort, connectError } = client.responsesCompletionStream(
+                { ...body, model: candidate.model, stream: true } as UpstreamResponsesRequest,
+                { signal },
+              )
+              // 等待连接阶段结果：成功（null）→ 把流交给调用方；失败（Error）→ 可回退下一个候选
+              // 必须 await：axios 流式调用是后台 promise，try/catch 抓不到它的 reject
+              const connectErr = await connectError
+              if (connectErr) {
+                // 主动挂空操作监听器，避免被丢弃的流产生 unhandled error 事件
+                // （实际错误已通过 connectError 上报，调用方要走回退路径）
+                stream.on('error', () => {})
+                reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(connectErr))
+                // 决策 6/7：透传 404 → 视为该上游实际不支持 → 可回退；其余沿用 isFallbackableAxiosError
+                return {
+                  ok: false,
+                  error: connectErr,
+                  fallbackable: isFallbackableAxiosError(connectErr) || extractErrorStatus(connectErr) === 404,
+                }
+              }
+              reportAttempt(candidate.upstreamId, true, attemptStart)
+              return { ok: true, value: { stream, abort } }
+            } catch (err) {
+              reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
+              return {
+                ok: false,
+                error: err,
+                fallbackable: isFallbackableAxiosError(err) || extractErrorStatus(err) === 404,
+              }
+            }
+          }
+          // ---------- response→completions（转换）：responses → chat，chat SSE 流 → responses SSE 事件流 ----------
+          // 转换发生在候选内：成功返回的 stream 已是 responses 事件流，输出管道对原生/转换一视同仁
           const chatReq = responsesRequestToChat(body as ResponsesRequest)
           chatReq.model = candidate.model
           chatReq.stream = true
@@ -280,8 +320,11 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
               reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(connectErr))
               return { ok: false, error: connectErr, fallbackable: isFallbackableAxiosError(connectErr) }
             }
+            // chat SSE 流 → responses SSE 事件流（转换器内部挂接上游 error 监听）
+            const responsesStream = createResponsesStream(stream, model)
+            stream.pipe(responsesStream as unknown as Writable)
             reportAttempt(candidate.upstreamId, true, attemptStart)
-            return { ok: true, value: { stream, abort } }
+            return { ok: true, value: { stream: responsesStream, abort } }
           } catch (err) {
             reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
             return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
@@ -299,10 +342,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
         return
       }
       const { stream, abort } = result.value
-      // 上游 chat SSE 流 → responses SSE 事件流（转换器内部挂接上游 error 监听）
-      const responsesStream = createResponsesStream(stream, model)
-      stream.pipe(responsesStream as unknown as Writable)
-      // SSE 响应头必须在首字节之前设置
+      // SSE 响应头必须在首字节之前设置（原生透传流与转换流共用同一输出管道，直接 pipe）
       res.setHeader('Content-Type', 'text/event-stream')
       res.setHeader('Cache-Control', 'no-cache')
       res.setHeader('Connection', 'keep-alive')
@@ -313,13 +353,13 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       res.on('close', () => {
         abort()
       })
-      // 转换流异常（上游传输错误已由转换器转成 error 事件，正常路径不触发）→ 结束响应
-      responsesStream.on('error', () => {
+      // 上游流异常 → 结束响应（SSE 半关闭），不崩溃进程
+      stream.on('error', () => {
         if (!res.destroyed) {
           res.end()
         }
       })
-      responsesStream.pipe(res)
+      stream.pipe(res)
       return
     }
 
@@ -335,7 +375,30 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
           reportAttempt(candidate.upstreamId, false, attemptStart)
           return { ok: false, error: new Error('upstream_client_missing'), fallbackable: true }
         }
-        // 转换请求：responses → chat，模型名换成上游侧名称，强制非流式
+        // 按配置分流：mode = upstreamCfg?.responsesApi ?? 'convert'（缺省 convert，防御性保留 ??）
+        // native → 原生透传 /v1/responses；convert/未配置 → 转换路径（responses → chat）
+        const upstreamCfg = store.get().upstreams.find((u) => u.id === candidate.upstreamId)
+        const mode = upstreamCfg?.responsesApi ?? 'convert'
+        // ---------- response（原生透传）：请求体原样（仅改写 model）+ 强制非流式，响应 JSON 原样返回 ----------
+        if (mode === 'native') {
+          try {
+            const data = await client.responsesCompletion(
+              { ...body, model: candidate.model, stream: false } as UpstreamResponsesRequest,
+              { signal },
+            )
+            reportAttempt(candidate.upstreamId, true, attemptStart, 200)
+            return { ok: true, value: { status: 200, headers: {}, data } }
+          } catch (err) {
+            reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
+            // 决策 6/7：透传 404 → 视为该上游实际不支持 → 可回退；其余沿用 isFallbackableAxiosError
+            return {
+              ok: false,
+              error: err,
+              fallbackable: isFallbackableAxiosError(err) || extractErrorStatus(err) === 404,
+            }
+          }
+        }
+        // ---------- response→completions（转换）：responses → chat，chat 响应 → responses 响应对象 ----------
         const chatReq = responsesRequestToChat(body as ResponsesRequest)
         chatReq.model = candidate.model
         chatReq.stream = false

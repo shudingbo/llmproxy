@@ -27,6 +27,7 @@
 | `upstreams[].apiKey` | string | 是 | — | 明文密钥（配置文件 0600 权限落盘） |
 | `upstreams[].timeoutMs` | number | 否 | `30000` | 请求超时（毫秒），必须为正整数 |
 | `upstreams[].disabled` | boolean | 否 | `false` | 暂停开关，`true` 时该上游不参与路由 |
+| `upstreams[].responsesApi` | string | 否 | `'convert'` | Responses API 处理方式：`'native'` 原生透传（请求 / 响应 / 流式事件原样打给上游 `/v1/responses`）；`'convert'`（缺省）在网关边界转换为 `/v1/chat/completions` 再请求上游。 |
 | `downstreamModels` | object | 是 | — | 下游模型别名映射：key = 虚拟模型别名，value = 候选数组 |
 | `downstreamModels[alias][]` | array | 是（至少 1 个候选） | — | 一个别名对应的有序候选列表 |
 | `downstreamModels[alias][].upstreamId` | string | 是 | — | 须与某个 `upstreams[].id` 对应 |
@@ -64,6 +65,7 @@
       "apiKey": "sk-REPLACE_ME",                  // 明文密钥（配置文件 0600 权限）
       "timeoutMs": 30000,                         // 请求超时（毫秒），默认 30000
       "disabled": false,                          // 暂停开关，默认 false
+      "responsesApi": "convert",                  // Responses API：convert=转换为 chat/completions（缺省）/ native=原生透传；auto 已移除
       "max_context_length": 32768,                // 可选：模型最大上下文；可点管理端「自动」按钮探测（llama.cpp / LM Studio），缺省不设
     },
     {
@@ -119,6 +121,12 @@
 - **`apiKey`**：明文存放。配置文件以 `0600` 权限落盘以保护密钥。密钥**绝不**出现在日志、管理接口响应或错误体中（管理接口只返回掩码值）。
 - **`timeoutMs`**：单次上游请求的超时（毫秒），缺省 `30000`。超时属于可回退错误，会触发故障切换。
 - **`disabled`**：暂停开关，缺省 `false`。暂停的上游在候选解析时被过滤，不再参与路由；管理界面显示 `Paused` 标签。
+- **`responsesApi`**：Responses API 处理方式，取值 `'native'` 或 `'convert'`（缺省 `'convert'`）。
+  - `'native'`：原生透传。下游 `/v1/responses` 请求体（除 `model` 改写为上游侧模型名、`stream` 按分支强制外）原样打到 `POST {baseUrl}/responses`，非流式响应 JSON 与流式 SSE 事件原样回转，不经 Responses ↔ Chat 转换。适合上游 `/v1/responses` 实现完整（流式事件齐全、多轮 input 兼容）的服务。
+  - `'convert'`：转换路径（缺省，行为与未配置该字段时一致）。网关边界把 `/v1/responses` 转为 `/v1/chat/completions` 请求上游，再把上游响应 / SSE 流转回 Responses 形状。兼容性最好：上游 responses 实现不完整（如流式漏发 `output_item.added`、input 含 reasoning item 被拒 400）时也稳定工作。
+  - **添加上游时检测**：管理端「新增 / 编辑上游」弹窗的 Responses API 下拉旁有「检测」按钮，自动判定该上游应选哪个值。两步检测：① 非流式 `POST {baseUrl}/responses`（`{model, input: 'ping', max_output_tokens: 1}`）返回 200 且 `object === 'response'`；② 流式同请求并消费 SSE 事件流，验证事件完整（`response.completed` 收到，且 message item 有 `output_item.added`、`content_part.added` 前置）。两步都过 → 填入 `'native'`；任一失败 → 填入 `'convert'`。
+  - **404 防护（已知取舍）**：原生透传分支中上游返回 `404` 视为「该上游实际不支持」→ 可回退（切下一候选）；全部候选 404 耗尽返回 `502 {"error": "no_upstream"}`。注意语义变化：真实坏 model 的 404 从「立即 404」变为「回退 → 可能 502」。
+  - **响应 `model` 字段（已知取舍）**：原生透传响应 `model` 为上游侧模型名（与 `/v1/chat/completions` 透传一致，不回写别名）；转换路径响应 `model` 为下游别名。同一别名两条路径的响应 `model` 不一致属已知设计取舍（流式透传按事件原样 pipe，无法逐事件改写）。
 - **`max_context_length`**：可选，模型最大上下文（正整数）。可手动填写，或点管理端「自动」按钮调用 `POST /admin/api/upstreams/probe-context` 探测（仅支持 llama.cpp / LM Studio 格式，其它上游探测不到返回 `context_not_found`）。显式 `null` 表示清空。下游模型列表（`/v1/models`、`/api/tags`）会按别名分组取各候选上游该值的**最小值**作为 `meta.n_ctx` 返回；所有候选均未配置时该模型不带 meta。
 
 ### downstreamModels（下游别名）

@@ -255,7 +255,7 @@ describe('OpenAIUpstreamClient', () => {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ data: [{ id: 'gpt-4' }] }))
     })
-    const client = openaiClient({ id: 'u1', baseUrl, apiKey: 'sk-x', timeoutMs: 3000, disabled: false })
+    const client = openaiClient({ id: 'u1', baseUrl, apiKey: 'sk-x', timeoutMs: 3000, disabled: false, responsesApi: 'convert' })
     const models = await client.listModels()
     expect(models).toEqual([{ id: 'gpt-4' }])
   })
@@ -349,5 +349,414 @@ describe('OpenAIUpstreamClient', () => {
     result.stream.on('error', () => {})
     const err = await result.connectError
     expect(err).toBeInstanceOf(Error)
+  })
+})
+
+// ============================================================================
+// T7a 追加：Responses 原生透传方法测试（T2 新增：responsesCompletion /
+// responsesCompletionStream / probeResponsesSupport）+ chatCompletionStream
+// 重构零回归断言。行为对照 server/src/upstream/openai.ts 的 T2 实现。
+// ============================================================================
+
+describe('OpenAIUpstreamClient responsesCompletion', () => {
+  it('非流式 POST /responses：返回解析后的对象，强制 stream=false，其余字段原样透传', async () => {
+    let capturedUrl: string | undefined
+    let captured: unknown
+    await startMock(async (req, res) => {
+      capturedUrl = req.url
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'resp_1',
+          object: 'response',
+          output: [{ type: 'message', content: [{ type: 'output_text', text: 'hi' }] }],
+        }),
+      )
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    const res = await client.responsesCompletion({ model: 'gpt-4o', input: '你好', temperature: 0.7 })
+    // 打 /responses（baseUrl 带 /v1 后缀），请求体强制 stream=false，透传字段原样保留
+    expect(capturedUrl).toBe('/v1/responses')
+    expect(captured).toMatchObject({ model: 'gpt-4o', input: '你好', temperature: 0.7, stream: false })
+    expect(res).toMatchObject({ id: 'resp_1', object: 'response' })
+  })
+
+  it('responsesCompletion 收到流式请求时抛错', async () => {
+    const client = new OpenAIUpstreamClient({ baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'k', timeoutMs: 1000 })
+    await expect(
+      client.responsesCompletion({ model: 'm', input: 'hi', stream: true }),
+    ).rejects.toThrow(/responsesCompletionStream/)
+  })
+})
+
+describe('OpenAIUpstreamClient responsesCompletionStream', () => {
+  it('流式 POST /responses：SSE 数据桥接，请求体强制 stream=true', async () => {
+    let capturedUrl: string | undefined
+    let captured: unknown
+    await startMock(async (req, res) => {
+      capturedUrl = req.url
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write('data: {"type":"response.output_text.delta","delta":"你"}\n\n')
+      res.write('data: {"type":"response.output_text.delta","delta":"好"}\n\n')
+      res.end('data: [DONE]\n\n')
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    const { stream } = client.responsesCompletionStream({
+      model: 'gpt-4o',
+      input: '你好',
+      stream: true,
+    })
+    const text = await drain(stream)
+    expect(capturedUrl).toBe('/v1/responses')
+    expect(captured).toMatchObject({ model: 'gpt-4o', input: '你好', stream: true })
+    expect(text).toContain('data: [DONE]')
+    expect(text).toContain('你')
+    expect(text).toContain('好')
+  })
+
+  it('正常 SSE：connectError 解析为 null', async () => {
+    await startMock(async (req, res) => {
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n')
+      res.end('data: [DONE]\n\n')
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    const result = client.responsesCompletionStream({ model: 'gpt-4o', input: 'hi', stream: true })
+    // 连接阶段成功：connectError 立即 resolve 为 null（与 chatCompletionStream 语义一致）
+    await expect(result.connectError).resolves.toBeNull()
+    await drain(result.stream)
+  })
+
+  it('上游 500：connectError 解析为带 500 状态码的 axios 错误', async () => {
+    await startMock(async (req, res) => {
+      res.statusCode = 500
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: 'mock boom' }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    const result = client.responsesCompletionStream({ model: 'gpt-4o', input: 'hi', stream: true })
+    // 显式挂空操作监听器，避免被丢弃的流产生 unhandled error 事件
+    result.stream.on('error', () => {})
+    const err = await result.connectError
+    expect(err).toBeInstanceOf(Error)
+    expect((err as unknown as { response: { status: number } }).response.status).toBe(500)
+  })
+
+  it('返回的 abort() 能销毁流', async () => {
+    await startMock((req, res) => {
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write('data: {"type":"response.output_text.delta","delta":"x"}\n\n')
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    const { stream, abort } = client.responsesCompletionStream({ model: 'gpt-4o', input: 'hi', stream: true })
+    await firstChunk(stream)
+    abort()
+    expect(stream.destroyed).toBe(true)
+    await sleep(200)
+  })
+})
+
+describe('OpenAIUpstreamClient probeResponsesSupport', () => {
+  it('200 + object=response → true；请求体与 url 正确', async () => {
+    let capturedUrl: string | undefined
+    let captured: unknown
+    await startMock(async (req, res) => {
+      capturedUrl = req.url
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ object: 'response', id: 'resp_1' }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesSupport('gpt-4o-mini')).resolves.toBe(true)
+    expect(capturedUrl).toBe('/v1/responses')
+    expect(captured).toEqual({ model: 'gpt-4o-mini', input: 'ping', max_output_tokens: 1, stream: false })
+  })
+
+  it('model 缺省时探测请求体使用 gpt-4o-mini', async () => {
+    let captured: unknown
+    await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ object: 'response' }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesSupport()).resolves.toBe(true)
+    expect((captured as { model: string }).model).toBe('gpt-4o-mini')
+  })
+
+  it('200 但 object 为 chat.completion → false（形状不符）', async () => {
+    await startMock(async (req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ object: 'chat.completion' }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesSupport('m')).resolves.toBe(false)
+  })
+
+  it('200 但响应体为空对象 → false（形状不符）', async () => {
+    await startMock(async (req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({}))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesSupport('m')).resolves.toBe(false)
+  })
+
+  it('400 → true（端点存在，仅参数不被接受）', async () => {
+    await startMock(async (req, res) => {
+      res.statusCode = 400
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: { message: 'bad request' } }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesSupport('m')).resolves.toBe(true)
+  })
+
+  it('422 → true（端点存在，仅参数不被接受）', async () => {
+    await startMock(async (req, res) => {
+      res.statusCode = 422
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: { message: 'invalid' } }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesSupport('m')).resolves.toBe(true)
+  })
+
+  it.each<[string, number]>([
+    ['400', 400],
+    ['422', 422],
+  ])('严格模式：上游返回 %s → false（非 2xx 均视为不支持）', async (desc: string, status: number) => {
+    await startMock(async (req, res) => {
+      res.statusCode = status
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: { message: desc } }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesSupport('m', true)).resolves.toBe(false)
+  })
+
+  it('严格模式：404 同样视为不支持（与默认语义一致）', async () => {
+    await startMock(async (req, res) => {
+      res.statusCode = 404
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: { message: 'not found' } }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesSupport('m', true)).resolves.toBe(false)
+  })
+
+  it.each<[string, number]>([
+    ['404（端点不存在）', 404],
+    ['405（方法不允许）', 405],
+    ['401（鉴权失败）', 401],
+    ['403（禁止访问）', 403],
+  ])('上游返回 %s → false（确定性不支持）', async (desc: string, status: number) => {
+    await startMock(async (req, res) => {
+      res.statusCode = status
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: { message: desc } }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesSupport('m')).resolves.toBe(false)
+  })
+
+  it.each<[string, number]>([
+    ['500（服务端错误）', 500],
+    ['429（限流）', 429],
+  ])('上游返回 %s → 抛错（探测异常，由调用方按失败处理）', async (desc: string, status: number) => {
+    await startMock(async (req, res) => {
+      res.statusCode = status
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: desc }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesSupport('m')).rejects.toThrow()
+  })
+
+  it('连接拒绝（网络错误）→ 抛错', async () => {
+    // 端口 1 在本地保证无服务监听 → axios 抛出 ECONNREFUSED，probe 视为探测异常
+    const client = new OpenAIUpstreamClient({
+      baseUrl: 'http://127.0.0.1:1/v1',
+      apiKey: 'sk-test',
+      timeoutMs: 1000,
+    })
+    await expect(client.probeResponsesSupport('m')).rejects.toThrow()
+  })
+})
+
+describe('OpenAIUpstreamClient probeResponsesStream', () => {
+  it('标准事件序列 → true；请求体与 url 正确', async () => {
+    let capturedUrl: string | undefined
+    let captured: unknown
+    await startMock(async (req, res) => {
+      capturedUrl = req.url
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n')
+      res.write(
+        'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}\n\n',
+      )
+      res.write(
+        'data: {"type":"response.content_part.added","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}\n\n',
+      )
+      res.write(
+        'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"ping"}\n\n',
+      )
+      res.write(
+        'data: {"type":"response.output_text.done","item_id":"msg_1","output_index":0,"content_index":0,"text":"ping"}\n\n',
+      )
+      res.end('data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n')
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesStream('gpt-4o-mini')).resolves.toBe(true)
+    expect(capturedUrl).toBe('/v1/responses')
+    expect(captured).toEqual({ model: 'gpt-4o-mini', input: 'ping', max_output_tokens: 128, stream: true })
+  })
+
+  it('model 缺省时探测请求体使用 gpt-4o-mini', async () => {
+    let captured: unknown
+    await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write(
+        'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}\n\n',
+      )
+      res.write(
+        'data: {"type":"response.content_part.added","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}\n\n',
+      )
+      res.write(
+        'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"ping"}\n\n',
+      )
+      res.end('data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n')
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesStream()).resolves.toBe(true)
+    expect((captured as { model: string }).model).toBe('gpt-4o-mini')
+  })
+
+  it('仅 reasoning 无 message → false（推理模型判不支持 → convert）', async () => {
+    // 实测根因场景：llama.cpp deepseek 系列探测流（max_output_tokens:128）事件序列
+    // 只有 reasoning 相关事件，无任何 message 事件 → 流式完整性验证不通过
+    await startMock(async (req, res) => {
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write(
+        'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rsn_1","type":"reasoning","summary":[]}}\n\n',
+      )
+      res.write(
+        'data: {"type":"response.reasoning_text.delta","item_id":"rsn_1","output_index":0,"content_index":0,"delta":"think"}\n\n',
+      )
+      res.write(
+        'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rsn_1","type":"reasoning","summary":[]}}\n\n',
+      )
+      res.end('data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n')
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesStream('m')).resolves.toBe(false)
+  })
+
+  it('reasoning 之后出现 message 事件 → true（推理模型思考完仍正常输出 message）', async () => {
+    await startMock(async (req, res) => {
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write(
+        'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rsn_1","type":"reasoning","summary":[]}}\n\n',
+      )
+      res.write(
+        'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}\n\n',
+      )
+      res.write(
+        'data: {"type":"response.content_part.added","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}\n\n',
+      )
+      res.write(
+        'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"ping"}\n\n',
+      )
+      res.end('data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n')
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesStream('m')).resolves.toBe(true)
+  })
+
+  it('流缺失 response.completed → false', async () => {
+    await startMock(async (req, res) => {
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n')
+      res.end('data: [DONE]\n\n')
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesStream('m')).resolves.toBe(false)
+  })
+
+  it('message delta 先于 output_item.added（缺少 added）→ false', async () => {
+    await startMock(async (req, res) => {
+      res.setHeader('Content-Type', 'text/event-stream')
+      // 故意漏发 response.output_item.added(message)（llama.cpp 偶发缺陷场景）
+      res.write(
+        'data: {"type":"response.content_part.added","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}\n\n',
+      )
+      res.write(
+        'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"ping"}\n\n',
+      )
+      res.end('data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n')
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesStream('m')).resolves.toBe(false)
+  })
+
+  it('上游返回非流式 JSON（异常）→ false', async () => {
+    await startMock(async (req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ object: 'response', id: 'resp_1' }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesStream('m')).resolves.toBe(false)
+  })
+
+  it('上游 500 → false（不抛错）', async () => {
+    await startMock(async (req, res) => {
+      res.statusCode = 500
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: 'mock boom' }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await expect(client.probeResponsesStream('m')).resolves.toBe(false)
+  })
+
+  it('网络错误 → false（不抛错）', async () => {
+    // 端口 1 在本地保证无服务监听 → axios 抛出 ECONNREFUSED，探测视为失败
+    const client = new OpenAIUpstreamClient({
+      baseUrl: 'http://127.0.0.1:1/v1',
+      apiKey: 'sk-test',
+      timeoutMs: 1000,
+    })
+    await expect(client.probeResponsesStream('m')).resolves.toBe(false)
+  })
+})
+
+describe('chatCompletionStream 重构零回归（T7a）', () => {
+  it('请求体与流行为与重构前一致：url /v1/chat/completions、强制 stream=true、透传字段原样', async () => {
+    let capturedUrl: string | undefined
+    let captured: unknown
+    await startMock(async (req, res) => {
+      capturedUrl = req.url
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write('data: {"choices":[{"delta":{"content":"a"}}]}\n\n')
+      res.end('data: [DONE]\n\n')
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    const result = client.chatCompletionStream({
+      model: 'gpt-4',
+      messages: [{ role: 'user', content: 'hi' }],
+      temperature: 0.5,
+      stream: true,
+    })
+    // 连接成功 + 流数据正常桥接，行为与重构前一致
+    await expect(result.connectError).resolves.toBeNull()
+    const text = await drain(result.stream)
+    expect(capturedUrl).toBe('/v1/chat/completions')
+    expect(captured).toMatchObject({ model: 'gpt-4', stream: true, temperature: 0.5 })
+    expect(text).toContain('data: [DONE]')
+    expect(text).toContain('a')
   })
 })

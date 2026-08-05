@@ -362,6 +362,12 @@ describe('OpenAI Responses API（POST /v1/responses）', () => {
     // 捕获上游收到的请求体，断言已转换为 chat 格式
     let captured: unknown
     const url = await startMock(async (req, res) => {
+      // /v1/responses 分流保留：convert 模式不探测不透传，转换路径只打 /chat/completions
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
       captured = await readBody(req)
       res.setHeader('Content-Type', 'application/json')
       res.end(
@@ -417,6 +423,12 @@ describe('OpenAI Responses API（POST /v1/responses）', () => {
   it('instructions 前置 system 消息，数组 input 逐项映射', async () => {
     let captured: unknown
     const url = await startMock(async (req, res) => {
+      // /v1/responses 分流保留：convert 模式不探测不透传，转换路径只打 /chat/completions
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
       captured = await readBody(req)
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ id: 'ok', object: 'chat.completion', choices: [] }))
@@ -447,6 +459,12 @@ describe('OpenAI Responses API（POST /v1/responses）', () => {
   it('流式：返回 Responses SSE 事件流，delta 事件顺序正确', async () => {
     let captured: unknown
     const url = await startMock(async (req, res) => {
+      // /v1/responses 分流保留：convert 模式不探测不透传，转换路径只打 /chat/completions
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
       captured = await readBody(req)
       res.setHeader('Content-Type', 'text/event-stream')
       res.write('data: {"id":"1","choices":[{"delta":{"content":"你"}}]}\n\n')
@@ -509,10 +527,22 @@ describe('OpenAI Responses API（POST /v1/responses）', () => {
 
   it('全部上游失败时返回 502 no_upstream', async () => {
     const url1 = await startMock(async (req, res) => {
+      // /v1/responses 分流保留：convert 模式不探测不透传，转换路径只打 /chat/completions
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
       res.statusCode = 500
       res.end('err')
     })
     const url2 = await startMock(async (req, res) => {
+      // /v1/responses 分流保留：convert 模式不探测不透传，转换路径只打 /chat/completions
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
       res.statusCode = 503
       res.end('err')
     })
@@ -528,10 +558,22 @@ describe('OpenAI Responses API（POST /v1/responses）', () => {
 
   it('首选上游失败回退到下一个候选并最终 200', async () => {
     const url1 = await startMock(async (req, res) => {
+      // /v1/responses 分流保留：convert 模式不探测不透传，转换路径只打 /chat/completions
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
       res.statusCode = 500
       res.end('boom')
     })
     const url2 = await startMock(async (req, res) => {
+      // /v1/responses 分流保留：convert 模式不探测不透传，转换路径只打 /chat/completions
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
       res.setHeader('Content-Type', 'application/json')
       res.end(
         JSON.stringify({
@@ -646,12 +688,24 @@ describe('OpenAI 会话亲和路由', () => {
     let hitU1 = 0
     let hitU2 = 0
     const url1 = await startMock(async (req, res) => {
+      // /v1/responses 分流保留：convert 模式不探测不透传，转换路径只打 /chat/completions，不计入上游请求计数
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
       hitU1++
       await readBody(req)
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ id: 'r1', object: 'response', output: [] }))
     })
     const url2 = await startMock(async (req, res) => {
+      // /v1/responses 分流保留：convert 模式不探测不透传，转换路径只打 /chat/completions，不计入上游请求计数
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
       hitU2++
       await readBody(req)
       res.setHeader('Content-Type', 'application/json')
@@ -685,6 +739,12 @@ describe('OpenAI 会话亲和路由', () => {
   it('同一内容跨协议：chat messages 与 responses input 产生相同内容 hash 会话键', async () => {
     let hitU1 = 0
     const url = await startMock(async (req, res) => {
+      // /v1/responses 分流保留：convert 模式不探测不透传，转换路径只打 /chat/completions，不计入上游请求计数
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
       hitU1++
       await readBody(req)
       res.setHeader('Content-Type', 'application/json')
@@ -710,5 +770,337 @@ describe('OpenAI 会话亲和路由', () => {
     expect(session.touchCalls).toEqual([sessionKey])
     expect(session.bindCalls).toHaveLength(1)
     expect(hitU1).toBe(2)
+  })
+})
+
+describe('OpenAI Responses 原生透传（POST /v1/responses）', () => {
+  // 按用例改写配置：给上游设 responsesApi（native / convert），可选收窄为单候选别名
+  // （保证轮询命中同一上游，便于请求计数断言）
+  function setResponsesConfig(opts: { u1?: 'native' | 'convert'; u2?: 'native' | 'convert'; singleCandidate?: boolean }): void {
+    const current = store.get()
+    const modes: Array<'native' | 'convert' | undefined> = [opts.u1, opts.u2]
+    store.set(
+      {
+        ...current,
+        upstreams: current.upstreams.map((u, i) => ({ ...u, responsesApi: modes[i] ?? 'convert' })),
+        downstreamModels: opts.singleCandidate
+          ? { 'gpt-4': [{ upstreamId: 'u1', model: 'gpt-4-u1' }] }
+          : current.downstreamModels,
+      },
+      { source: 'admin' },
+    )
+  }
+
+  it('native 配置：不探测直接透传，mock 只收到 1 次 /v1/responses 且请求体原样（除 model/stream 改写）', async () => {
+    setResponsesConfig({ u1: 'native', u2: 'native', singleCandidate: true })
+    let responsesHits = 0
+    let captured: unknown
+    // 上游原生 Responses 响应：model 为上游侧模型名（决策 8，不回写下游别名）
+    const upstreamJson = {
+      id: 'resp_1',
+      object: 'response',
+      status: 'completed',
+      model: 'gpt-4-u1',
+      output: [
+        {
+          id: 'msg_1',
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text: '你好', annotations: [] }],
+        },
+      ],
+      usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+    }
+    const url = await startMock(async (req, res) => {
+      responsesHits++
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify(upstreamJson))
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/responses')
+      .send({ model: 'gpt-4', input: '你好', max_output_tokens: 100, temperature: 0.7 })
+    expect(res.status).toBe(200)
+    // 非流式透传：上游 JSON 原样返回（深度相等），model 为候选上游侧模型名
+    expect(res.body).toEqual(upstreamJson)
+    expect((res.body as { model: string }).model).toBe('gpt-4-u1')
+    // 请求体原样透传：仅改写 model（候选上游模型名）与强制非流式，其余字段未动
+    expect(captured).toEqual({
+      model: 'gpt-4-u1',
+      input: '你好',
+      max_output_tokens: 100,
+      temperature: 0.7,
+      stream: false,
+    })
+    // native 短路不探测：/v1/responses 只收到 1 次（即真实请求本身）
+    expect(responsesHits).toBe(1)
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: true, status: 200 })
+  })
+
+  it('native 流式：上游 SSE 事件原样透传（不经 createResponsesStream 转换）', async () => {
+    setResponsesConfig({ u1: 'native', singleCandidate: true })
+    let responsesHits = 0
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      responsesHits++
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write(
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"r1","object":"response","status":"in_progress","model":"gpt-4-u1"}}\n\n',
+      )
+      res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"你"}\n\n')
+      res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"好"}\n\n')
+      res.end(
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"r1","object":"response","status":"completed","model":"gpt-4-u1"}}\n\n',
+      )
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/responses')
+      .send({ model: 'gpt-4', input: '你好', stream: true })
+    expect(res.status).toBe(200)
+    // SSE 响应头必须完整
+    expect(res.headers['content-type']).toContain('text/event-stream')
+    expect(res.headers['cache-control']).toContain('no-cache')
+    expect(res.headers['x-accel-buffering']).toBe('no')
+    // 上游原始事件序列原样出现：透传不经 createResponsesStream 的证据是
+    // 事件名/顺序与上游完全一致，且转换路径必发的中间事件（in_progress / output_item.added）不存在
+    const text = res.text
+    const eventOrder = [
+      'event: response.created',
+      'event: response.output_text.delta',
+      'event: response.output_text.delta',
+      'event: response.completed',
+    ]
+    let prev = -1
+    for (const name of eventOrder) {
+      // 同名事件（连续两个 delta）需从上次位置之后开始查找，保证顺序断言
+      const idx = text.indexOf(name, prev + 1)
+      expect(idx).toBeGreaterThan(prev)
+      prev = idx
+    }
+    expect(text).not.toContain('event: response.in_progress')
+    expect(text).not.toContain('event: response.output_item.added')
+    expect(text).toContain('"delta":"你"')
+    expect(text).toContain('"delta":"好"')
+    // 请求体原样：仅 model 改写 + 强制流式；native 透传不注入 stream_options
+    expect(captured).toEqual({ model: 'gpt-4-u1', input: '你好', stream: true })
+    // 无探测请求
+    expect(responsesHits).toBe(1)
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: true })
+  })
+
+  it('native 配置：即便 mock 能应答探测也不探测，/v1/responses 只收到真实请求', async () => {
+    setResponsesConfig({ u1: 'native', singleCandidate: true })
+    let probeHits = 0
+    let realHits = 0
+    let realBody: unknown
+    const upstreamJson = {
+      id: 'resp_1',
+      object: 'response',
+      status: 'completed',
+      model: 'gpt-4-u1',
+      output: [],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    }
+    const url = await startMock(async (req, res) => {
+      const body = await readBody(req)
+      // 探测请求特征：input:'ping'（T2 冻结的探测请求体）；native 模式不会发起，该分支只用于证明未探测
+      if ((body as { input?: string }).input === 'ping') {
+        probeHits++
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify({ object: 'response' }))
+        return
+      }
+      realHits++
+      realBody = body
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify(upstreamJson))
+    })
+    addClient('u1', url)
+
+    const send = (): request.Test => request(app).post('/v1/responses').send({ model: 'gpt-4', input: '你好' })
+
+    const res1 = await send()
+    expect(res1.status).toBe(200)
+    // 首请求：无探测，只发 1 次真实请求，响应原样透传
+    expect(res1.body).toEqual(upstreamJson)
+    expect(probeHits).toBe(0)
+    expect(realHits).toBe(1)
+    // 真实请求体仅改写 model 与强制非流式
+    expect(realBody).toEqual({ model: 'gpt-4-u1', input: '你好', stream: false })
+
+    // 二次请求：仍然无探测，只发真实请求
+    const res2 = await send()
+    expect(res2.status).toBe(200)
+    expect(res2.body).toEqual(upstreamJson)
+    expect(probeHits).toBe(0)
+    expect(realHits).toBe(2)
+    expect(attempts).toHaveLength(2)
+    expect(attempts.every((a) => a.ok && a.upstreamId === 'u1')).toBe(true)
+  })
+
+  it('convert 配置：即使 mock /v1/responses 可支持也不打它，请求直达 /chat/completions', async () => {
+    setResponsesConfig({ u1: 'convert', singleCandidate: true })
+    let responsesHits = 0
+    let chatHits = 0
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      // mock 的 /v1/responses 也能正常应答（可支持），但 convert 模式既不探测也不透传
+      if (req.url?.startsWith('/v1/responses')) {
+        responsesHits++
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify({ id: 'resp_1', object: 'response', status: 'completed', model: 'gpt-4-u1', output: [] }))
+        return
+      }
+      chatHits++
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-1',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: '转换结果' }, finish_reason: 'stop' }],
+        }),
+      )
+    })
+    addClient('u1', url)
+
+    const res = await request(app).post('/v1/responses').send({ model: 'gpt-4', input: '你好' })
+    expect(res.status).toBe(200)
+    const body = res.body as { object: string; model: string; output: Array<{ content: Array<{ text: string }> }> }
+    // 转换产物：chat 响应 → responses 对象（model 为下游别名）
+    expect(body.object).toBe('response')
+    expect(body.model).toBe('gpt-4')
+    expect(body.output[0].content[0].text).toBe('转换结果')
+    // 上游收到的是 chat 格式请求（responses → chat 转换产物）
+    expect(captured).toMatchObject({
+      model: 'gpt-4-u1',
+      stream: false,
+      messages: [{ role: 'user', content: '你好' }],
+    })
+    // /v1/responses 一次都没被打：无探测、无透传；转换路径只打 1 次 /chat/completions
+    expect(responsesHits).toBe(0)
+    expect(chatHits).toBe(1)
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: true, status: 200 })
+  })
+
+  it('404 防护：native 真实请求 404 视为不支持 → 回退下一候选成功', async () => {
+    setResponsesConfig({ u1: 'native', u2: 'native' })
+    const url1 = await startMock(async (req, res) => {
+      // 真实透传请求返回 404：按决策 6/7 可回退下一个候选
+      res.statusCode = 404
+      res.end('not found')
+    })
+    const upstreamJson = { id: 'resp_2', object: 'response', status: 'completed', model: 'gpt-4-u2', output: [] }
+    const url2 = await startMock(async (req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify(upstreamJson))
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+
+    const res = await request(app).post('/v1/responses').send({ model: 'gpt-4', input: '你好' })
+    expect(res.status).toBe(200)
+    // 回退到 u2 的原样透传产物
+    expect(res.body).toEqual(upstreamJson)
+    expect(attempts.map((a) => a.upstreamId)).toEqual(['u1', 'u2'])
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: false, status: 404 })
+    expect(attempts[1]).toMatchObject({ upstreamId: 'u2', ok: true, status: 200 })
+  })
+
+  it('混合候选：候选1 原生透传失败（500）→ 候选2 转换成功（下游拿到转换产物）', async () => {
+    setResponsesConfig({ u1: 'native', u2: 'convert' })
+    const url1 = await startMock(async (req, res) => {
+      res.statusCode = 500
+      res.end('boom')
+    })
+    const url2 = await startMock(async (req, res) => {
+      // /v1/responses 分流保留：convert 模式不探测不透传，转换路径只打 /chat/completions
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-2',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: '混合回退' }, finish_reason: 'stop' }],
+        }),
+      )
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+
+    const res = await request(app).post('/v1/responses').send({ model: 'gpt-4', input: '你好' })
+    expect(res.status).toBe(200)
+    const body = res.body as { object: string; model: string; output: Array<{ content: Array<{ text: string }> }> }
+    // 转换产物：chat 响应 → responses 对象（model 为下游别名）
+    expect(body.object).toBe('response')
+    expect(body.model).toBe('gpt-4')
+    expect(body.output[0].content[0].text).toBe('混合回退')
+    expect(attempts.map((a) => a.upstreamId)).toEqual(['u1', 'u2'])
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: false, status: 500 })
+    expect(attempts[1]).toMatchObject({ upstreamId: 'u2', ok: true, status: 200 })
+  })
+
+  it('混合候选反向：候选1 转换失败（500）→ 候选2 原生透传成功（下游拿到原样产物）', async () => {
+    setResponsesConfig({ u1: 'convert', u2: 'native' })
+    const url1 = await startMock(async (req, res) => {
+      // /v1/responses 分流保留：convert 模式不探测不透传，转换路径只打 /chat/completions
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
+      res.statusCode = 500
+      res.end('boom')
+    })
+    const upstreamJson = { id: 'resp_3', object: 'response', status: 'completed', model: 'gpt-4-u2', output: [] }
+    const url2 = await startMock(async (req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify(upstreamJson))
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+
+    const res = await request(app).post('/v1/responses').send({ model: 'gpt-4', input: '你好' })
+    expect(res.status).toBe(200)
+    // 原样透传产物：model 为候选上游侧模型名（决策 8）
+    expect(res.body).toEqual(upstreamJson)
+    expect((res.body as { model: string }).model).toBe('gpt-4-u2')
+    expect(attempts.map((a) => a.upstreamId)).toEqual(['u1', 'u2'])
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: false, status: 500 })
+    expect(attempts[1]).toMatchObject({ upstreamId: 'u2', ok: true, status: 200 })
+  })
+
+  it('全部候选 404 耗尽 → 502 no_upstream', async () => {
+    setResponsesConfig({ u1: 'native', u2: 'native' })
+    const url1 = await startMock(async (req, res) => {
+      res.statusCode = 404
+      res.end('not found')
+    })
+    const url2 = await startMock(async (req, res) => {
+      res.statusCode = 404
+      res.end('not found')
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+
+    const res = await request(app).post('/v1/responses').send({ model: 'gpt-4', input: 'hi' })
+    expect(res.status).toBe(502)
+    expect(res.body as { error?: string }).toMatchObject({ error: 'no_upstream' })
+    expect(attempts.map((a) => a.upstreamId)).toEqual(['u1', 'u2'])
+    expect(attempts.map((a) => a.status)).toEqual([404, 404])
+    expect(attempts.every((a) => !a.ok)).toBe(true)
   })
 })

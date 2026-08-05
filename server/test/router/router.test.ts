@@ -13,9 +13,9 @@ import { Router } from '../../src/router/index.js'
 function buildConfig(): Config {
   return {
     upstreams: [
-      { id: 'openai-main', baseUrl: 'https://api.openai.com/v1', apiKey: 'sk-a', timeoutMs: 30000, disabled: false },
-      { id: 'openai-backup', baseUrl: 'https://api.backup.com/v1', apiKey: 'sk-b', timeoutMs: 30000, disabled: false },
-      { id: 'openai-paused', baseUrl: 'https://api.paused.com/v1', apiKey: 'sk-c', timeoutMs: 30000, disabled: true },
+      { id: 'openai-main', baseUrl: 'https://api.openai.com/v1', apiKey: 'sk-a', timeoutMs: 30000, disabled: false, responsesApi: 'convert' },
+      { id: 'openai-backup', baseUrl: 'https://api.backup.com/v1', apiKey: 'sk-b', timeoutMs: 30000, disabled: false, responsesApi: 'convert' },
+      { id: 'openai-paused', baseUrl: 'https://api.paused.com/v1', apiKey: 'sk-c', timeoutMs: 30000, disabled: true, responsesApi: 'convert' },
     ],
     downstreamModels: {
       'gpt-4': [
@@ -63,8 +63,8 @@ describe('Router.resolve', () => {
     const warnSpy = vi.spyOn(getLogger(), 'warn').mockImplementation(() => true)
     const config: Config = {
       upstreams: [
-        { id: 'a', baseUrl: 'https://a.example', apiKey: 'k', timeoutMs: 30000, disabled: true },
-        { id: 'b', baseUrl: 'https://b.example', apiKey: 'k', timeoutMs: 30000, disabled: true },
+        { id: 'a', baseUrl: 'https://a.example', apiKey: 'k', timeoutMs: 30000, disabled: true, responsesApi: 'convert' },
+        { id: 'b', baseUrl: 'https://b.example', apiKey: 'k', timeoutMs: 30000, disabled: true, responsesApi: 'convert' },
       ],
       downstreamModels: {
         'm': [

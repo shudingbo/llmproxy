@@ -5,13 +5,32 @@ import axios from 'axios'
 import type { AxiosRequestConfig, AxiosResponse } from 'axios'
 import type { Upstream } from '../config/schema.js'
 
-// OpenAI 兼容的聊天补全请求体（宽松结构，其余字段原样透传，由上游决定是否忽略）
-export interface UpstreamChatRequest {
+// Responses 原生支持探测的独立超时：默认上游超时（30s）对探测过长，单独收紧到 5s
+const PROBE_TIMEOUT_MS = 5000
+
+// 上游请求体最小公共形状（chat / responses 共用）：model + stream 为核心，其余字段原样透传
+export interface UpstreamStreamRequest {
   model: string
-  messages: Array<{ role: string; content: string; name?: string }>
   stream?: boolean
   stream_options?: { include_usage: boolean }
   [key: string]: unknown
+}
+
+// OpenAI 兼容的聊天补全请求体（宽松结构，其余字段原样透传，由上游决定是否忽略）
+export interface UpstreamChatRequest extends UpstreamStreamRequest {
+  messages: Array<{ role: string; content: string; name?: string }>
+}
+
+// OpenAI Responses 请求体（宽松结构；用 input 而非 messages，其余字段原样透传）
+export interface UpstreamResponsesRequest extends UpstreamStreamRequest {
+  input?: string | Array<unknown>
+}
+
+// 流式探测关注的最小事件形状（其余字段原样忽略）
+interface ResponsesProbeEvent {
+  type?: string
+  item_id?: string
+  item?: { id?: string; type?: string }
 }
 
 // OpenAI 兼容的聊天补全响应体（宽松结构，调用方按需取字段）
@@ -73,7 +92,7 @@ export class OpenAIUpstreamClient {
     method: 'GET' | 'POST',
     path: string,
     body?: unknown,
-    options: { signal?: AbortSignal; stream?: boolean } = {},
+    options: { signal?: AbortSignal; stream?: boolean; timeout?: number } = {},
   ): Promise<T> {
     const config: AxiosRequestConfig = {
       method,
@@ -83,7 +102,8 @@ export class OpenAIUpstreamClient {
         Authorization: `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',
       },
-      timeout: this.timeoutMs,
+      // 未显式传 timeout 时沿用默认值，probe 等场景可单独覆盖
+      timeout: options.timeout ?? this.timeoutMs,
       signal: options.signal,
     }
     if (body !== undefined) {
@@ -124,8 +144,42 @@ export class OpenAIUpstreamClient {
     req: UpstreamChatRequest,
     options: { signal?: AbortSignal; includeUsage?: boolean } = {},
   ): UpstreamStreamResult {
+    return this.streamRequest('/chat/completions', req, options)
+  }
+
+  /** 非流式 Responses 调用：req.stream 为 true 时直接报错（应改用 responsesCompletionStream） */
+  async responsesCompletion(
+    req: UpstreamResponsesRequest,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<unknown> {
+    if (req.stream === true) {
+      throw new Error('responsesCompletion 不接受流式请求，请改用 responsesCompletionStream')
+    }
+    // 拷贝请求体并强制关闭流式，确保走非流分支
+    const body = { ...req, stream: false }
+    return this.request<unknown>('POST', '/responses', body, { signal: options.signal })
+  }
+
+  /** 流式 Responses 调用：返回 SSE 响应流与 abort 函数（同步返回，请求在后台发起） */
+  responsesCompletionStream(
+    req: UpstreamResponsesRequest,
+    options: { signal?: AbortSignal; includeUsage?: boolean } = {},
+  ): UpstreamStreamResult {
+    return this.streamRequest('/responses', req, options)
+  }
+
+  /**
+   * 流式请求公共实现：chat / responses 共用。
+   * 返回 SSE 响应流与 abort 函数；连接阶段结果经 connectError promise 上报
+   * （axios 流式请求在后台发起，try/catch 抓不到连接失败）。
+   */
+  private streamRequest(
+    path: string,
+    req: UpstreamStreamRequest,
+    options: { signal?: AbortSignal; includeUsage?: boolean } = {},
+  ): UpstreamStreamResult {
     // 拷贝请求体并强制开启流式
-    const body: UpstreamChatRequest = { ...req, stream: true }
+    const body: UpstreamStreamRequest = { ...req, stream: true }
     // 仅当请求本身是流式且调用方要求统计用量时注入 stream_options
     // （上游会在流末尾补发 usage 块，供 T15 的读取器消费）
     if (req.stream === true && options.includeUsage === true) {
@@ -179,7 +233,7 @@ export class OpenAIUpstreamClient {
     controller.signal.addEventListener('abort', teardown, { once: true })
 
     // 后台发起请求，响应流就绪后桥接数据
-    this.request<Readable>('POST', '/chat/completions', body, {
+    this.request<Readable>('POST', path, body, {
       signal: controller.signal,
       stream: true,
     })
@@ -232,6 +286,192 @@ export class OpenAIUpstreamClient {
         teardown()
       },
       connectError: connectErrorPromise,
+    }
+  }
+
+  /**
+   * 探测上游是否原生支持 Responses API（POST /responses）。
+   * 返回 boolean 表示确定性结论；网络错误 / 超时 / 5xx / 429 等探测异常则抛错，
+   * 探测异常向上抛，由调用方按失败处理。
+   * @param strict 严格语义（缺省 false 保持 /test 端点的「端点存在」旧语义）：
+   *   strict=true 时 400 / 422 视为不支持（返回 false），供管理端检测第一步使用——
+   *   非流式请求只要不是 2xx + object:response 即判定失败，避免 400 但流式完整的
+   *   不对称场景误判 native。
+   */
+  async probeResponsesSupport(model?: string, strict = false): Promise<boolean> {
+    const body = {
+      model: model ?? 'gpt-4o-mini',
+      input: 'ping',
+      max_output_tokens: 1,
+      stream: false,
+    }
+    try {
+      // 2xx：端点存在，仅当响应体 object === 'response' 才算原生支持（形状不符 → false）
+      const data = await this.request<{ object?: string }>('POST', '/responses', body, {
+        timeout: PROBE_TIMEOUT_MS,
+      })
+      return data?.object === 'response'
+    } catch (err) {
+      // axios 非 2xx 抛 AxiosError（含 err.response?.status）；网络错误 / 超时没有 status
+      const status = axios.isAxiosError(err) ? err.response?.status : undefined
+      if (status !== undefined) {
+        // 严格语义：任何非 2xx（含 400 / 422 / 404 / 405 / 401 / 403）都视为不支持
+        if (strict) {
+          return false
+        }
+        // 400 / 422 → 端点存在，仅参数或模型不被接受（确定性 true，/test 端点语义）
+        if (status === 400 || status === 422) {
+          return true
+        }
+        // 404 / 405 → 端点不存在；401 / 403 → 鉴权配置错误（确定性 false）
+        if (status === 404 || status === 405 || status === 401 || status === 403) {
+          return false
+        }
+      }
+      // 网络错误 / 超时 / 5xx / 429 / 其余非 2xx → 探测异常，向上抛，由调用方按失败处理
+      throw err
+    }
+  }
+
+  /**
+   * 探测上游流式 Responses 事件完整性（管理端「检测 responsesApi」第二步）。
+   * 流式消费整个 SSE 流，验证：
+   *  - 收到 response.completed（type=response.completed）
+   *  - 出现过 message 输出事件（output_item.added 且 item.type === 'message'、
+   *    content_part.added、output_text.delta / output_text.done 任一）——探测请求
+   *    加大输出预算后仍只有 reasoning 的上游（推理模型）判不支持（convert）
+   *  - 每个 message item 的 output_item.added + content_part.added 事件先于其
+   *    output_text.delta / output_text.done 出现（顺序完整）
+   * 全部满足 → true；任何异常（网络 / 超时 / 5xx / 流解析失败 / 缺少 completed /
+   * 无 message 事件 / 事件顺序违规）→ 返回 false（不抛错，管理端检测用：失败即按
+   * convert 处理）。
+   */
+  async probeResponsesStream(model?: string): Promise<boolean> {
+    const body = {
+      model: model ?? 'gpt-4o-mini',
+      input: 'ping',
+      // 128 而非 1：给 message 输出留出 token 预算——推理模型首个 token 总在思考，
+      // 预算过小则永远等不到 message 事件，导致流式验证形同虚设
+      max_output_tokens: 128,
+      stream: true,
+    }
+    let stream: Readable
+    try {
+      // timeout 只覆盖连接阶段（响应头未及时返回即中止）；流已建立后由 watchdog 兜底
+      stream = await this.request<Readable>('POST', '/responses', body, {
+        timeout: PROBE_TIMEOUT_MS,
+        stream: true,
+      })
+    } catch {
+      // 网络错误 / 超时 / 5xx / 非 2xx → 探测失败
+      return false
+    }
+
+    // 独立 5s 兜底：上游迟迟不结束流时强制拆线，避免探测挂死
+    const watchdog = setTimeout(() => stream.destroy(), PROBE_TIMEOUT_MS)
+    watchdog.unref()
+    try {
+      return await this.consumeResponsesProbe(stream)
+    } finally {
+      clearTimeout(watchdog)
+    }
+  }
+
+  /** 消费探测响应流：解析 SSE data: 行并返回事件完整性判定 */
+  private async consumeResponsesProbe(stream: Readable): Promise<boolean> {
+    // message item 状态：output_item.added 与 content_part.added 是否已出现
+    const itemState = new Map<string, { added: boolean; partAdded: boolean }>()
+    // 跨行共享状态：流中是否出现过 message 输出事件（仅 reasoning 的推理模型为 false）
+    const state = { sawMessage: false }
+    // 跨 chunk 累积未换行的字节，保证单条 SSE 行跨多个 chunk 也能完整解析
+    let buffer = ''
+    let completed = false
+    let violated = false
+    try {
+      for await (const chunk of stream) {
+        buffer += chunk.toString()
+        // 按 \n 切出完整行处理；残留的行留在 buffer 等待下一个 chunk
+        let nl = buffer.indexOf('\n')
+        while (nl >= 0) {
+          const line = buffer.slice(0, nl)
+          buffer = buffer.slice(nl + 1)
+          const verdict = this.consumeResponsesProbeLine(line, itemState, state)
+          if (verdict === 'completed') {
+            completed = true
+          } else if (verdict === 'violated') {
+            violated = true
+          }
+          nl = buffer.indexOf('\n')
+        }
+      }
+    } catch {
+      // 流中途出错（连接被拆 / 传输中断）→ 探测失败
+      return false
+    }
+    // 需同时满足：收到 response.completed、无事件顺序违规、出现过 message 输出事件
+    return completed && !violated && state.sawMessage
+  }
+
+  /** 解析一条 SSE data: 行：更新 item 状态或返回判定（completed / violated / null） */
+  private consumeResponsesProbeLine(
+    line: string,
+    itemState: Map<string, { added: boolean; partAdded: boolean }>,
+    state: { sawMessage: boolean },
+  ): 'completed' | 'violated' | null {
+    // 只处理 data: 行，其余（event: / 空行 / 注释）一律忽略
+    if (!line.startsWith('data: ')) {
+      return null
+    }
+    const payload = line.slice('data: '.length).trim()
+    // 流结束标记 / 空负载不参与判定
+    if (payload === '' || payload === '[DONE]') {
+      return null
+    }
+    let evt: ResponsesProbeEvent
+    try {
+      evt = JSON.parse(payload) as ResponsesProbeEvent
+    } catch {
+      // 非 JSON 的 data 行 → 流解析失败
+      return 'violated'
+    }
+    switch (evt.type) {
+      case 'response.completed':
+        return 'completed'
+      case 'response.output_item.added': {
+        // 只跟踪 message item；reasoning / function_call 不产生 output_text，不影响判定
+        const itemId = evt.item?.id
+        if (evt.item?.type === 'message' && itemId !== undefined) {
+          state.sawMessage = true
+          const itemStateEntry = itemState.get(itemId) ?? { added: false, partAdded: false }
+          itemStateEntry.added = true
+          itemState.set(itemId, itemStateEntry)
+        }
+        return null
+      }
+      case 'response.content_part.added': {
+        // content_part 只属于 message 输出（reasoning 走 reasoning_text.delta 等独立事件）
+        const itemId = evt.item_id
+        if (itemId !== undefined) {
+          state.sawMessage = true
+          const itemStateEntry = itemState.get(itemId) ?? { added: false, partAdded: false }
+          itemStateEntry.partAdded = true
+          itemState.set(itemId, itemStateEntry)
+        }
+        return null
+      }
+      case 'response.output_text.delta':
+      case 'response.output_text.done': {
+        // delta / done 本身即 message 输出事件；但必须晚于该 item 的 output_item.added
+        // + content_part.added，否则为事件顺序违规（llama.cpp 偶发漏发 output_item.added 即此场景）
+        state.sawMessage = true
+        const itemStateEntry = evt.item_id !== undefined ? itemState.get(evt.item_id) : undefined
+        if (itemStateEntry === undefined || !itemStateEntry.added || !itemStateEntry.partAdded) {
+          return 'violated'
+        }
+        return null
+      }
+      default:
+        return null
     }
   }
 }

@@ -58,6 +58,8 @@ export function createApp(deps: AppDeps): Express {
 
   // 上游客户端映射：配置变更时重建，保证新增/删除上游无需重启
   const clients = new Map<string, OpenAIUpstreamClient>()
+  // 按上游 ID 取客户端：请求处理器共用
+  const getUpstreamClient = (id: string): OpenAIUpstreamClient | undefined => clients.get(id)
   const rebuildClients = (): void => {
     clients.clear()
     for (const upstream of store.get().upstreams) {
@@ -121,7 +123,6 @@ export function createApp(deps: AppDeps): Express {
   // 兼容注入的路由器实例：openai.ts / ollama.ts 内部实际按 store.get() 逐请求重建，
   // 此实例仅用于满足 deps 形状，不会产生过期引用
   const router = new Router(store.get())
-  const getUpstreamClient = (id: string): OpenAIUpstreamClient | undefined => clients.get(id)
 
   const app = express()
   // 请求体解析：先于路由，10mb 上限（大体积多模态请求）

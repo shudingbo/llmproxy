@@ -151,6 +151,7 @@ Schema reference — see `server/src/config/schema.ts` for the authoritative Zod
 | `upstreams[].apiKey` | string | plaintext key (stored 0600 in the config file) |
 | `upstreams[].timeoutMs` | number | request timeout in ms, default `30000` |
 | `upstreams[].disabled` | boolean | pause switch, default `false` |
+| `upstreams[].responsesApi` | `'native' \| 'convert'` | Responses API handling: `'native'` passes `/v1/responses` through unchanged; `'convert'` (default) converts to `/v1/chat/completions` before reaching the upstream. `'auto'` was removed — old configs writing `auto` fail to load (zod rejects) and must be changed manually. The admin UI's detect button auto-picks the value when adding an upstream (two-step check: non-streaming + streaming event completeness) |
 | `downstreamModels` | record | alias → ordered candidate list (min 1 each) |
 | `downstreamModels[alias][].upstreamId` | string | must match an `upstreams[].id` |
 | `downstreamModels[alias][].model` | string | model name used on the upstream side |
@@ -167,7 +168,7 @@ Example:
 {
   // 上游：OpenAI 兼容服务
   "upstreams": [
-    { "id": "openai", "baseUrl": "https://api.openai.com/v1", "apiKey": "sk-...", "timeoutMs": 30000 },
+    { "id": "openai", "baseUrl": "https://api.openai.com/v1", "apiKey": "sk-...", "timeoutMs": 30000, "responsesApi": "convert" /* native=原生透传 /v1/responses；convert=转换（缺省）；auto 已移除 */ },
     { "id": "ollama-local", "baseUrl": "http://127.0.0.1:11434/v1", "apiKey": "dummy" },
     { "id": "llama-cpp", "baseUrl": "http://127.0.0.1:8080/v1", "apiKey": "dummy" }
   ],
@@ -395,7 +396,8 @@ curl -N http://127.0.0.1:3000/api/chat \
 | POST | `/admin/api/upstreams` | 新增上游（重复 ID 返回 400 `duplicate_id`） |
 | PUT | `/admin/api/upstreams/:id` | 部分更新上游（ID 以路径为准；apiKey 留空保持原值） |
 | DELETE | `/admin/api/upstreams/:id` | 删除上游（级联清理候选；最后一个上游拒绝删除） |
-| POST | `/admin/api/upstreams/:id/test` | 连通性测试（可用 body 覆盖 baseUrl / apiKey） |
+| POST | `/admin/api/upstreams/:id/test` | 连通性测试（可用 body 覆盖 baseUrl / apiKey；响应含 `supportsResponses`: true=原生支持 / false=明确不支持 / null=探测异常或上游不可达） |
+| POST | `/admin/api/upstreams/:id/detect-responses` | Responses API 能力检测（两步）：① 非流式 `POST /v1/responses` 返回 200 且 `object: "response"`；② 流式同请求并消费 SSE 验证事件完整（`response.completed` 收到 + message item 的 `output_item.added` / `content_part.added` 前置）。两步都过 → 判定 `native`；任一失败 → 判定 `convert`（管理端「检测」按钮调用，结果自动填入 Responses API 下拉） |
 | POST | `/admin/api/candidates/probe-context` | 探测候选 `(upstreamId, model)` 的最大上下文（body 必传 `upstreamId` + `model`；`baseUrl` / `apiKey` 缺省取配置上游，非空字符串覆盖；成功 `{ ok: true, max_context_length }`，探测不到 `{ ok: false, error: 'context_not_found' }`，缺参 400 `invalid_request` + `field`） |
 | GET | `/admin/api/downstream-models` | 查看别名 → 候选映射 |
 | PUT | `/admin/api/downstream-models` | 全量替换映射（每个别名至少 1 个候选） |
@@ -445,14 +447,14 @@ All routes are served on the single port (default `3000`).
 | Endpoint | Supported | Notes |
 | --- | --- | --- |
 | `POST /v1/chat/completions` | ✅ | OpenAI-compatible chat; passthrough to upstream with alias routing; streaming SSE when `stream: true` |
-| `POST /v1/responses` | ✅ | OpenAI Responses API; converted to/from Chat Completions at the gateway boundary; non-streaming returns an `object: "response"` payload, `stream: true` returns a Responses SSE event stream |
+| `POST /v1/responses` | ✅ | OpenAI Responses API; **per-upstream by config** — `upstreams[].responsesApi: 'native'` passes the request / response / SSE events through unchanged (only `model` is rewritten to the upstream-side name); `'convert'` (default) converts to/from Chat Completions at the gateway boundary. The admin UI's detect button (`POST /admin/api/upstreams/:id/detect-responses`) picks the right value when adding an upstream. Non-streaming returns an `object: "response"` payload, `stream: true` returns a Responses SSE event stream |
 | `GET /v1/models` | ✅ | OpenAI-compatible model list (returns downstream model aliases) |
 | `POST /api/chat` | ✅ | Ollama-compatible chat; request/response converted to/from the OpenAI upstream format; NDJSON streaming |
 | `GET /api/tags` | ✅ | Ollama-compatible model list |
 | `GET /api/version` | ✅ | Ollama-compatible version probe (returns `0.5.12`) |
 | `GET /admin/api/health` | ✅ | health check |
 | `GET /admin/api/stats` | ✅ | per-alias attempt counters (60s snapshot) |
-| `GET /admin/api/upstreams` · `POST` · `PUT /:id` · `DELETE /:id` · `POST /:id/test` | ✅ | upstream CRUD + connectivity test |
+| `GET /admin/api/upstreams` · `POST` · `PUT /:id` · `DELETE /:id` · `POST /:id/test` · `POST /:id/detect-responses` | ✅ | upstream CRUD + connectivity test + Responses API capability detection |
 | `GET /admin/api/downstream-models` · `PUT` | ✅ | alias/candidate management |
 | `GET /admin/api/logs` | ✅ | log lines served from SQLite (type/level/time/keyword filters, offset/limit pagination, `hasMore`) |
 | `GET /admin/api/config` · `GET /admin/api/config/reload-error` | ✅ | config inspection + last reload error |
@@ -463,7 +465,7 @@ Limitations: tool calls are stripped from upstream responses on the Ollama path 
 
 ## Architecture
 
-The gateway is a single Node.js/Express process composed of three layers: a **gateway core** (config store + file watcher, model-alias router, round-robin load balancer, session-affinity routing with SQLite persistence, sequential failover, stats counter, log4js request logger dual-written to files and SQLite), **protocol adapters** (OpenAI-compatible and Ollama-compatible downstream routes plus OpenAI-compatible upstream clients, with dedicated converters for OpenAI ↔ Ollama request/response/stream shapes and Responses ↔ Chat Completions conversion at the gateway boundary), and an **admin UI** (Vue 3 + Element Plus SPA served from the same port, managing upstreams, aliases, sessions, logs and stats through `/admin/api`). Upstream clients and the router rebuild on config change so edits apply without restart; every request is routed through the ordered candidate list with automatic failover to the next healthy upstream.
+The gateway is a single Node.js/Express process composed of three layers: a **gateway core** (config store + file watcher, model-alias router, round-robin load balancer, session-affinity routing with SQLite persistence, sequential failover, stats counter, log4js request logger dual-written to files and SQLite), **protocol adapters** (OpenAI-compatible and Ollama-compatible downstream routes plus OpenAI-compatible upstream clients, with dedicated converters for OpenAI ↔ Ollama request/response/stream shapes and Responses ↔ Chat Completions conversion at the gateway boundary — the latter used in `'convert'` mode (default; `'native'` passes through unchanged)), and an **admin UI** (Vue 3 + Element Plus SPA served from the same port, managing upstreams, aliases, sessions, logs and stats through `/admin/api`). Upstream clients and the router rebuild on config change so edits apply without restart; every request is routed through the ordered candidate list with automatic failover to the next healthy upstream.
 
 ## Protocol Conversion
 

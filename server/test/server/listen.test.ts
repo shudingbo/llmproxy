@@ -5,7 +5,7 @@ import { DEFAULT_HOST, DEFAULT_PORT, resolveListen } from '../../src/server/list
 
 const baseConfig: Config = {
   upstreams: [
-    { id: 'a', baseUrl: 'https://x.example', apiKey: 'k', timeoutMs: 5000, disabled: false },
+    { id: 'a', baseUrl: 'https://x.example', apiKey: 'k', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
   ],
   downstreamModels: { m1: [{ upstreamId: 'a', model: 'm1' }] },
 }

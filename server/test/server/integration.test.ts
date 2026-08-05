@@ -132,8 +132,8 @@ async function createMockUpstream(behavior: MockBehavior): Promise<MockUpstream>
 function buildTwoUpstreamConfig(ok: MockUpstream, bad: MockUpstream): Config {
   return {
     upstreams: [
-      { id: 'u1', baseUrl: ok.baseUrl, apiKey: 'sk-upstream-u1', timeoutMs: 5000, disabled: false },
-      { id: 'u2', baseUrl: bad.baseUrl, apiKey: 'sk-upstream-u2', timeoutMs: 5000, disabled: false },
+      { id: 'u1', baseUrl: ok.baseUrl, apiKey: 'sk-upstream-u1', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
+      { id: 'u2', baseUrl: bad.baseUrl, apiKey: 'sk-upstream-u2', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
     ],
     downstreamModels: {
       'gpt-4': [
@@ -269,8 +269,8 @@ describe('网关集成测试（真实 mock 上游）', () => {
     mocks.push(bad1, bad2)
     startGateway({
       upstreams: [
-        { id: 'u1', baseUrl: bad1.baseUrl, apiKey: 'k1', timeoutMs: 5000, disabled: false },
-        { id: 'u2', baseUrl: bad2.baseUrl, apiKey: 'k2', timeoutMs: 5000, disabled: false },
+        { id: 'u1', baseUrl: bad1.baseUrl, apiKey: 'k1', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
+        { id: 'u2', baseUrl: bad2.baseUrl, apiKey: 'k2', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
       ],
       downstreamModels: {
         'gpt-4': [
@@ -409,8 +409,8 @@ describe('网关集成测试（真实 mock 上游）', () => {
     // 改写配置文件：别名只指向 B（err500），A 标记为禁用
     const updated: Config = {
       upstreams: [
-        { id: 'u1', baseUrl: ok.baseUrl, apiKey: 'sk-upstream-u1', timeoutMs: 5000, disabled: true },
-        { id: 'u2', baseUrl: bad.baseUrl, apiKey: 'sk-upstream-u2', timeoutMs: 5000, disabled: false },
+        { id: 'u1', baseUrl: ok.baseUrl, apiKey: 'sk-upstream-u1', timeoutMs: 5000, disabled: true, responsesApi: 'convert' },
+        { id: 'u2', baseUrl: bad.baseUrl, apiKey: 'sk-upstream-u2', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
       ],
       downstreamModels: { 'gpt-4': [{ upstreamId: 'u2', model: 'model-b' }] },
     }
@@ -485,7 +485,7 @@ describe('网关集成测试（真实 mock 上游）', () => {
     const leaky = await createMockUpstream('leak500')
     mocks.push(leaky)
     startGateway({
-      upstreams: [{ id: 'u1', baseUrl: leaky.baseUrl, apiKey: 'sk-upstream-u1', timeoutMs: 5000, disabled: false }],
+      upstreams: [{ id: 'u1', baseUrl: leaky.baseUrl, apiKey: 'sk-upstream-u1', timeoutMs: 5000, disabled: false, responsesApi: 'convert' }],
       downstreamModels: { 'gpt-4': [{ upstreamId: 'u1', model: 'model-a' }] },
     })
 
@@ -507,8 +507,8 @@ describe('网关集成测试（真实 mock 上游）', () => {
     mocks.push(bad, ok)
     startGateway({
       upstreams: [
-        { id: 'u1', baseUrl: bad.baseUrl, apiKey: 'sk-upstream-u1', timeoutMs: 5000, disabled: false },
-        { id: 'u2', baseUrl: ok.baseUrl, apiKey: 'sk-upstream-u2', timeoutMs: 5000, disabled: false },
+        { id: 'u1', baseUrl: bad.baseUrl, apiKey: 'sk-upstream-u1', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
+        { id: 'u2', baseUrl: ok.baseUrl, apiKey: 'sk-upstream-u2', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
       ],
       downstreamModels: {
         'gpt-4': [
@@ -537,8 +537,8 @@ describe('网关集成测试（真实 mock 上游）', () => {
     mocks.push(bad1, bad2)
     startGateway({
       upstreams: [
-        { id: 'u1', baseUrl: bad1.baseUrl, apiKey: 'k1', timeoutMs: 5000, disabled: false },
-        { id: 'u2', baseUrl: bad2.baseUrl, apiKey: 'k2', timeoutMs: 5000, disabled: false },
+        { id: 'u1', baseUrl: bad1.baseUrl, apiKey: 'k1', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
+        { id: 'u2', baseUrl: bad2.baseUrl, apiKey: 'k2', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
       ],
       downstreamModels: {
         'gpt-4': [
@@ -567,8 +567,8 @@ describe('网关集成测试（真实 mock 上游）', () => {
     mocks.push(bad, ok)
     startGateway({
       upstreams: [
-        { id: 'u1', baseUrl: bad.baseUrl, apiKey: 'sk-upstream-u1', timeoutMs: 5000, disabled: false },
-        { id: 'u2', baseUrl: ok.baseUrl, apiKey: 'sk-upstream-u2', timeoutMs: 5000, disabled: false },
+        { id: 'u1', baseUrl: bad.baseUrl, apiKey: 'sk-upstream-u1', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
+        { id: 'u2', baseUrl: ok.baseUrl, apiKey: 'sk-upstream-u2', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
       ],
       downstreamModels: {
         'gpt-4': [

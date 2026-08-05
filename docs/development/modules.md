@@ -42,16 +42,16 @@ server/src/
 ├── upstream/                 # 上游客户端模块
 │   └── openai.ts             #   OpenAIUpstreamClient：模型列表 / 聊天 / SSE 流式
 │
-├── converters/               # 协议转换模块（OpenAI ↔ Ollama + Responses ↔ Chat）
+├── converters/               # 协议转换模块（OpenAI ↔ Ollama + Responses ↔ Chat（convert 模式））
 │   ├── types.ts              #   共享类型（Ollama 模型列表结构）
 │   ├── openai-to-ollama-models.ts    # 模型列表转换
 │   ├── openai-to-ollama-request.ts   # 聊天请求转换
 │   ├── openai-to-ollama-response.ts  # 非流式响应转换
 │   ├── openai-to-ollama-stream.ts    # SSE → NDJSON 流式转换
 │   ├── responses-types.ts    #   Responses 请求 / 响应 / usage 类型（边界子集）
-│   ├── responses-request.ts  #   Responses 请求 → Chat 请求
-│   ├── responses-response.ts #   Chat 非流式响应 → Responses 响应对象
-│   └── responses-stream.ts   #   Chat SSE 流 → Responses SSE 事件流
+│   ├── responses-request.ts  #   Responses 请求 → Chat 请求（convert 模式）
+│   ├── responses-response.ts #   Chat 非流式响应 → Responses 响应对象（convert 模式）
+│   └── responses-stream.ts   #   Chat SSE 流 → Responses SSE 事件流（convert 模式）
 │
 └── server/                   # 装配层与下游适配
     ├── index.ts              #   createApp 装配 + startServer 进程引导
@@ -72,7 +72,7 @@ server/src/
 - `logger/`：基于 log4js 的双类别日志（app 文本 / api JSON），负责输出、双写与文件清理。
 - `stats/`：进程内请求统计计数器。
 - `upstream/`：OpenAI 兼容上游的 HTTP 客户端。
-- `converters/`：OpenAI 与 Ollama 协议之间、Responses 与 Chat Completions 之间的纯数据转换（不发起网络请求）。
+- `converters/`：OpenAI 与 Ollama 协议之间、Responses 与 Chat Completions 之间的纯数据转换（不发起网络请求）。Responses ↔ Chat 转换在 **convert 模式下使用**：`responsesApi: 'convert'`（缺省）时 `/v1/responses` 请求经转换打给上游 `/v1/chat/completions`，响应 / 流式事件再转回 Responses 形状；`'native'` 时请求 / 响应 / 流式事件原样透传。
 - `server/`：Express 应用装配、三组下游路由的 HTTP 适配与进程引导。
 
 ### 1.2 web（前端，`web/src/`）
@@ -178,9 +178,9 @@ web 端职责一句话：纯管理界面，所有数据经 `/admin/api` 获取�
 | `openai-to-ollama-response.ts` | OpenAI 非流式响应 → Ollama 非流式响应：只取 choices[0]（调用方已拒绝 n>1）；`created` 秒 → ISO 时间戳；`finish_reason` 仅 'stop'/'length' 可映射；usage 映射为 `prompt_eval_count` / `eval_count`；choices 为空抛错 | `convertChatResponse`、`mapFinishReason`、`OllamaChatResponse` |
 | `openai-to-ollama-stream.ts` | SSE → NDJSON 流式转换：`Transform` 逐行解析 OpenAI SSE（`data: <json>` / `data: [DONE]`），输出 Ollama NDJSON（每行一个对象）；usage 实时捕获（最后一次生效）；内容块解析失败 warn + 跳过；上游传输错误输出一行 `{ error }` 后结束；`done: true` 保证只输出一次 | `createOpenAIToOllamaStream` |
 | `responses-types.ts` | OpenAI Responses API 类型定义（网关边界使用的子集）：请求 `ResponsesRequest` / 输入项 `ResponsesInputItem`、响应 `ResponsesResponse` / `ResponsesOutputMessage` / `ResponsesOutputTextPart`、`ResponsesUsage`；只声明本仓库转换器用到的字段，其余按宽松结构处理 | `ResponsesRequest`、`ResponsesResponse`、`ResponsesOutputMessage`、`ResponsesOutputTextPart`、`ResponsesUsage` |
-| `responses-request.ts` | Responses 请求体 → Chat 请求体：`instructions`（非空）前置 system 消息；`input` 为字符串 → user 消息、为数组逐项映射（仅带 role 的项，其余忽略）；`max_output_tokens` → `max_tokens`；采样参数白名单（temperature / top_p / stop / seed / presence_penalty / frequency_penalty / response_format）原样透传。绝不修改入参 | `responsesToChatMessages`、`responsesRequestToChat` |
-| `responses-response.ts` | 上游 chat 非流式响应 → Responses 响应对象：`object: 'response'` + `output` 消息数组（`output_text` 片段，annotations 固定空数组）；usage 字段改名（prompt_tokens → input_tokens / completion_tokens → output_tokens，缺省 0，上游无 usage 时整个字段省略）；`model` 用下游别名 | `chatResponseToResponses` |
-| `responses-stream.ts` | Chat SSE → Responses SSE 事件流：`Transform` 逐行解析上游 chat SSE；首个 delta 前输出 opening 序列（response.created → in_progress → output_item.added → content_part.added），delta 期间输出 output_text.delta，结束（[DONE] / EOF）输出收尾序列（output_text.done → content_part.done → output_item.done → response.completed，usage 注入 completed）；空输出也保持完整序列；上游传输错误输出 error 事件后结束，不做重试 | `createResponsesStream` |
+| `responses-request.ts` | Responses 请求体 → Chat 请求体：`instructions`（非空）前置 system 消息；`input` 为字符串 → user 消息、为数组逐项映射（仅带 role 的项，其余忽略）；`max_output_tokens` → `max_tokens`；采样参数白名单（temperature / top_p / stop / seed / presence_penalty / frequency_penalty / response_format）原样透传。绝不修改入参。**convert 模式下使用（responsesApi: 'convert'，缺省）** | `responsesToChatMessages`、`responsesRequestToChat` |
+| `responses-response.ts` | 上游 chat 非流式响应 → Responses 响应对象：`object: 'response'` + `output` 消息数组（`output_text` 片段，annotations 固定空数组）；usage 字段改名（prompt_tokens → input_tokens / completion_tokens → output_tokens，缺省 0，上游无 usage 时整个字段省略）；`model` 用下游别名。**convert 模式下使用（responsesApi: 'convert'，缺省）** | `chatResponseToResponses` |
+| `responses-stream.ts` | Chat SSE → Responses SSE 事件流：`Transform` 逐行解析上游 chat SSE；首个 delta 前输出 opening 序列（response.created → in_progress → output_item.added → content_part.added），delta 期间输出 output_text.delta，结束（[DONE] / EOF）输出收尾序列（output_text.done → content_part.done → output_item.done → response.completed，usage 注入 completed）；空输出也保持完整序列；上游传输错误输出 error 事件后结束，不做重试。**convert 模式下使用（responsesApi: 'convert'，缺省）** | `createResponsesStream` |
 
 依赖关系：`request` / `response` / `stream`（Ollama 方向）依赖 `logger`；`models` 依赖 `types`；`responses-request` 依赖 `responses-types` 与 `upstream/openai`（类型）；`responses-response` / `responses-stream` 依赖 `responses-types` 与 `nanoid`（`responses-stream` 另依赖 `logger`）。全部为纯数据转换，不发起网络请求。
 
@@ -189,7 +189,7 @@ web 端职责一句话：纯管理界面，所有数据经 `/admin/api` 获取�
 | 文件 | 职责 | 关键导出 |
 | --- | --- | --- |
 | `index.ts` | 装配层与进程引导：`createApp(deps)` 组合 Express 应用（见 §3 装配链路）；`startServer()` 进程入口（配置 log4js、定位 web/dist、装载 ConfigStore、组合应用、启动日志保留清理、`parseCliArgs` 解析命令行 `--host` / `--port` 后交 `resolveListen` 监听端口、打印下游端点清单） | `createApp`、`startServer`、`AppDeps` |
-| `openai.ts` | OpenAI 兼容下游：`GET /v1/models`（返回下游别名列表）、`POST /v1/chat/completions`（非流式/流式透传 + 顺序回退 + 尝试计数 + 会话改绑）、`POST /v1/responses`（Responses API：边界经 `converters/responses-*.ts` 与 Chat Completions 互转，非流式返回 `object=response` 对象 / `stream: true` 返回 Responses SSE 事件流，复用同一套回退 + 会话改绑逻辑）。chat 请求体原样透传不校验；用 `res 'close'` 自建 AbortSignal 中止上游；全部候选失败返回 502，未知模型 404 | `registerOpenAIRoutes`、`OpenAIDeps` |
+| `openai.ts` | OpenAI 兼容下游：`GET /v1/models`（返回下游别名列表）、`POST /v1/chat/completions`（非流式/流式透传 + 顺序回退 + 尝试计数 + 会话改绑）、`POST /v1/responses`（Responses API：**按上游配置分流**——`responsesApi: 'native'` 时请求体（除 model 改写为上游侧名、stream 按分支强制外）与响应 / 流式 SSE 事件原样透传，透传 404 视为可回退；`'convert'`（缺省）时经 `converters/responses-*.ts` 与 Chat Completions 互转，非流式返回 `object=response` 对象 / `stream: true` 返回 Responses SSE 事件流，复用同一套回退 + 会话改绑逻辑）。chat 请求体原样透传不校验；用 `res 'close'` 自建 AbortSignal 中止上游；全部候选失败返回 502，未知模型 404 | `registerOpenAIRoutes`、`OpenAIDeps` |
 | `ollama.ts` | Ollama 兼容下游：`GET /api/version`、`GET /api/tags`、`POST /api/chat`（Ollama 形状 → OpenAI 上游 → 转回 Ollama 形状，含 NDJSON 流式；`n > 1` 先于一切拒绝 400）。`/api/show`、`/api/generate` 等明确不实现 | `registerOllamaRoutes`、`OllamaDeps` |
 | `admin.ts` | 管理端 `/admin/api/*`：上游增删改查与连通性测试、下游模型映射整体替换、日志查询与手动清理、统计、会话粘附列表/删除/清空/清理、健康检查、配置查看与重载错误。apiKey 一律掩码，响应不落敏感信息 | `registerAdminRoutes`、`AdminDeps` |
 | `admin-helpers.ts` | 脱敏工具：`maskApiKey`（保留后 4 位）、`scrubSensitiveKeys`（递归清洗 authorization / api_key / x-api-key） | `maskApiKey`、`scrubSensitiveKeys` |

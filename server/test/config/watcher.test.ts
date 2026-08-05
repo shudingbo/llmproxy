@@ -20,6 +20,7 @@ const sampleConfig: Config = {
       apiKey: 'sk-test',
       timeoutMs: 60000,
       disabled: false,
+      responsesApi: 'convert',
     },
   ],
   downstreamModels: {

@@ -8,7 +8,7 @@ llmproxy 是一个**单端口 LLM 网关**：聚合多个 OpenAI 兼容上游（
 
 | 接口 | 前缀 | 说明 |
 | --- | --- | --- |
-| OpenAI 兼容 | `/v1` | `GET /v1/models`（聚合模型列表，60s 缓存）、`POST /v1/chat/completions`（非流式 + SSE 流式）、`POST /v1/responses`（Responses API，非流式 + SSE 流式） |
+| OpenAI 兼容 | `/v1` | `GET /v1/models`（聚合模型列表，60s 缓存）、`POST /v1/chat/completions`（非流式 + SSE 流式）、`POST /v1/responses`（Responses API：按上游原生支持能力分流——支持则原生透传、否则网关边界互转；非流式 + SSE 流式） |
 | Ollama 兼容 | `/api` | `GET /api/tags`、`POST /api/chat`（NDJSON 流 / JSON 非流）、`POST /api/version` |
 | 管理端 | `/admin/api` | 上游 CRUD / 连通性测试、下游模型映射、日志查询与清理、会话粘附管理、统计、健康检查 |
 | 静态 SPA | `/` 其余路径 | Vue 3 + Element Plus 前端产物（`web/dist`），非 API 前缀请求回退到 `index.html` |
@@ -42,7 +42,7 @@ flowchart TB
         OAI[openai.ts<br/>/v1/models /v1/chat/completions /v1/responses]
         OLL[ollama.ts<br/>/api/tags /api/chat]
         ADM[admin.ts<br/>/admin/api/*]
-        CV[converters/<br/>OpenAI ↔ Ollama + Responses ↔ Chat 转换]
+        CV[converters/<br/>OpenAI ↔ Ollama + Responses ↔ Chat 互转（条件性）]
     end
 
     subgraph gateway core[gateway core server/src]
@@ -87,9 +87,9 @@ flowchart TB
 
 ### 2.2 协议适配层（`server/src/server`）
 
-- `openai.ts`：OpenAI 兼容下游，`/v1/chat/completions` 请求体原样透传；`/v1/responses` 在网关边界做 Responses ↔ Chat 互转（`converters/responses-*.ts`）；非流式 / 流式（SSE）+ 顺序回退，每次尝试计数。
+- `openai.ts`：OpenAI 兼容下游，`/v1/chat/completions` 请求体原样透传；`/v1/responses` **按上游配置分流**——`responsesApi: 'native'` 时原生透传：请求体（除 `model` 改写为上游侧模型名、`stream` 按分支强制外）原样打给 `POST {baseUrl}/responses`，响应 JSON 与流式 SSE 事件原样回转（透传分支 404 视为可回退）；`responsesApi: 'convert'`（缺省）时在网关边界做 Responses ↔ Chat 互转（`converters/responses-*.ts`）。运行时探测已移除（responses-probe / registry 不再存在），改为管理端添加上游时用「检测」按钮确认该上游应配哪个值；非流式 / 流式（SSE）+ 顺序回退，每次尝试计数。
 - `ollama.ts`：Ollama 兼容下游，通过 `converters/openai-to-ollama-*.ts` 把 OpenAI 上游的请求 / 响应 / SSE 流转成 Ollama 形状（`/api/show`、`/api/generate` 等明确不实现）。
-- `converters/responses-*.ts`：Responses ↔ Chat Completions 边界转换（`responses-types` 类型、`responses-request` 请求、`responses-response` 非流式响应、`responses-stream` SSE 事件流），供 `openai.ts` 的 `/v1/responses` 使用。
+- `converters/responses-*.ts`：Responses ↔ Chat Completions 边界转换（`responses-types` 类型、`responses-request` 请求、`responses-response` 非流式响应、`responses-stream` SSE 事件流），**convert 模式下使用**——`responsesApi: 'convert'`（缺省）时供 `openai.ts` 的 `/v1/responses` 使用。
 - `admin.ts`：管理端全部端点（无鉴权，由部署层防护；无 CORS，开发期走 web/vite 代理）。
 - `downstreams.ts`：`DOWNSTREAM_ENDPOINTS` 单一真相源——启动日志与 `/admin/api/health` 共用，前端 Dashboard 自动跟随。
 - `index.ts`：装配层（见下）。
@@ -195,7 +195,7 @@ server/src/
 ├── logstore/         日志 SQLite 存储（logs 表：insert/query/cleanup/deleteBefore）
 ├── logger/           双类别 log4js · 双写 Proxy · 请求日志中间件 · 保留期清理（sweep）
 ├── upstream/         OpenAI 兼容上游客户端（axios，非流式 + SSE）
-├── converters/       OpenAI ↔ Ollama 转换 + Responses ↔ Chat 边界转换
+├── converters/       OpenAI ↔ Ollama 转换 + Responses ↔ Chat 边界转换（条件性，仅上游不支持原生 Responses 时）
 ├── stats/            纯内存统计计数器
 └── paths.ts          数据目录 / 日志路径定位
 

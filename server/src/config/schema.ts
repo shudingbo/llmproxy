@@ -9,6 +9,9 @@ import { z } from 'zod'
  * - apiKey：明文密钥（配置文件以 0600 权限落盘）
  * - timeoutMs：请求超时（毫秒），缺省 30000
  * - disabled：暂停开关，缺省 false
+ * - responsesApi：Responses API 处理方式，'native' 强制原生透传、
+ *   'convert' 转换为 chat 再请求上游，缺省 'convert'（未配置 = 转换路径）；
+ *   添加上游时可用管理端「检测」按钮自动判定该值
  *
  * 注意：max_context_length 是「模型 × 该上游实例」的属性，已移到 UpstreamCandidate；
  * 同一上游跑不同模型时，每个模型各自独立配置上下文大小。
@@ -19,6 +22,7 @@ export const UpstreamSchema = z.object({
   apiKey: z.string().min(1),
   timeoutMs: z.number().int().positive().default(30000),
   disabled: z.boolean().default(false),
+  responsesApi: z.enum(['native', 'convert']).default('convert'),
 })
 
 /**
@@ -88,7 +92,6 @@ export const ConfigSchema = z.object({
 
 // 导出的推断类型：全项目统一使用该类型表示一份配置
 export type Config = z.infer<typeof ConfigSchema>
-
 export type Upstream = z.infer<typeof UpstreamSchema>
 export type UpstreamCandidate = z.infer<typeof UpstreamCandidateSchema>
 export type ServerListen = z.infer<typeof ServerListenSchema>

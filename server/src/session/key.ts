@@ -67,7 +67,7 @@ export function extractSessionKey(
 ): SessionKeyResult | undefined {
   const openWebuiHeader = findHeaderValue(req, 'x-openwebui-chat-id')
   if (openWebuiHeader !== undefined ) {
-    let trimmed = openWebuiHeader.trim()
+    const trimmed = openWebuiHeader.trim()
     if( trimmed !== '' ) {
       return { raw: trimmed, client: 'open-webui' }
     }
@@ -77,7 +77,7 @@ export function extractSessionKey(
   // 以 'ywnrs' 开头的值归类为独立的 ywnrs 客户端，便于运维按客户端来源筛选
   const sessionIdHeader = findHeaderValue(req, 'x-session-id')
   if (sessionIdHeader !== undefined ) {
-    let trimmed = sessionIdHeader.trim()
+    const trimmed = sessionIdHeader.trim()
     if( trimmed !== '' ) {
       return { raw: trimmed, client: trimmed.startsWith('ywnrs') ? 'ywnrs' : 'x-session-id' }
     }

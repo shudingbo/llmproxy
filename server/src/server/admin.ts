@@ -208,6 +208,7 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
   })
 
   // 上游连通性测试：请求体可覆盖 baseUrl/apiKey（apiKey 允许为空串，Ollama 风格），否则用配置中的上游
+  // 附加 Responses API 原生支持探测：supportsResponses = true（原生支持）/ false（明确不支持）/ null（探测异常或上游不可达）
   app.post('/admin/api/upstreams/:id/test', async (req: Request, res: Response) => {
     const config = store.get()
     const configured = config.upstreams.find((u) => u.id === req.params.id)
@@ -231,11 +232,77 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     const startedAt = process.hrtime.bigint()
     try {
       const models = await client.listModels()
+      // Responses 原生支持探测：探测 model 取 listModels 首项 id（空数组不传 model，走 client 内部缺省）；
+      // 探测异常（网络 / 超时 / 5xx / 429）不使测试失败，统一置 null
+      let supportsResponses: boolean | null = null
+      try {
+        supportsResponses = await client.probeResponsesSupport(models[0]?.id)
+      } catch (err) {
+        getLogger().debug({ err }, 'Responses 支持探测异常，supportsResponses 置 null')
+      }
       const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6
-      res.json({ ok: true, status: 200, latencyMs, modelCount: models.length })
+      res.json({ ok: true, status: 200, latencyMs, modelCount: models.length, supportsResponses })
     } catch (err) {
       const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6
-      res.json({ ok: false, latencyMs, modelCount: 0, error: extractErrorCode(err) })
+      // 上游不可达（listModels 失败）：无法探测 Responses 支持，supportsResponses 恒为 null
+      res.json({ ok: false, latencyMs, modelCount: 0, error: extractErrorCode(err), supportsResponses: null })
+    }
+  })
+
+  // 上游 Responses API 能力检测：两步判定 responsesApi = 'native' | 'convert'（管理端「检测」按钮）
+  // ① 非流式 POST /v1/responses（probeResponsesSupport 严格模式）：2xx + object:response → 过；
+  //    400/422/404/405/401/403 及网络/超时/5xx/429 等 → fail（不再继续第二步）
+  // ② 流式 POST /v1/responses（probeResponsesStream）：消费 SSE 验证事件完整（completed + message 输出事件 + output_item.added 前置）→ 过
+  // 两步都过 → native；任一失败 → convert（第一步失败不再继续）；上游不可达（listModels 失败）→ { ok: false, error }
+  // 探测请求由 probe 方法直接发到上游，不经路由层，天然不计入 stats/attempt；两步内部各 5s 超时
+  app.post('/admin/api/upstreams/:id/detect-responses', async (req: Request, res: Response) => {
+    const config = store.get()
+    const configured = config.upstreams.find((u) => u.id === req.params.id)
+    const body = (req.body ?? {}) as Record<string, unknown>
+    let client: OpenAIUpstreamClient
+    if (typeof body.baseUrl === 'string') {
+      // 覆盖模式：超时沿用已配置上游的值（无配置时 30s），apiKey 缺省为空
+      client = new OpenAIUpstreamClient({
+        baseUrl: body.baseUrl,
+        apiKey: typeof body.apiKey === 'string' ? body.apiKey : '',
+        timeoutMs: configured?.timeoutMs ?? 30000,
+      })
+    } else {
+      if (!configured) {
+        res.status(404).json({ error: 'upstream_not_found', id: req.params.id })
+        return
+      }
+      // 优先注入的客户端工厂，缺省用配置直接构建（Express 5 的 params 可能是 string[]，收敛为 string）
+      client = getUpstreamClient(String(req.params.id)) ?? openaiClient(configured)
+    }
+    try {
+      // 探测 model 取 listModels 首项 id（空数组 → 不传 model，走 client 内部缺省 gpt-4o-mini）
+      const models = await client.listModels()
+      const model = models[0]?.id
+      // 第一步：非流式探测（严格模式：400/422 也判 fail；明确不支持或探测异常 → convert，跳过流式）
+      let nonStream: 'ok' | 'fail' = 'ok'
+      try {
+        if (!(await client.probeResponsesSupport(model, true))) {
+          nonStream = 'fail'
+        }
+      } catch {
+        // 网络错误 / 超时 / 5xx / 429 等探测异常同样按不支持处理
+        nonStream = 'fail'
+      }
+      if (nonStream === 'fail') {
+        res.json({ ok: true, responsesApi: 'convert', evidence: { nonStream: 'fail', stream: 'skipped' } })
+        return
+      }
+      // 第二步：流式事件完整性探测（probeResponsesStream 约定不抛错，失败即 false）
+      const streamOk = await client.probeResponsesStream(model)
+      res.json({
+        ok: true,
+        responsesApi: streamOk ? 'native' : 'convert',
+        evidence: { nonStream: 'ok', stream: streamOk ? 'ok' : 'fail' },
+      })
+    } catch (err) {
+      // 上游不可达（listModels 失败等）→ 检测失败，返回错误代号
+      res.json({ ok: false, error: extractErrorCode(err) })
     }
   })
 

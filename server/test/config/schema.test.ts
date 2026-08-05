@@ -94,6 +94,27 @@ describe('UpstreamSchema', () => {
     if (!result.success) return
     expect((result.data as Record<string, unknown>).max_context_length).toBeUndefined()
   })
+
+  it('responsesApi 缺省时为 convert', () => {
+    const result = UpstreamSchema.safeParse({ id: 'a', baseUrl: 'https://x.example', apiKey: 'k' })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.responsesApi).toBe('convert')
+  })
+
+  it('responsesApi 合法值 native / convert 均接受', () => {
+    const base = { id: 'a', baseUrl: 'https://x.example', apiKey: 'k' }
+    expect(UpstreamSchema.safeParse({ ...base, responsesApi: 'native' }).success).toBe(true)
+    expect(UpstreamSchema.safeParse({ ...base, responsesApi: 'convert' }).success).toBe(true)
+  })
+
+  it('responsesApi 非法值拒绝（auto / passthrough / 空串等，z.enum 白名单）', () => {
+    const base = { id: 'a', baseUrl: 'https://x.example', apiKey: 'k' }
+    expect(UpstreamSchema.safeParse({ ...base, responsesApi: 'auto' }).success).toBe(false)
+    expect(UpstreamSchema.safeParse({ ...base, responsesApi: 'passthrough' }).success).toBe(false)
+    expect(UpstreamSchema.safeParse({ ...base, responsesApi: '' }).success).toBe(false)
+    expect(UpstreamSchema.safeParse({ ...base, responsesApi: 1 }).success).toBe(false)
+  })
 })
 
 describe('UpstreamCandidateSchema.max_context_length', () => {

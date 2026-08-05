@@ -2,6 +2,19 @@
 
 本项目所有值得记录的变更都会汇总到本文件。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.5.0] / 2026-08-05
+
+### 变更
+
+- **`responsesApi` 取值改为 `'native' | 'convert'`（缺省 `'convert'`）**：`'native'` 原生透传——下游 `/v1/responses` 请求体（除 `model` 改写为上游侧模型名、`stream` 按分支强制外）原样打到 `POST {baseUrl}/responses`，非流式响应 JSON 与流式 SSE 事件原样回转，不再经 `converters/responses-*.ts` 与 Chat Completions 互转；`'convert'`（缺省）保持原有转换路径（行为与更改前一致）：网关边界把 `/v1/responses` 转为 `/v1/chat/completions` 请求上游
+- **管理端「检测」按钮**：新增 / 编辑上游弹窗的 Responses API 下拉旁可一键检测，自动判定该上游应选 `native` 还是 `convert`。两步检测：① 非流式 `POST {baseUrl}/responses`（`{model, input: 'ping', max_output_tokens: 1}`）返回 200 且 `object === 'response'`；② 流式同请求并消费 SSE 事件流验证事件完整（`response.completed` 收到，且 message item 有 `output_item.added`、`content_part.added` 前置）。两步都过 → `native`；任一失败 → `convert`
+- **404 防护**：原生透传分支中上游返回 404 视为「该上游实际不支持」→ 可回退（切下一候选），全部候选 404 耗尽返回 `502 {"error": "no_upstream"}`。语义变化：真实坏 model 的 404 从「立即 404」变为「回退 → 可能 502」
+- 响应 `model` 字段语义（已知取舍）：原生透传路径响应 `model` 为上游侧模型名（与 `/v1/chat/completions` 透传一致，不回写别名）；转换路径仍为下游别名。同一别名两条路径的响应 `model` 不一致属已知设计取舍
+
+### 移除
+
+- 运行时 Responses 支持探测（`responses-probe.ts` / `ResponsesSupportRegistry`）与 `responsesApi: 'auto'` 取值
+
 ## [0.4.1] / 2026-08-05
 
 - 会话亲和新增 `X-Session-Id` header 提取：部分客户端把会话 id 放在该通用 header；值以 `ywnrs` 开头时 Client 记为 `ywnrs`，否则记为 `x-session-id`。优先级在 `X-OpenWebUI-Chat-Id` 之后、内容前缀哈希之前；管理端 Sessions 页客户端筛选新增对应选项

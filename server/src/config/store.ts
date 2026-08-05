@@ -32,7 +32,10 @@ const BOOTSTRAP_JSONC = `{
       // 上游请求超时（毫秒），缺省 30000
       "timeoutMs": 60000,
       // 暂停开关：true 时该上游不参与路由
-      "disabled": false
+      "disabled": false,
+      // Responses API 处理方式：'native' 强制原生透传；'convert' 转换为 chat 再请求上游；缺省 'convert'
+      // 添加上游后可在管理端对上游点「检测」按钮，自动判定 native / convert 并填入
+      // 例如： "responsesApi": "native"
     }
   ],
 

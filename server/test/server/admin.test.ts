@@ -1,8 +1,8 @@
 // 管理端 REST 接口测试：supertest + 真实 ConfigStore（临时目录）+ 可注入假客户端
-// 覆盖：上游 CRUD 与密钥掩码、级联删除、最后一个上游保护、连通性测试（覆盖/配置两种模式、各类错误代号）、
+// 覆盖：上游 CRUD 与密钥掩码、级联删除、最后一个上游保护、连通性测试（覆盖/配置两种模式、各类错误代号、Responses 支持探测三态）、
 //       上下文探测（新增/编辑模式、缺参 400、探测不到、网络错误、防御分支错误代号）、
 //       下游模型映射整体替换、日志 SQLite 查询（倒序/级别/关键词过滤/offset 翻页/limit/hasMore/日期过滤）、统计汇总、健康检查、配置掩码与重载错误
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -30,8 +30,22 @@ vi.mock('../../src/upstream/context.js', async (importOriginal) => {
 // 基础配置模板：u1 健康 / u2 暂停；gpt-4 别名引用两者，only-u2 别名仅引用 u2（用于级联删除断言）
 const BASE_CONFIG = {
   upstreams: [
-    { id: 'u1', baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'sk-long-1234', timeoutMs: 5000, disabled: false },
-    { id: 'u2', baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'abcd', timeoutMs: 5000, disabled: true },
+    {
+      id: 'u1',
+      baseUrl: 'http://127.0.0.1:1/v1',
+      apiKey: 'sk-long-1234',
+      timeoutMs: 5000,
+      disabled: false,
+      responsesApi: 'convert',
+    },
+    {
+      id: 'u2',
+      baseUrl: 'http://127.0.0.1:1/v1',
+      apiKey: 'abcd',
+      timeoutMs: 5000,
+      disabled: true,
+      responsesApi: 'convert',
+    },
   ],
   downstreamModels: {
     'gpt-4': [
@@ -64,9 +78,12 @@ async function startMock(handler: MockHandler): Promise<string> {
   return `http://127.0.0.1:${port}/v1`
 }
 
-// 构造一个仅实现 listModels 的假客户端（其余方法不会被调用）
-function fakeClient(listModels: () => Promise<Array<{ id: string }>>): OpenAIUpstreamClient {
-  return { listModels } as unknown as OpenAIUpstreamClient
+// 构造一个仅实现 listModels 的假客户端（probeResponsesSupport 可注入，缺省不提供 → 处理器内部 catch 置 null）
+function fakeClient(
+  listModels: () => Promise<Array<{ id: string }>>,
+  probeResponsesSupport?: (model?: string) => Promise<boolean>,
+): OpenAIUpstreamClient {
+  return { listModels, probeResponsesSupport } as unknown as OpenAIUpstreamClient
 }
 
 // 带 code 属性的错误（模拟 ECONNREFUSED 等 Node 网络错误）
@@ -169,8 +186,22 @@ describe('上游管理 /admin/api/upstreams', () => {
     const res = await request(app).get('/admin/api/upstreams')
     expect(res.status).toBe(200)
     expect(res.body).toEqual([
-      { id: 'u1', baseUrl: 'http://127.0.0.1:1/v1', apiKey: '***1234', timeoutMs: 5000, disabled: false },
-      { id: 'u2', baseUrl: 'http://127.0.0.1:1/v1', apiKey: '****', timeoutMs: 5000, disabled: true },
+      {
+        id: 'u1',
+        baseUrl: 'http://127.0.0.1:1/v1',
+        apiKey: '***1234',
+        timeoutMs: 5000,
+        disabled: false,
+        responsesApi: 'convert',
+      },
+      {
+        id: 'u2',
+        baseUrl: 'http://127.0.0.1:1/v1',
+        apiKey: '****',
+        timeoutMs: 5000,
+        disabled: true,
+        responsesApi: 'convert',
+      },
     ])
   })
 
@@ -179,13 +210,14 @@ describe('上游管理 /admin/api/upstreams', () => {
       .post('/admin/api/upstreams')
       .send({ id: 'u3', baseUrl: 'https://example.com/v1', apiKey: 'key12345' })
     expect(res.status).toBe(201)
-    // timeoutMs / disabled 由 schema 默认补齐
+    // timeoutMs / disabled / responsesApi 由 schema 默认补齐
     expect(res.body).toEqual({
       id: 'u3',
       baseUrl: 'https://example.com/v1',
       apiKey: '***2345',
       timeoutMs: 30000,
       disabled: false,
+      responsesApi: 'convert',
     })
     const config = store.get()
     expect(config.upstreams).toHaveLength(3)
@@ -195,6 +227,7 @@ describe('上游管理 /admin/api/upstreams', () => {
       apiKey: 'key12345',
       timeoutMs: 30000,
       disabled: false,
+      responsesApi: 'convert',
     })
   })
 
@@ -324,6 +357,8 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
     expect(res.body.modelCount).toBe(0)
     expect(res.body.error).toBe('ECONNREFUSED')
     expect(typeof res.body.latencyMs).toBe('number')
+    // 上游不可达：Responses 支持探测恒为 null
+    expect(res.body.supportsResponses).toBe(null)
   })
 
   it('无 code 时回退到状态码字符串', async () => {
@@ -336,6 +371,289 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
     const res = await request(app).post('/admin/api/upstreams/u1/test')
     expect(res.body.ok).toBe(false)
     expect(res.body.error).toBe('503')
+  })
+
+  // 读取 mock 请求体（startMock 的 handler 只给 req/res，body 需自行拼流）
+  const readBody = (req: IncomingMessage): Promise<string> =>
+    new Promise((resolve, reject) => {
+      let raw = ''
+      req.on('data', (chunk: Buffer) => {
+        raw += chunk.toString()
+      })
+      req.on('end', () => resolve(raw))
+      req.on('error', reject)
+    })
+
+  // 三态 mock：/v1/models 正常返回，/v1/responses 按 status 与 body 决定探测结果
+  const responsesMock =
+    (opts: { status?: number; body?: unknown }): MockHandler =>
+    (req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      if (req.url === '/v1/models') {
+        res.end(JSON.stringify({ data: [{ id: 'm1' }, { id: 'm2' }] }))
+        return
+      }
+      if (req.url === '/v1/responses') {
+        if (opts.status !== undefined && opts.status !== 200) {
+          res.statusCode = opts.status
+        }
+        res.end(JSON.stringify(opts.body ?? { object: 'response' }))
+        return
+      }
+      res.end(JSON.stringify({ data: [] }))
+    }
+
+  it('探测原生支持：/responses 返回 200 + object: response → supportsResponses: true', async () => {
+    const url = await startMock(responsesMock({}))
+    const res = await request(app).post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
+    expect(res.status).toBe(200)
+    expect(res.body.ok).toBe(true)
+    expect(res.body.modelCount).toBe(2)
+    expect(res.body.supportsResponses).toBe(true)
+  })
+
+  it('探测明确不支持：/responses 返回 404 → supportsResponses: false（ok 仍为 true）', async () => {
+    const url = await startMock(responsesMock({ status: 404, body: { error: 'not found' } }))
+    const res = await request(app).post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
+    expect(res.status).toBe(200)
+    expect(res.body.ok).toBe(true)
+    expect(res.body.supportsResponses).toBe(false)
+  })
+
+  it('探测异常：/responses 返回 500 → supportsResponses: null（ok 仍为 true）', async () => {
+    const url = await startMock(responsesMock({ status: 500, body: { error: 'boom' } }))
+    const res = await request(app).post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
+    expect(res.status).toBe(200)
+    expect(res.body.ok).toBe(true)
+    expect(res.body.supportsResponses).toBe(null)
+  })
+
+  it('探测 model 取 listModels 首项 id（/responses 请求体 model = m1）', async () => {
+    let capturedBody = ''
+    const url = await startMock(async (req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      if (req.url === '/v1/models') {
+        res.end(JSON.stringify({ data: [{ id: 'm1' }] }))
+        return
+      }
+      if (req.url === '/v1/responses') {
+        capturedBody = await readBody(req)
+        res.end(JSON.stringify({ object: 'response' }))
+        return
+      }
+      res.end(JSON.stringify({ data: [] }))
+    })
+    const res = await request(app).post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
+    expect(res.status).toBe(200)
+    expect(res.body.supportsResponses).toBe(true)
+    expect((JSON.parse(capturedBody) as { model?: string }).model).toBe('m1')
+  })
+
+  it('listModels 返回空数组 → 探测不传 model，走 client 内部缺省 gpt-4o-mini', async () => {
+    let capturedBody = ''
+    const url = await startMock(async (req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      if (req.url === '/v1/models') {
+        res.end(JSON.stringify({ data: [] }))
+        return
+      }
+      if (req.url === '/v1/responses') {
+        capturedBody = await readBody(req)
+        res.end(JSON.stringify({ object: 'response' }))
+        return
+      }
+      res.end(JSON.stringify({ data: [] }))
+    })
+    const res = await request(app).post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
+    expect(res.status).toBe(200)
+    expect(res.body.ok).toBe(true)
+    expect(res.body.modelCount).toBe(0)
+    expect(res.body.supportsResponses).toBe(true)
+    expect((JSON.parse(capturedBody) as { model?: string }).model).toBe('gpt-4o-mini')
+  })
+
+  it('注入客户端模式：探测抛错 → supportsResponses: null 且 ok 仍为 true', async () => {
+    clients.set(
+      'u1',
+      fakeClient(
+        async () => [{ id: 'm1' }],
+        async () => {
+          throw errWithCode('ETIMEDOUT')
+        },
+      ),
+    )
+    const res = await request(app).post('/admin/api/upstreams/u1/test')
+    expect(res.status).toBe(200)
+    expect(res.body.ok).toBe(true)
+    expect(res.body.supportsResponses).toBe(null)
+  })
+})
+
+describe('Responses API 检测 /admin/api/upstreams/:id/detect-responses', () => {
+  // 流式标准事件序列：output_item.added → content_part.added → delta → completed → [DONE]
+  // 与 probeResponsesStream 的判定要求（completed + output_item.added/content_part.added 前置）一一对应
+  const standardStreamEvents = [
+    JSON.stringify({ type: 'response.created', response: { id: 'r1' } }),
+    JSON.stringify({ type: 'response.output_item.added', item: { id: 'msg_1', type: 'message' } }),
+    JSON.stringify({ type: 'response.content_part.added', item_id: 'msg_1' }),
+    JSON.stringify({ type: 'response.output_text.delta', item_id: 'msg_1', delta: 'p' }),
+    JSON.stringify({ type: 'response.completed', response: { id: 'r1' } }),
+    '[DONE]',
+  ]
+
+  // 读取 mock 请求体（拼流解析 JSON；startMock 的 handler 只给 req/res）
+  const readJsonBody = (req: IncomingMessage): Promise<Record<string, unknown>> =>
+    new Promise((resolve, reject) => {
+      let raw = ''
+      req.on('data', (chunk: Buffer) => {
+        raw += chunk.toString()
+      })
+      req.on('end', () => {
+        try {
+          resolve(raw === '' ? {} : (JSON.parse(raw) as Record<string, unknown>))
+        } catch (err) {
+          reject(err)
+        }
+      })
+      req.on('error', reject)
+    })
+
+  // 检测 mock：/v1/models 正常返回；/v1/responses 按 stream 字段分流
+  // 非流式 → JSON（默认 object: response，可覆盖 status/body）；流式 → SSE data 行序列（默认标准事件）
+  const detectMock = (opts: { nonStreamStatus?: number; nonStreamBody?: unknown; streamEvents?: string[] }): MockHandler =>
+    async (req, res) => {
+      if (req.url === '/v1/models') {
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify({ data: [{ id: 'm1' }] }))
+        return
+      }
+      if (req.url === '/v1/responses') {
+        const json = await readJsonBody(req)
+        if (json.stream === true) {
+          // 流式探测：SSE 事件序列（probeResponsesStream 只消费 data: 行）
+          res.setHeader('Content-Type', 'text/event-stream')
+          res.flushHeaders()
+          for (const payload of opts.streamEvents ?? standardStreamEvents) {
+            res.write(`data: ${payload}\n\n`)
+          }
+          res.end()
+          return
+        }
+        res.setHeader('Content-Type', 'application/json')
+        if (opts.nonStreamStatus !== undefined && opts.nonStreamStatus !== 200) {
+          res.statusCode = opts.nonStreamStatus
+        }
+        res.end(JSON.stringify(opts.nonStreamBody ?? { object: 'response' }))
+        return
+      }
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ data: [] }))
+    }
+
+  it('两步都过（非流式 200 + object:response，流式标准事件）→ responsesApi: native', async () => {
+    const url = await startMock(detectMock({}))
+    const res = await request(app).post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: true, responsesApi: 'native', evidence: { nonStream: 'ok', stream: 'ok' } })
+  })
+
+  it('非流式 404 → responsesApi: convert（evidence.nonStream: fail，stream: skipped）', async () => {
+    const url = await startMock(detectMock({ nonStreamStatus: 404, nonStreamBody: { error: 'not found' } }))
+    const res = await request(app).post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: true, responsesApi: 'convert', evidence: { nonStream: 'fail', stream: 'skipped' } })
+  })
+
+  it.each<[string, number]>([
+    ['400', 400],
+    ['422', 422],
+  ])('非流式 %s → responsesApi: convert（evidence.nonStream: fail，stream: skipped，流式未被探测）', async (desc: string, status: number) => {
+    // 严格语义：非流式 400/422 同样判 fail，且不再发流式请求（记录是否收到 stream: true）
+    let streamProbed = false
+    const url = await startMock(async (req, res) => {
+      if (req.url === '/v1/models') {
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify({ data: [{ id: 'm1' }] }))
+        return
+      }
+      if (req.url === '/v1/responses') {
+        const json = await readJsonBody(req)
+        if (json.stream === true) {
+          streamProbed = true
+          res.setHeader('Content-Type', 'text/event-stream')
+          res.end()
+          return
+        }
+        res.setHeader('Content-Type', 'application/json')
+        res.statusCode = status
+        res.end(JSON.stringify({ error: { message: desc } }))
+        return
+      }
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ data: [] }))
+    })
+    const res = await request(app).post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: true, responsesApi: 'convert', evidence: { nonStream: 'fail', stream: 'skipped' } })
+    expect(streamProbed).toBe(false)
+  })
+
+  it('非流式 OK + 流式缺 response.completed → convert（evidence.stream: fail）', async () => {
+    const url = await startMock(
+      detectMock({
+        streamEvents: [
+          JSON.stringify({ type: 'response.output_item.added', item: { id: 'msg_1', type: 'message' } }),
+          JSON.stringify({ type: 'response.content_part.added', item_id: 'msg_1' }),
+          JSON.stringify({ type: 'response.output_text.delta', item_id: 'msg_1', delta: 'p' }),
+          '[DONE]',
+        ],
+      }),
+    )
+    const res = await request(app).post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
+    expect(res.body).toEqual({ ok: true, responsesApi: 'convert', evidence: { nonStream: 'ok', stream: 'fail' } })
+  })
+
+  it('流式 message delta 先于 output_item.added → convert（事件顺序违规）', async () => {
+    const url = await startMock(
+      detectMock({
+        streamEvents: [
+          JSON.stringify({ type: 'response.output_text.delta', item_id: 'msg_1', delta: 'p' }),
+          JSON.stringify({ type: 'response.output_item.added', item: { id: 'msg_1', type: 'message' } }),
+          JSON.stringify({ type: 'response.content_part.added', item_id: 'msg_1' }),
+          JSON.stringify({ type: 'response.completed', response: { id: 'r1' } }),
+          '[DONE]',
+        ],
+      }),
+    )
+    const res = await request(app).post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
+    expect(res.body).toEqual({ ok: true, responsesApi: 'convert', evidence: { nonStream: 'ok', stream: 'fail' } })
+  })
+
+  it('覆盖 baseUrl 模式：body 传新 baseUrl → 检测走新 client；配置模式（不可达）→ ok: false', async () => {
+    // 覆盖模式：配置中 u1 指向 127.0.0.1:1（不可达），仅靠 body 覆盖 baseUrl 才能检测成功
+    const url = await startMock(detectMock({}))
+    const res = await request(app).post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: true, responsesApi: 'native', evidence: { nonStream: 'ok', stream: 'ok' } })
+
+    // 配置模式：u1 配置 baseUrl 不可达 → listModels 失败 → ok: false + 错误代号
+    const res2 = await request(app).post('/admin/api/upstreams/u1/detect-responses')
+    expect(res2.body.ok).toBe(false)
+    expect(res2.body.error).toBe('ECONNREFUSED')
+  })
+
+  it('listModels 失败（上游不可达）→ { ok: false, error: 错误代号 }', async () => {
+    const res = await request(app)
+      .post('/admin/api/upstreams/u1/detect-responses')
+      .send({ baseUrl: 'http://127.0.0.1:1/v1' })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: false, error: 'ECONNREFUSED' })
+  })
+
+  it('配置模式下上游不存在返回 404', async () => {
+    const res = await request(app).post('/admin/api/upstreams/nope/detect-responses')
+    expect(res.status).toBe(404)
+    expect(res.body.error).toBe('upstream_not_found')
   })
 })
 
@@ -757,7 +1075,9 @@ describe('健康检查与配置 /admin/api/health|config', () => {
     expect(res.status).toBe(200)
     expect(res.body.status).toBe('ok')
     expect(typeof res.body.uptime).toBe('number')
-    expect(res.body.version).toBe('0.3.0')
+    // 版本与 server/package.json 保持同步（动态读取，避免版本升级后断言过期）
+    const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf-8')) as { version?: string }
+    expect(res.body.version).toBe(pkg.version)
     expect(res.body.upstreams).toEqual({ u1: 'healthy', u2: 'paused' })
   })
 
@@ -826,6 +1146,7 @@ describe('健康检查与配置 /admin/api/health|config', () => {
       apiKey: '***1234',
       timeoutMs: 5000,
       disabled: false,
+      responsesApi: 'convert',
     })
     expect(res.body.downstreamModels).toEqual(BASE_CONFIG.downstreamModels)
   })

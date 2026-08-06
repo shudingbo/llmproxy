@@ -126,13 +126,13 @@ const detecting = ref(false) // Responses API 检测中（按钮 loading）
 const dialogVisible = ref(false) // 弹窗开关
 const editingId = ref<string | null>(null) // 当前编辑的上游 id，null 表示新增
 const formRef = ref<FormInstance>()
-
+const DEFAULT_TIMEOUT_MS = 300000
 // 表单数据：apiKey 编辑模式留空表示不修改；responsesApi 缺省 convert
 const form = reactive({
   id: '',
   baseUrl: '',
   apiKey: '',
-  timeoutMs: 30000,
+  timeoutMs: DEFAULT_TIMEOUT_MS,
   disabled: false,
   responsesApi: 'convert' as 'native' | 'convert',
 })
@@ -198,7 +198,7 @@ function resetForm() {
   form.id = ''
   form.baseUrl = ''
   form.apiKey = ''
-  form.timeoutMs = 30000
+  form.timeoutMs = DEFAULT_TIMEOUT_MS
   form.disabled = false
   form.responsesApi = 'convert'
   formRef.value?.clearValidate()

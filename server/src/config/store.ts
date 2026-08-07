@@ -17,7 +17,8 @@ const BOOTSTRAP_JSONC = `{
   // 环境变量 HOST / PORT 会覆盖此节；socket 在启动时绑定，需重启进程才能生效
   // "server": {
   //   "host": "127.0.0.1",
-  //   "port": 3000
+  //   "port": 3000,
+  //   "bodyLimit": "10mb"  // JSON body 上限（'10mb' 等字符串或数字字节数；全局生效，改后重启）
   // },
 
   // 上游提供商列表：所有 OpenAI 兼容服务（OpenAI 官方、各类网关/自建服务）

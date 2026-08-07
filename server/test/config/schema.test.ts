@@ -156,7 +156,7 @@ describe('UpstreamCandidateSchema.max_context_length', () => {
   })
 })
 
-describe('server 配置节（下行流监听）', () => {
+describe('server 配置节（进程级 server 配置：host / port / bodyLimit）', () => {
   it('未指定 server 时 ConfigSchema 仍接受（向上兼容现有配置）', () => {
     const result = ConfigSchema.safeParse(validConfig)
     expect(result.success).toBe(true)
@@ -164,14 +164,14 @@ describe('server 配置节（下行流监听）', () => {
     expect(result.data.server).toBeUndefined()
   })
 
-  it('指定 host/port 时按原样保留', () => {
+  it('指定 host/port 时按原样保留，bodyLimit 走缺省 10mb', () => {
     const result = ConfigSchema.safeParse({
       ...validConfig,
       server: { host: '0.0.0.0', port: 8080 },
     })
     expect(result.success).toBe(true)
     if (!result.success) return
-    expect(result.data.server).toEqual({ host: '0.0.0.0', port: 8080 })
+    expect(result.data.server).toEqual({ host: '0.0.0.0', port: 8080, bodyLimit: '10mb' })
   })
 
   it('只指定 host 时 port 走缺省 3000', () => {
@@ -219,6 +219,37 @@ describe('server 配置节（下行流监听）', () => {
       ConfigSchema.safeParse({ ...validConfig, server: { host: '127.0.0.1', port: 65535 } }).success,
     ).toBe(true)
   })
+
+  it('显式指定 server 空对象时 bodyLimit 走缺省 10mb', () => {
+    const result = ConfigSchema.safeParse({ ...validConfig, server: {} })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.server).toEqual({ host: '127.0.0.1', port: 3000, bodyLimit: '10mb' })
+  })
+
+  it('bodyLimit 接受字符串（如 "2mb"）', () => {
+    const result = ConfigSchema.safeParse({ ...validConfig, server: { bodyLimit: '2mb' } })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.server?.bodyLimit).toBe('2mb')
+  })
+
+  it('bodyLimit 接受正整数字节数（如 2048）', () => {
+    const result = ConfigSchema.safeParse({ ...validConfig, server: { bodyLimit: 2048 } })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.server?.bodyLimit).toBe(2048)
+  })
+
+  it('bodyLimit 拒绝空串 / 负数 / 0 / 小数 / 布尔值', () => {
+    const mk = (bodyLimit: unknown): boolean =>
+      ConfigSchema.safeParse({ ...validConfig, server: { bodyLimit } }).success
+    expect(mk('')).toBe(false)
+    expect(mk(-1)).toBe(false)
+    expect(mk(0)).toBe(false)
+    expect(mk(1.5)).toBe(false)
+    expect(mk(true)).toBe(false)
+  })
 })
 
 describe('routing 配置节（会话亲和）', () => {
@@ -238,7 +269,7 @@ describe('routing 配置节（会话亲和）', () => {
     expect(result.success).toBe(true)
     if (!result.success) return
     expect(result.data.routing).toBeUndefined()
-    expect(result.data.server).toEqual({ host: '0.0.0.0', port: 8080 })
+    expect(result.data.server).toEqual({ host: '0.0.0.0', port: 8080, bodyLimit: '10mb' })
   })
 
   it('routing.sessionAffinity 缺省时全部取默认值', () => {

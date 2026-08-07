@@ -45,15 +45,18 @@ export const UpstreamCandidateSchema = z.object({
 export const DownstreamModelSchema = z.array(UpstreamCandidateSchema).min(1)
 
 /**
- * 下行流监听配置（控制整个 server 进程对外暴露的 IP / 端口）：
+ * 进程级 server 配置（控制整个 server 进程的监听与请求体解析）：
  * - host：监听地址（IPv4 / IPv6 / Unix socket 名）；缺省 127.0.0.1
  * - port：TCP 端口（1-65535）；缺省 3000
- * 提示：socket 在进程启动时绑定，修改本节后必须重启进程才能生效；
- *       进程级配置变更不会通过文件监听即时应用，以避免出现端口漂移/重复绑定
+ * - bodyLimit：JSON 请求体上限（'10mb' 等字符串或数字字节数）；缺省 '10mb'
+ * 提示：socket 在进程启动时绑定、bodyLimit 在 createApp 装配时读取，
+ *       修改本节后必须重启进程才能生效；
+ *       进程级配置变更不会通过文件监听即时应用，以避免端口漂移/重复绑定
  */
-export const ServerListenSchema = z.object({
+export const ServerConfigSchema = z.object({
   host: z.string().min(1).default('127.0.0.1'),
   port: z.number().int().min(1).max(65535).default(3000),
+  bodyLimit: z.union([z.string().min(1), z.number().int().positive()]).default('10mb'),
 })
 
 /**
@@ -80,13 +83,13 @@ export const RoutingSchema = z.object({
  * 完整配置：
  * - upstreams：上游列表（至少 1 个）
  * - downstreamModels：别名 → 候选列表的映射
- * - server：可选的下行流监听配置（host / port）；未指定时按缺省值
+ * - server：可选的进程级 server 配置（host / port / bodyLimit）；未指定时按缺省值
  * - routing：可选的路由配置（会话亲和等）；未指定时按缺省值
  */
 export const ConfigSchema = z.object({
   upstreams: z.array(UpstreamSchema).min(1),
   downstreamModels: z.record(z.string(), DownstreamModelSchema),
-  server: ServerListenSchema.optional(),
+  server: ServerConfigSchema.optional(),
   routing: RoutingSchema.optional(),
 })
 
@@ -94,5 +97,5 @@ export const ConfigSchema = z.object({
 export type Config = z.infer<typeof ConfigSchema>
 export type Upstream = z.infer<typeof UpstreamSchema>
 export type UpstreamCandidate = z.infer<typeof UpstreamCandidateSchema>
-export type ServerListen = z.infer<typeof ServerListenSchema>
+export type ServerConfig = z.infer<typeof ServerConfigSchema>
 export type Routing = z.infer<typeof RoutingSchema>

@@ -86,3 +86,24 @@ describe('单端口装配 createApp', () => {
     expect(res.status).toBe(404)
   })
 })
+
+describe('server.bodyLimit 请求体上限', () => {
+  it('配置 bodyLimit: "1kb" 时，超限 JSON 请求返回 413 PayloadTooLarge', async () => {
+    // 重写配置加入 server.bodyLimit（进程级配置，createApp 装配时读取一次）
+    const cfgPath = join(tmpDir, 'config.jsonc')
+    writeFileSync(cfgPath, JSON.stringify({ ...BASE_CONFIG, server: { bodyLimit: '1kb' } }))
+    store = new ConfigStore(cfgPath)
+    const app = buildAppWithUi()
+    // 2KB 内容 > 1kb 上限，body-parser 在到达路由前即拒绝
+    const res = await request(app)
+      .post('/v1/chat/completions')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'x'.repeat(2048) }] })
+    expect(res.status).toBe(413)
+  })
+
+  it('未配置 server 节时走缺省 10mb：小体积 JSON 请求正常命中路由（200，不受 413 影响）', async () => {
+    const app = buildAppWithUi()
+    const res = await request(app).post('/admin/api/sessions/cleanup').send({ padding: 'small' })
+    expect(res.status).toBe(200)
+  })
+})

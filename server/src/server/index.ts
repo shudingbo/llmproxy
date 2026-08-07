@@ -125,8 +125,9 @@ export function createApp(deps: AppDeps): Express {
   const router = new Router(store.get())
 
   const app = express()
-  // 请求体解析：先于路由，10mb 上限（大体积多模态请求）
-  app.use(express.json({ limit: '10mb' }))
+  // 请求体解析：先于路由；上限取 server.bodyLimit（缺省 '10mb'，大体积多模态请求）。
+  // 与监听 host/port 同属进程级配置：createApp 装配时读取一次，热重载不重新应用，改后需重启
+  app.use(express.json({ limit: store.get().server?.bodyLimit ?? '10mb' }))
   // 请求日志中间件：每个请求生成 requestId 并记录方法/URL/状态码/耗时
   app.use(requestLogger)
   // 三组 API 路由：管理端 / OpenAI 兼容 / Ollama 兼容

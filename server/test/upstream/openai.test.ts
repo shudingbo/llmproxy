@@ -811,3 +811,70 @@ describe('OpenAIUpstreamClient createEmbedding', () => {
     })
   })
 })
+
+// ============================================================================
+// rerank-proxy Todo 1 追加：rerank 方法测试（POST /v1/rerank，请求体原样透传，
+// 不做任何强制改写）。行为对照 server/src/upstream/openai.ts 的 rerank 实现。
+// ============================================================================
+
+describe('OpenAIUpstreamClient rerank', () => {
+  it('POST /v1/rerank：请求体原样透传（含多模态 documents 形状），返回解析后的重排序结果', async () => {
+    let capturedUrl: string | undefined
+    let captured: unknown
+    await startMock(async (req, res) => {
+      capturedUrl = req.url
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ results: [{ index: 1, relevance_score: 0.9 }] }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    // documents 元素兼容纯文本字符串与多模态对象（content 数组）两种形状
+    const reqBody = {
+      model: 'reranker-vl',
+      query: '哪个图片里有猫',
+      documents: [
+        'Shanghai is the biggest city in China.',
+        {
+          content: [
+            { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,xxx' } },
+            { type: 'text', text: '一只橘猫' },
+          ],
+        },
+      ],
+      top_n: 1,
+    }
+    const res = await client.rerank(reqBody)
+    // 打 /rerank（baseUrl 带 /v1 后缀）
+    expect(capturedUrl).toBe('/v1/rerank')
+    // 捕获体与传入体逐字段相等：未被改写、无多余字段注入
+    expect(captured).toEqual(reqBody)
+    expect(res).toEqual({ results: [{ index: 1, relevance_score: 0.9 }] })
+  })
+
+  it('baseUrl 不带 /v1 后缀时打 /rerank（版本前缀完全来自 baseUrl）', async () => {
+    let capturedUrl: string | undefined
+    await startMock(async (req, res) => {
+      capturedUrl = req.url
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ results: [] }))
+    })
+    // 复用已启动 mock 的端口、剥掉 /v1 后缀：验证路径恒定 /rerank 的配置约定
+    const noV1BaseUrl = `http://127.0.0.1:${new URL(baseUrl).port}`
+    const client = new OpenAIUpstreamClient({ baseUrl: noV1BaseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await client.rerank({ model: 'reranker-vl', query: 'q', documents: ['d1', 'd2'] })
+    expect(capturedUrl).toBe('/rerank')
+  })
+
+  it('上游返回 500 时 reject，错误携带状态码', async () => {
+    await startMock(async (req, res) => {
+      res.statusCode = 500
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: 'mock boom' }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    // axios 非 2xx 抛 AxiosError，调用方据此识别可回退
+    await expect(client.rerank({ model: 'm', query: 'q', documents: ['d'] })).rejects.toMatchObject({
+      response: { status: 500 },
+    })
+  })
+})

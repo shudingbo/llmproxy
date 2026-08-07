@@ -69,6 +69,33 @@ export interface UpstreamEmbeddingsResponse {
   [key: string]: unknown
 }
 
+// 重排序请求体（宽松结构；rerank 协议无 stream 概念，query 为查询串、documents 为待排序
+// 文档列表——每项既可以是纯文本字符串，也可以是含 content（多模态内容数组）/ text 的对象
+// 形状，其余字段原样透传，由上游决定是否忽略）
+export interface UpstreamRerankRequest {
+  model: string
+  query?: string
+  documents?: Array<
+    | string
+    | { content?: Array<Record<string, unknown>>; text?: string; [k: string]: unknown }
+  >
+  top_n?: number
+  [key: string]: unknown
+}
+
+// 重排序响应体（宽松结构；results 元素携带 index / relevance_score（或 score）/
+// document 等字段，调用方按需取字段）
+export interface UpstreamRerankResponse {
+  results?: Array<{
+    index?: number
+    relevance_score?: number
+    score?: number
+    document?: unknown
+    [k: string]: unknown
+  }>
+  [key: string]: unknown
+}
+
 // 流式调用结果：stream 为上游 SSE 响应流，abort() 立即断开底层连接
 // connectError 用于判断连接阶段是否成功（HTTP 状态码 / 网络错误）。
 // 因为 axios 流式调用是后端 promise 排队发起的，try/catch 抓不到阶段错误，
@@ -165,6 +192,16 @@ export class OpenAIUpstreamClient {
     options: { signal?: AbortSignal } = {},
   ): Promise<UpstreamEmbeddingsResponse> {
     return this.request<UpstreamEmbeddingsResponse>('POST', '/embeddings', req, {
+      signal: options.signal,
+    })
+  }
+
+  /** 文本重排序：rerank 协议无 stream，请求体原样透传（模型名改写由路由层负责），不做任何强制改写 */
+  async rerank(
+    req: UpstreamRerankRequest,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<UpstreamRerankResponse> {
+    return this.request<UpstreamRerankResponse>('POST', '/rerank', req, {
       signal: options.signal,
     })
   }

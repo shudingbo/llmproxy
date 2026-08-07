@@ -1,5 +1,5 @@
-// OpenAI 兼容下游的 HTTP 服务模块：/v1/models 与 /v1/chat/completions
-// 职责：模型列表（返回下游别名）、非流式/流式透传、按候选顺序回退、每次尝试计数
+// OpenAI 兼容下游的 HTTP 服务模块：/v1/models、/v1/chat/completions 与 /v1/embeddings
+// 职责：模型列表（返回下游别名）、非流式/流式透传、文本嵌入透传、按候选顺序回退、每次尝试计数
 // 请求体解析（express.json 10mb）由装配层 T19 注入；请求体本身原样透传，不做校验
 import type { Express, Request, Response } from 'express'
 import type { Readable, Writable } from 'node:stream'
@@ -13,7 +13,12 @@ import { executeWithFallback, isFallbackableAxiosError } from '../router/fallbac
 import { Router } from '../router/index.js'
 import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
 import { extractSessionKey } from '../session/key.js'
-import type { OpenAIUpstreamClient, UpstreamChatRequest, UpstreamResponsesRequest } from '../upstream/openai.js'
+import type {
+  OpenAIUpstreamClient,
+  UpstreamChatRequest,
+  UpstreamEmbeddingsRequest,
+  UpstreamResponsesRequest,
+} from '../upstream/openai.js'
 import { buildAliasMetaMap } from './model-meta.js'
 
 // 依赖注入集合：由装配层（T19）构造后传入
@@ -46,6 +51,7 @@ interface StreamSuccess {
  * 注册 OpenAI 兼容下游路由（挂到传入的 Express 应用上）：
  * - GET /v1/models：返回下游别名列表（downstreamModels 的 key）
  * - POST /v1/chat/completions：非流式/流式透传 + 顺序回退
+ * - POST /v1/embeddings：文本嵌入非流式透传 + 顺序回退（上游 404 视为不支持，可回退）
  */
 export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
   const { store, getUpstreamClient, loadBalancer, onAttempt } = deps
@@ -431,6 +437,62 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     )
   }
 
+  // 文本嵌入透传（POST /v1/embeddings）：非流式透传，结构逐行对齐 handleNonStream
+  // 刻意不调用 extractSessionKey：embeddings 无多轮/缓存复用语义，不产生会话粘附、不写 sessions 表；
+  // 即使请求带 X-OpenWebUI-Chat-Id / X-Session-Id 头也一律不提取（ctx 不含 sessionKey/client 字段）
+  const handleEmbeddings = async (
+    req: Request,
+    res: Response,
+    body: Record<string, unknown>,
+    model: string,
+    signal: AbortSignal,
+  ): Promise<void> => {
+    // 未知模型别名在此抛 ModelNotFoundError，由外层 catch 转 404
+    const candidates = buildRouter().resolve(model)
+    // ctx 缺省 sessionKey/client：无会话键 → 走轮询兜底，会话亲和均衡器也不会 bind/touch/rebind
+    const ctx = { downstreamModel: model, sessionKey: undefined, client: undefined }
+    // 省略第 5 个 onSuccess 参数：无会话键，无需 rebind
+    const result = await executeWithFallback<ChatSuccess>(
+      candidates,
+      loadBalancer,
+      ctx,
+      async (candidate) => {
+        const attemptStart = process.hrtime.bigint()
+        const client = getUpstreamClient(candidate.upstreamId)
+        if (!client) {
+          reportAttempt(candidate.upstreamId, false, attemptStart)
+          // 客户端缺失（防御性，如配置刚删除）：可回退，尝试下一个候选
+          return { ok: false, error: new Error('upstream_client_missing'), fallbackable: true }
+        }
+        // 改写请求体：模型名换成上游侧名称；其余字段（input/encoding_format/dimensions 等）原样透传，
+        // 不强制 stream（embeddings 协议无 stream 概念）
+        body.model = candidate.model
+        try {
+          const data = await client.createEmbedding(body as UpstreamEmbeddingsRequest, { signal })
+          reportAttempt(candidate.upstreamId, true, attemptStart, 200)
+          return { ok: true, value: { status: 200, headers: {}, data } }
+        } catch (err) {
+          reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
+          // 决策 6/7 镜像（responses 透传分支）：上游 404 → 视为该上游不支持 embeddings → 可回退；
+          // 其余沿用 isFallbackableAxiosError（网络/超时/429/5xx 可回退，其它 4xx 立即中断）
+          return {
+            ok: false,
+            error: err,
+            fallbackable: isFallbackableAxiosError(err) || extractErrorStatus(err) === 404,
+          }
+        }
+      },
+    )
+    if (result.ok && result.value) {
+      res.status(result.value.status).json(result.value.data)
+      return
+    }
+    // 全部候选失败：502，附带最后一次尝试的错误代号（若有）
+    const lastEntry = result.attemptLog[result.attemptLog.length - 1]
+    res.status(502).json(
+      lastEntry.errorCode !== undefined ? { error: 'no_upstream', code: lastEntry.errorCode } : { error: 'no_upstream' },
+    )
+  }
   // 模型列表：返回下游别名列表（downstreamModels 的 key），
   // 与聊天接口可识别的模型名保持一致，不再从上游拉取；
   // 别名能聚合出候选 max_context_length 时附加 meta: { n_ctx: 最小值 }
@@ -482,6 +544,24 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       const model = typeof body.model === 'string' ? body.model : ''
       const signal = createRequestSignal(res)
       await handleResponses(req, res, body, model, signal)
+    } catch (err) {
+      // 未知模型别名 → 404；其余异常（如候选为空）→ 502（与 chat 接口一致）
+      if (err instanceof ModelNotFoundError) {
+        res.status(404).json({ error: 'model_not_found' })
+        return
+      }
+      res.status(502).json({ error: 'no_upstream' })
+    }
+  })
+
+  // 文本嵌入：非流式透传（embeddings 协议无 stream），与 /v1/responses 并列
+  app.post('/v1/embeddings', async (req: Request, res: Response) => {
+    try {
+      // 请求体原样透传，不做校验；仅提取路由所需的模型名
+      const body = req.body as Record<string, unknown>
+      const model = typeof body.model === 'string' ? body.model : ''
+      const signal = createRequestSignal(res)
+      await handleEmbeddings(req, res, body, model, signal)
     } catch (err) {
       // 未知模型别名 → 404；其余异常（如候选为空）→ 502（与 chat 接口一致）
       if (err instanceof ModelNotFoundError) {

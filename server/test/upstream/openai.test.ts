@@ -760,3 +760,54 @@ describe('chatCompletionStream 重构零回归（T7a）', () => {
     expect(text).toContain('a')
   })
 })
+
+// ============================================================================
+// T1 追加：createEmbedding 方法测试（POST /v1/embeddings，请求体原样透传，
+// 不做任何强制改写）。行为对照 server/src/upstream/openai.ts 的 T1 实现。
+// ============================================================================
+
+describe('OpenAIUpstreamClient createEmbedding', () => {
+  it('POST /v1/embeddings：请求体原样透传，返回解析后的嵌入对象', async () => {
+    let capturedUrl: string | undefined
+    let captured: unknown
+    await startMock(async (req, res) => {
+      capturedUrl = req.url
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          object: 'list',
+          data: [{ object: 'embedding', embedding: [0.1, 0.2], index: 0 }],
+          model: 'gpt-4-u1',
+          usage: { prompt_tokens: 3, total_tokens: 3 },
+        }),
+      )
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    const reqBody = { model: 'text-embedding-3-small', input: ['hello', 'world'], dimensions: 2 }
+    const res = await client.createEmbedding(reqBody)
+    // 打 /embeddings（baseUrl 带 /v1 后缀）
+    expect(capturedUrl).toBe('/v1/embeddings')
+    // 捕获体与传入体逐字段相等：未被改写、无多余字段注入
+    expect(captured).toEqual(reqBody)
+    expect(res).toEqual({
+      object: 'list',
+      data: [{ object: 'embedding', embedding: [0.1, 0.2], index: 0 }],
+      model: 'gpt-4-u1',
+      usage: { prompt_tokens: 3, total_tokens: 3 },
+    })
+  })
+
+  it('上游返回 500 时 reject，错误携带状态码', async () => {
+    await startMock(async (req, res) => {
+      res.statusCode = 500
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: 'mock boom' }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    // axios 非 2xx 抛 AxiosError，调用方据此识别可回退
+    await expect(client.createEmbedding({ model: 'm', input: 'hi' })).rejects.toMatchObject({
+      response: { status: 500 },
+    })
+  })
+})

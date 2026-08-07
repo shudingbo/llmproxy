@@ -26,6 +26,17 @@ export interface UpstreamResponsesRequest extends UpstreamStreamRequest {
   input?: string | Array<unknown>
 }
 
+// OpenAI 兼容的文本嵌入请求体（宽松结构；embeddings 协议无 stream 概念，
+// input 支持字符串 / 字符串数组 / token 数组 / 多模态 content 对象，其余字段原样透传）
+export interface UpstreamEmbeddingsRequest {
+  model: string
+  input: string | Array<string | number[] | { content: string }>
+  encoding_format?: 'float' | 'base64'
+  dimensions?: number
+  user?: string
+  [key: string]: unknown
+}
+
 // 流式探测关注的最小事件形状（其余字段原样忽略）
 interface ResponsesProbeEvent {
   type?: string
@@ -46,6 +57,15 @@ export interface UpstreamChatResponse {
     finish_reason?: string | null
   }>
   usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
+  [key: string]: unknown
+}
+
+// OpenAI 兼容的文本嵌入响应体（宽松结构；embedding 为 float 数组或 base64 字符串，调用方按需取字段）
+export interface UpstreamEmbeddingsResponse {
+  object?: string
+  data?: Array<{ object?: string; embedding?: Array<number | string>; index?: number }>
+  model?: string
+  usage?: { prompt_tokens?: number; total_tokens?: number }
   [key: string]: unknown
 }
 
@@ -135,6 +155,16 @@ export class OpenAIUpstreamClient {
     // 拷贝请求体并强制关闭流式，确保走非流分支
     const body = { ...req, stream: false }
     return this.request<UpstreamChatResponse>('POST', '/chat/completions', body, {
+      signal: options.signal,
+    })
+  }
+
+  /** 文本嵌入：embeddings 协议无 stream，请求体原样透传（模型名改写由路由层负责），不做任何强制改写 */
+  async createEmbedding(
+    req: UpstreamEmbeddingsRequest,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<UpstreamEmbeddingsResponse> {
+    return this.request<UpstreamEmbeddingsResponse>('POST', '/embeddings', req, {
       signal: options.signal,
     })
   }

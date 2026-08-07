@@ -448,6 +448,7 @@ All routes are served on the single port (default `3000`).
 | --- | --- | --- |
 | `POST /v1/chat/completions` | ✅ | OpenAI-compatible chat; passthrough to upstream with alias routing; streaming SSE when `stream: true` |
 | `POST /v1/responses` | ✅ | OpenAI Responses API; **per-upstream by config** — `upstreams[].responsesApi: 'native'` passes the request / response / SSE events through unchanged (only `model` is rewritten to the upstream-side name); `'convert'` (default) converts to/from Chat Completions at the gateway boundary. The admin UI's detect button (`POST /admin/api/upstreams/:id/detect-responses`) picks the right value when adding an upstream. Non-streaming returns an `object: "response"` payload, `stream: true` returns a Responses SSE event stream |
+| `POST /v1/embeddings` | ✅ | OpenAI-compatible text embeddings; alias routing + sequential failover, passthrough |
 | `GET /v1/models` | ✅ | OpenAI-compatible model list (returns downstream model aliases) |
 | `POST /api/chat` | ✅ | Ollama-compatible chat; request/response converted to/from the OpenAI upstream format; NDJSON streaming |
 | `GET /api/tags` | ✅ | Ollama-compatible model list |

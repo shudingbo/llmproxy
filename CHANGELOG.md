@@ -2,6 +2,13 @@
 
 本项目所有值得记录的变更都会汇总到本文件。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.6.0] / 2026-08-07
+
+### 新增
+
+- **`POST /v1/embeddings` 文本嵌入透传代理**：OpenAI 兼容下游新增文本嵌入端点。按 `/v1/chat/completions` 非流式模式实现：别名解析 → 轮询起点 → 顺序回退；仅改写 `model` 为上游侧模型名，其余字段原样透传。embeddings 无多轮会话语义，不走会话亲和（不写 sessions 表）。上游 404 视为该上游不支持 embeddings → 可回退（切下一候选），其余 4xx（401/403/400）立即中断；全部失败返回 `502 {"error": "no_upstream"}`
+- **下行端点清单**：`DOWNSTREAM_ENDPOINTS` 与 `/admin/api/health` 新增 `POST /v1/embeddings` 条目（文本嵌入）
+
 ## [0.5.0] / 2026-08-05
 
 ### 变更

@@ -1,5 +1,5 @@
-// OpenAI 兼容下游的 HTTP 服务模块：/v1/models、/v1/chat/completions 与 /v1/embeddings
-// 职责：模型列表（返回下游别名）、非流式/流式透传、文本嵌入透传、按候选顺序回退、每次尝试计数
+// OpenAI 兼容下游的 HTTP 服务模块：/v1/models、/v1/chat/completions、/v1/embeddings 与 /v1/rerank
+// 职责：模型列表（返回下游别名）、非流式/流式透传、文本嵌入/重排序透传、按候选顺序回退、每次尝试计数
 // 请求体解析（express.json 10mb）由装配层 T19 注入；请求体本身原样透传，不做校验
 import type { Express, Request, Response } from 'express'
 import type { Readable, Writable } from 'node:stream'
@@ -17,6 +17,7 @@ import type {
   OpenAIUpstreamClient,
   UpstreamChatRequest,
   UpstreamEmbeddingsRequest,
+  UpstreamRerankRequest,
   UpstreamResponsesRequest,
 } from '../upstream/openai.js'
 import { buildAliasMetaMap } from './model-meta.js'
@@ -52,6 +53,8 @@ interface StreamSuccess {
  * - GET /v1/models：返回下游别名列表（downstreamModels 的 key）
  * - POST /v1/chat/completions：非流式/流式透传 + 顺序回退
  * - POST /v1/embeddings：文本嵌入非流式透传 + 顺序回退（上游 404 视为不支持，可回退）
+ * - POST /rerank 与 POST /v1/rerank：文本重排序非流式透传 + 顺序回退（上游 404 视为不支持，
+ *   可回退；/v1/rerank 为 /rerank 的同义路径，两路径共享同一 handler）
  */
 export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
   const { store, getUpstreamClient, loadBalancer, onAttempt } = deps
@@ -493,6 +496,64 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       lastEntry.errorCode !== undefined ? { error: 'no_upstream', code: lastEntry.errorCode } : { error: 'no_upstream' },
     )
   }
+
+  // 文本重排序透传（POST /rerank 与 /v1/rerank）：非流式透传，结构逐行对齐 handleEmbeddings
+  // 刻意不调用 extractSessionKey：rerank 为一次性无状态调用，不产生会话粘附、不写 sessions 表
+  // （与 embeddings 一致）；即使请求带 X-OpenWebUI-Chat-Id / X-Session-Id 头也一律不提取
+  // （ctx 不含 sessionKey/client 字段）
+  const handleRerank = async (
+    req: Request,
+    res: Response,
+    body: Record<string, unknown>,
+    model: string,
+    signal: AbortSignal,
+  ): Promise<void> => {
+    // 未知模型别名在此抛 ModelNotFoundError，由外层 catch 转 404
+    const candidates = buildRouter().resolve(model)
+    // ctx 缺省 sessionKey/client：无会话键 → 走轮询兜底，会话亲和均衡器也不会 bind/touch/rebind
+    const ctx = { downstreamModel: model, sessionKey: undefined, client: undefined }
+    // 省略第 5 个 onSuccess 参数：无会话键，无需 rebind
+    const result = await executeWithFallback<ChatSuccess>(
+      candidates,
+      loadBalancer,
+      ctx,
+      async (candidate) => {
+        const attemptStart = process.hrtime.bigint()
+        const client = getUpstreamClient(candidate.upstreamId)
+        if (!client) {
+          reportAttempt(candidate.upstreamId, false, attemptStart)
+          // 客户端缺失（防御性，如配置刚删除）：可回退，尝试下一个候选
+          return { ok: false, error: new Error('upstream_client_missing'), fallbackable: true }
+        }
+        // 改写请求体：模型名换成上游侧名称；其余字段（query/documents/top_n 等）原样透传，
+        // 不强制 stream（rerank 协议无 stream 概念）
+        body.model = candidate.model
+        try {
+          const data = await client.rerank(body as UpstreamRerankRequest, { signal })
+          reportAttempt(candidate.upstreamId, true, attemptStart, 200)
+          return { ok: true, value: { status: 200, headers: {}, data } }
+        } catch (err) {
+          reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
+          // 决策 6/7 镜像（responses 透传分支）：上游 404 → 视为该上游不支持 rerank → 可回退；
+          // 其余沿用 isFallbackableAxiosError（网络/超时/429/5xx 可回退，其它 4xx 立即中断）
+          return {
+            ok: false,
+            error: err,
+            fallbackable: isFallbackableAxiosError(err) || extractErrorStatus(err) === 404,
+          }
+        }
+      },
+    )
+    if (result.ok && result.value) {
+      res.status(result.value.status).json(result.value.data)
+      return
+    }
+    // 全部候选失败：502，附带最后一次尝试的错误代号（若有）
+    const lastEntry = result.attemptLog[result.attemptLog.length - 1]
+    res.status(502).json(
+      lastEntry.errorCode !== undefined ? { error: 'no_upstream', code: lastEntry.errorCode } : { error: 'no_upstream' },
+    )
+  }
   // 模型列表：返回下游别名列表（downstreamModels 的 key），
   // 与聊天接口可识别的模型名保持一致，不再从上游拉取；
   // 别名能聚合出候选 max_context_length 时附加 meta: { n_ctx: 最小值 }
@@ -571,4 +632,27 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       res.status(502).json({ error: 'no_upstream' })
     }
   })
+
+  // 文本重排序：非流式透传（rerank 协议无 stream），/rerank 与 /v1/rerank 同义，
+  // 两路径共享同一 handler 与同一 catch 逻辑（与 /v1/embeddings 一致）
+  const registerRerank = (path: string): void => {
+    app.post(path, async (req: Request, res: Response) => {
+      try {
+        // 请求体原样透传，不做校验；仅提取路由所需的模型名
+        const body = req.body as Record<string, unknown>
+        const model = typeof body.model === 'string' ? body.model : ''
+        const signal = createRequestSignal(res)
+        await handleRerank(req, res, body, model, signal)
+      } catch (err) {
+        // 未知模型别名 → 404；其余异常（如候选为空）→ 502（与 chat 接口一致）
+        if (err instanceof ModelNotFoundError) {
+          res.status(404).json({ error: 'model_not_found' })
+          return
+        }
+        res.status(502).json({ error: 'no_upstream' })
+      }
+    })
+  }
+  registerRerank('/rerank')
+  registerRerank('/v1/rerank')
 }

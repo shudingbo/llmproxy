@@ -1262,3 +1262,218 @@ describe('POST /v1/embeddings', () => {
     expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: true })
   })
 })
+
+describe('POST /rerank 与 /v1/rerank', () => {
+  it('happy 双路径透传：别名改写为上游模型名，query/documents/top_n 原样，无 stream 注入', async () => {
+    let captured: unknown
+    const payload = {
+      id: 'rerank-1',
+      results: [
+        { index: 0, relevance_score: 0.98, document: { text: 'd1' } },
+        { index: 1, relevance_score: 0.3, document: { text: 'd2' } },
+      ],
+      usage: { total_tokens: 10 },
+    }
+    const url = await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify(payload))
+    })
+    addClient('u1', url)
+
+    const send = (path: string): request.Test =>
+      request(app).post(path).send({ model: 'gpt-4', query: 'q', documents: ['d1', 'd2'], top_n: 2 })
+
+    // /rerank 与 /v1/rerank 共享同一 handler：两条路径分别请求，行为一致
+    const res1 = await send('/rerank')
+    expect(res1.status).toBe(200)
+    // 上游响应原样回写（深度相等）
+    expect(res1.body).toEqual(payload)
+    // 别名改写：上游收到的是候选模型名；query/documents/top_n 原样透传，无 stream 注入
+    expect(captured).toEqual({ model: 'gpt-4-u1', query: 'q', documents: ['d1', 'd2'], top_n: 2 })
+    // 统计钩子恰好记录一次成功尝试
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: true, status: 200 })
+
+    const res2 = await send('/v1/rerank')
+    expect(res2.status).toBe(200)
+    expect(res2.body).toEqual(payload)
+    expect(captured).toEqual({ model: 'gpt-4-u1', query: 'q', documents: ['d1', 'd2'], top_n: 2 })
+    // 第二次请求轮询起点推进到 u2（未注册客户端，缺失尝试后可回退），最终仍由 u1 成功
+    expect(attempts[attempts.length - 1]).toMatchObject({ upstreamId: 'u1', ok: true, status: 200 })
+  })
+
+  it('404 回退：u1 不支持 rerank（404）→ u2 成功，第二次尝试 model 改写为 gpt-4-u2', async () => {
+    let capturedU1: unknown
+    const url1 = await startMock(async (req, res) => {
+      capturedU1 = await readBody(req)
+      res.statusCode = 404
+      res.end('not found')
+    })
+    let capturedU2: unknown
+    const payload = { id: 'rerank-2', results: [{ index: 0, relevance_score: 0.9 }], model: 'gpt-4-u2' }
+    const url2 = await startMock(async (req, res) => {
+      capturedU2 = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify(payload))
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+
+    const res = await request(app).post('/rerank').send({ model: 'gpt-4', query: 'q', documents: ['d'] })
+    expect(res.status).toBe(200)
+    // 响应来自 u2
+    expect(res.body).toEqual(payload)
+    // 两次尝试：u1 失败（404）+ u2 成功；两次 body.model 分别改写为各自候选模型名
+    expect(attempts.map((a) => a.upstreamId)).toEqual(['u1', 'u2'])
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: false, status: 404 })
+    expect(attempts[1]).toMatchObject({ upstreamId: 'u2', ok: true, status: 200 })
+    expect(capturedU1).toMatchObject({ model: 'gpt-4-u1' })
+    expect(capturedU2).toMatchObject({ model: 'gpt-4-u2' })
+  })
+
+  it('500 回退：u1 上游 5xx → u2 成功（500 在可回退集合内）', async () => {
+    const url1 = await startMock(async (req, res) => {
+      await readBody(req)
+      res.statusCode = 500
+      res.end('internal error')
+    })
+    const payload = { id: 'rerank-3', results: [{ index: 0, relevance_score: 0.8 }] }
+    const url2 = await startMock(async (req, res) => {
+      await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify(payload))
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+
+    const res = await request(app).post('/v1/rerank').send({ model: 'gpt-4', query: 'q', documents: ['d'] })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual(payload)
+    expect(attempts.map((a) => a.upstreamId)).toEqual(['u1', 'u2'])
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: false, status: 500 })
+    expect(attempts[1]).toMatchObject({ upstreamId: 'u2', ok: true, status: 200 })
+  })
+
+  it('401 立即中断：u1 鉴权失败不再尝试 u2，直接 502 no_upstream', async () => {
+    let hitU2 = 0
+    const url1 = await startMock(async (req, res) => {
+      res.statusCode = 401
+      res.end('unauthorized')
+    })
+    const url2 = await startMock(async (req, res) => {
+      hitU2++
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'rerank-4', results: [] }))
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+
+    const res = await request(app).post('/rerank').send({ model: 'gpt-4', query: 'q', documents: ['d'] })
+    expect(res.status).toBe(502)
+    // 只断言 error 字段；code 来自 axios 错误码（如 ERR_BAD_REQUEST），非 HTTP 状态码，不断言具体值
+    expect(res.body as { error?: string }).toMatchObject({ error: 'no_upstream' })
+    // 401 不可回退：只尝试了 u1，未触碰 u2
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: false, status: 401 })
+    expect(hitU2).toBe(0)
+  })
+
+  it('未知模型别名返回 404 model_not_found', async () => {
+    const res = await request(app).post('/v1/rerank').send({ model: 'nope', query: 'q', documents: ['d'] })
+    expect(res.status).toBe(404)
+    expect(res.body as { error?: string }).toEqual({ error: 'model_not_found' })
+    // 未发起任何尝试
+    expect(attempts).toHaveLength(0)
+  })
+
+  it('无会话粘附：带 X-OpenWebUI-Chat-Id 头也不提取会话键，存储零调用，同头请求按轮询分布', async () => {
+    let hitU1 = 0
+    let hitU2 = 0
+    const url1 = await startMock(async (req, res) => {
+      hitU1++
+      await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'rerank-6', results: [{ index: 0, relevance_score: 0.6 }] }))
+    })
+    const url2 = await startMock(async (req, res) => {
+      hitU2++
+      await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'rerank-6', results: [{ index: 0, relevance_score: 0.7 }] }))
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+    const session = new FakeSessionStore()
+    buildApp(session)
+
+    const send = (): request.Test =>
+      request(app)
+        .post('/v1/rerank')
+        .set('X-OpenWebUI-Chat-Id', 'chat-rerank')
+        .send({ model: 'gpt-4', query: 'q', documents: ['d'] })
+
+    const res1 = await send()
+    expect(res1.status).toBe(200)
+    const res2 = await send()
+    expect(res2.status).toBe(200)
+    // rerank 不产生会话粘附：bind/touch/rebind 零调用
+    expect(session.bindCalls).toHaveLength(0)
+    expect(session.touchCalls).toHaveLength(0)
+    expect(session.rebindCalls).toHaveLength(0)
+    // 无粘附 → 连发两次同头请求按轮询命中不同上游（u1/u2 各一次）
+    expect(hitU1).toBe(1)
+    expect(hitU2).toBe(1)
+  })
+
+  it('透传保真：多模态对象元素 documents + top_n + query 原样到达上游', async () => {
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'rerank-7', results: [{ index: 0, relevance_score: 0.99 }] }))
+    })
+    addClient('u1', url)
+
+    const body = {
+      model: 'gpt-4',
+      query: 'q',
+      documents: [
+        { content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }] },
+      ],
+      top_n: 1,
+    }
+    const res = await request(app).post('/v1/rerank').send(body)
+    expect(res.status).toBe(200)
+    // 除 model 改写为候选模型名外，其余字段原样透传（不强制 stream、不删字段）
+    expect(captured).toEqual({ ...body, model: 'gpt-4-u1' })
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: true })
+  })
+
+  it('透传保真：混合数组 documents（纯文本 + 对象元素）顺序与内容不变', async () => {
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'rerank-8', results: [] }))
+    })
+    addClient('u1', url)
+
+    const body = {
+      model: 'gpt-4',
+      query: 'q',
+      documents: [
+        '纯文本A',
+        { content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,BBBB' } }] },
+        '纯文本B',
+      ],
+    }
+    const res = await request(app).post('/rerank').send(body)
+    expect(res.status).toBe(200)
+    // captured.documents 与发送体深度相等：顺序与内容不变，仅 model 改写
+    expect(captured).toEqual({ ...body, model: 'gpt-4-u1' })
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: true })
+  })
+})

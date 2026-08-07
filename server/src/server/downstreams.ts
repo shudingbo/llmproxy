@@ -20,6 +20,8 @@ export const DOWNSTREAM_ENDPOINTS: ReadonlyArray<DownstreamEndpoint> = [
   { type: 'openai', method: 'POST', path: '/v1/chat/completions', summary: '聊天补全，支持非流式与流式（SSE）' },
   { type: 'openai', method: 'POST', path: '/v1/responses', summary: 'Responses API，支持非流式与流式（SSE）' },
   { type: 'openai', method: 'POST', path: '/v1/embeddings', summary: '文本嵌入（embeddings）' },
+  { type: 'openai', method: 'POST', path: '/rerank', summary: '按相关性对文档重排序（rerank，/v1/rerank 的同义路径）' },
+  { type: 'openai', method: 'POST', path: '/v1/rerank', summary: '按相关性对文档重排序（rerank）' },
   // Ollama 兼容下游
   { type: 'ollama', method: 'GET', path: '/api/tags', summary: '聚合后的 Ollama 模型列表' },
   { type: 'ollama', method: 'POST', path: '/api/chat', summary: 'Ollama 聊天接口（NDJSON 流 / JSON 非流）' },

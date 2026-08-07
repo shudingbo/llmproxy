@@ -59,6 +59,8 @@ describe('下游清单 DOWNSTREAM_ENDPOINTS', () => {
     expect(paths).toContain('POST /v1/chat/completions')
     expect(paths).toContain('POST /v1/responses')
     expect(paths).toContain('POST /v1/embeddings')
+    expect(paths).toContain('POST /rerank')
+    expect(paths).toContain('POST /v1/rerank')
   })
 
   it('Ollama 兼容下游至少包含 /api/tags 与 /api/chat', () => {

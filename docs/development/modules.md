@@ -107,7 +107,7 @@ web 端职责一句话：纯管理界面，所有数据经 `/admin/api` 获取�
 
 | 文件 | 职责 | 关键导出 |
 | --- | --- | --- |
-| `schema.ts` | 用 Zod 定义配置结构：`upstreams`（至少 1 个上游）、`downstreamModels`（别名 → 候选列表映射）、`server`（监听配置，可选）、`routing`（会话亲和配置，可选）。缺省值由 schema 补齐（如 `timeoutMs: 30000`、`disabled: false`、`cleanupMaxAgeMs: 604800000`） | `ConfigSchema`、`UpstreamSchema`、`UpstreamCandidateSchema`、`DownstreamModelSchema`、`RoutingSchema`；类型 `Config`、`Upstream`、`UpstreamCandidate`、`ServerListen`、`Routing` |
+| `schema.ts` | 用 Zod 定义配置结构：`upstreams`（至少 1 个上游）、`downstreamModels`（别名 → 候选列表映射）、`server`（监听配置，可选）、`routing`（会话亲和配置，可选）。缺省值由 schema 补齐（如 `timeoutMs: 30000`、`disabled: false`、`cleanupMaxAgeMs: 604800000`） | `ConfigSchema`、`UpstreamSchema`、`UpstreamCandidateSchema`、`DownstreamModelSchema`、`RoutingSchema`；类型 `Config`、`Upstream`、`UpstreamCandidate`、`ServerConfig`、`Routing` |
 | `loader.ts` | 读取 JSONC 文件（支持注释与尾逗号，用 `jsonc-parser`）并按 `ConfigSchema` 校验 | `loadConfigFromFile(path)`、`ConfigError`（`code: 'PARSE' \| 'VALIDATE'`） |
 | `store.ts` | `ConfigStore`：持有唯一内存态配置；`set()` 先深比较去重（防 watcher 自环）、重新校验、原子写盘（`${path}.tmp` 临时文件 + rename，权限 0600）、再通知订阅者；文件缺失时写入 bootstrap 示例 | `ConfigStore`（`get` / `subscribe` / `set` / `getRecentReloadError` / `setRecentReloadError`）、类型 `WatchSource`（`'admin' \| 'watch' \| 'bootstrap'`） |
 | `watcher.ts` | chokidar 监听配置文件变更，`awaitWriteFinish` 200ms 防抖；变更后重新加载校验，合法则 `store.set(..., { source: 'watch' })`，非法则保留旧配置并上报 `reloadError`（日志脱敏，不落文件内容） | `startConfigWatcher(path, store)` |

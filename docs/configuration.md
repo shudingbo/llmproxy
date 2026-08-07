@@ -36,6 +36,7 @@
 | `server` | object | 否 | — | 下行流监听配置（整节可缺省） |
 | `server.host` | string | 否 | `127.0.0.1` | 监听地址（IPv4 / IPv6 / Unix socket 名） |
 | `server.port` | number | 否 | `3000` | TCP 端口（1–65535） |
+| `server.bodyLimit` | string \| number | 否 | `'10mb'` | JSON body 上限（`'10mb'` 等字符串或数字字节数）；全局生效；超限返回 413；非法值（如 'abc'）会导致启动失败 |
 | `routing` | object | 否 | — | 路由行为配置（整节可缺省） |
 | `routing.sessionAffinity` | object | 否 | `{}` | 会话亲和路由；允许只写部分键，其余取默认 |
 | `routing.sessionAffinity.enabled` | boolean | 否 | `true` | 会话亲和总开关 |
@@ -54,7 +55,8 @@
   // 注意：socket 在进程启动时绑定，修改本节必须重启进程才能生效
   "server": {
     "host": "0.0.0.0",   // 监听地址；0.0.0.0 表示对外网卡均可访问
-    "port": 3000         // TCP 端口（1-65535）
+    "port": 3000,        // TCP 端口（1-65535）
+    "bodyLimit": "10mb"  // JSON 请求体上限（'10mb' 等字符串或数字字节数），缺省 '10mb'；全局生效，改后重启
   },
 
   // ---- upstreams：上游提供商列表（至少 1 个）----
@@ -142,8 +144,9 @@
 ### server（监听，可选）
 
 - **`host`** / **`port`**：控制整个进程对外暴露的地址与端口。节内缺省 `127.0.0.1:3000`（schema 缺省值）；整节省略时进程缺省监听 `0.0.0.0:3000`（`listen.ts` 的 `DEFAULT_HOST` / `DEFAULT_PORT`）。`host` 设为 `0.0.0.0` 表示监听所有网卡，可被外部访问；生产部署时注意防火墙与鉴权（管理端 `/admin/api` 无内置鉴权，请在可信网络内使用）。
+- **`bodyLimit`**：JSON 请求体上限，缺省 `'10mb'`。支持 `'10mb'` 这类 `bytes` 单位字符串（`'1kb'` / `'1mb'` / `'1gb'` 等），也支持直接写数字字节数（正整数，如 `10485760`）。全局生效——所有接口（`/v1/*`、`/api/*`、`/admin/api/*` 与 `/rerank`）共用该上限；请求体超限返回 `413`。该值在 `createApp` 装配时读入 `express.json({ limit })`，**非法值（如 `'abc'`）zod 虽能通过（非空字符串），但会在启动装配 body-parser 时抛错导致启动失败**，因此请确保填写合法值。进程级配置，**改后需重启**（见下条）。
 - **监听优先级**：命令行 `--host` / `--port` > `server` 节 > 缺省值。命令行参数最高优先级，host/port 相互独立可选，未指定的一侧回落下一优先级；也支持 `--host=0.0.0.0` / `--port=8080` 等号形式。**不再支持环境变量 `HOST` / `PORT` 覆盖监听地址**（0.2.0 起移除）。
-- **需要重启**：socket 在进程启动时绑定，**修改本节或命令行参数的变更不会通过文件监听即时应用**（避免端口漂移 / 重复绑定），必须重启进程。例如 `pnpm start -- --host 0.0.0.0 --port 8080` 或 `node scripts/start.js --host 0.0.0.0 --port 8080`。
+- **需要重启**：socket 在进程启动时绑定、bodyLimit 在 `createApp` 装配时读取，**修改本节或命令行参数的变更不会通过文件监听即时应用**（避免端口漂移 / 重复绑定），必须重启进程。例如 `pnpm start -- --host 0.0.0.0 --port 8080` 或 `node scripts/start.js --host 0.0.0.0 --port 8080`。
 
 ### routing（路由，可选）
 

@@ -161,6 +161,8 @@ Schema reference — see `server/src/config/schema.ts` for the authoritative Zod
 | `routing.sessionAffinity.enabled` | boolean | master switch, default `true` |
 | `routing.sessionAffinity.cleanupMaxAgeMs` | number | session retention period, default `604800000` (1 week); `0` = never expire |
 | `routing.sessionAffinity.cleanupIntervalMs` | number | auto-cleanup interval, default `3600000` (1 hour); `0` = disable auto cleanup |
+| `server` | object (optional) | 进程级 server 配置（host / port / bodyLimit）；修改后需重启 |
+| `server.bodyLimit` | string \| number | 否；缺省 `'10mb'`。JSON body 上限（`'10mb'` 等字符串或数字字节数）；全局生效，改后重启 |
 
 Example:
 
@@ -449,6 +451,8 @@ All routes are served on the single port (default `3000`).
 | `POST /v1/chat/completions` | ✅ | OpenAI-compatible chat; passthrough to upstream with alias routing; streaming SSE when `stream: true` |
 | `POST /v1/responses` | ✅ | OpenAI Responses API; **per-upstream by config** — `upstreams[].responsesApi: 'native'` passes the request / response / SSE events through unchanged (only `model` is rewritten to the upstream-side name); `'convert'` (default) converts to/from Chat Completions at the gateway boundary. The admin UI's detect button (`POST /admin/api/upstreams/:id/detect-responses`) picks the right value when adding an upstream. Non-streaming returns an `object: "response"` payload, `stream: true` returns a Responses SSE event stream |
 | `POST /v1/embeddings` | ✅ | OpenAI-compatible text embeddings; alias routing + sequential failover, passthrough |
+| `POST /rerank` | ✅ | 按相关性对文档重排序（rerank）；别名路由 + 顺序回退，原样透传（/v1/rerank 的同义路径）。Path 原样拼在 upstream baseUrl 后：上游暴露 /v1/rerank 则 baseUrl 配 https://host/v1，本地 ranker 暴露 /rerank 则 baseUrl 配 http://host:port。JSON body 上限由 server.bodyLimit 配置（缺省 10mb，改后重启） |
+| `POST /v1/rerank` | ✅ | OpenAI 兼容重排序（rerank）；与 /rerank 等价，请求体 { model, query, documents, top_n? }，上游响应原样回写 |
 | `GET /v1/models` | ✅ | OpenAI-compatible model list (returns downstream model aliases) |
 | `POST /api/chat` | ✅ | Ollama-compatible chat; request/response converted to/from the OpenAI upstream format; NDJSON streaming |
 | `GET /api/tags` | ✅ | Ollama-compatible model list |

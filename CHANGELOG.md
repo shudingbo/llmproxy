@@ -2,6 +2,14 @@
 
 本项目所有值得记录的变更都会汇总到本文件。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **POST /rerank 与 /v1/rerank 重排序透传代理**：OpenAI 兼容下游新增文本重排序端点（`/v1/rerank` 为 `/rerank` 的同义路径，两路径共享同一 handler）。按 `/v1/embeddings` 模式实现：别名解析 → 轮询起点 → 顺序回退；仅改写 model 为上游侧模型名，其余字段原样透传；不走会话亲和（不写 sessions 表）；上游 404 视为不支持 → 可回退，其余 4xx 立即中断；全部失败返回 502 no_upstream。JSON body 上限由 server.bodyLimit 配置，见下条
+- **下行端点清单**：DOWNSTREAM_ENDPOINTS 与 /admin/api/health 新增 POST /rerank 与 POST /v1/rerank 条目
+- **server.bodyLimit 可配置 JSON body 上限**：server{} 节新增 bodyLimit（缺省 '10mb'，支持 '10mb' 字符串或数字字节数），全局生效（所有接口共用）；进程级配置，修改后需重启；非法 limit 值（如 'abc'）会导致启动失败；ServerListenSchema 更名为 ServerConfigSchema
+
 ## [0.6.0] / 2026-08-07
 
 ### 新增

@@ -3,10 +3,16 @@ import fs from 'fs';
 import path from 'path';
 
 // 配置参数
-const HOST = '222.18.149.200';
-const PORT = 1244;
-const PATH = '/rerank';
-const MODEL_NAME = 'qwen-vl-reranker-2b'; // 请确保这是你启动的 VL-Reranker 模型名
+// const HOST = '222.18.149.200';
+// const PORT = 1244;
+// const PATH = '/rerank';
+// const MODEL_NAME = 'qwen-vl-reranker-2b'; // 请确保这是你启动的 VL-Reranker 模型名
+
+
+const HOST = '127.0.0.1';
+const PORT = 3000;
+const PATH = '/rerank'; // 注意这里是 /v1/rerank
+const MODEL_NAME = 'ranker-vl';
 
 // 辅助函数：将本地图片转换为 Base64 Data URI
 function imageToBase64URI(filePath) {

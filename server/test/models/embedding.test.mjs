@@ -1,12 +1,18 @@
 // test_embedding.mjs
 import http from 'http';
 
-const HOST = '222.18.149.200';
-const PORT = 1244;
+// const HOST = '222.18.149.200';
+// const PORT = 1242;
+// const PATH = '/v1/embeddings';
+// // const MODEL_NAME = 'qwen-embedding-0.6';
+// // const MODEL_NAME = 'qwen3-embedding-4b';
+// const MODEL_NAME = 'qwen-vl-embedding-2b';
+
+const HOST = '127.0.0.1';
+const PORT = 3000;
 const PATH = '/v1/embeddings';
-// const MODEL_NAME = 'qwen-embedding-0.6';
-// const MODEL_NAME = 'qwen3-embedding-4b';
-const MODEL_NAME = 'qwen-vl-embedding-2b';
+const MODEL_NAME = 'embedding-vl';
+
 
 
 // 请求体：符合 OpenAI Embeddings API 兼容格式

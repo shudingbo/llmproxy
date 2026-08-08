@@ -3,10 +3,16 @@ import http from 'http';
 
 // 配置参数
 const HOST = '222.18.149.200';
-const PORT = 8000;
+const PORT = 1244;
 const PATH = '/v1/score';
 // const PATH = '/v1/rerank';
-const MODEL_NAME = 'qwen-vl-embedding-2b';
+const MODEL_NAME = 'qwen-vl-reranker-2b';
+
+// const HOST = '127.0.0.1';
+// const PORT = 3000;
+// //const PATH = '/v1/score';
+// const PATH = '/rerank';
+// const MODEL_NAME = 'ranker-vl';
 
 // 构造请求体
 const postData = JSON.stringify({

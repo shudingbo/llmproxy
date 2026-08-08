@@ -3,14 +3,18 @@ import http from 'http';
 import fs from 'fs';
 import path from 'path';
 
-const HOST = '222.18.149.200';
-const PORT = 1242;
-const MODEL_NAME = 'qwen-vl-embedding-2b';
+// const HOST = '222.18.149.200';
+// const PORT = 1242;
+// const MODEL_NAME = 'qwen-vl-embedding-2b';
 
 // const HOST = '222.18.149.10';
 // const PORT = 1238;
 // const MODEL_NAME = 'qwen3-vl-embedding-8b';
 
+const HOST = '127.0.0.1';
+const PORT = 3000;
+const PATH = '/v1/embeddings';
+const MODEL_NAME = 'embedding-vl';
 
 
 // ==================== 辅助函数 ====================

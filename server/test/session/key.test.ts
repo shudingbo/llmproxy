@@ -29,6 +29,33 @@ const expectedHash = (messages: unknown[]): string =>
     )
     .digest('hex')
 
+// 按与模块相同的口径计算期望的 github 分支 hash：
+// 取「第 1 个 assistant 之前」的消息（无 assistant 则取全部），序列化口径同上
+const expectedGithubHash = (messages: unknown[]): string => {
+  const firstAssistantIndex = messages.findIndex((m) => {
+    const msg = (m ?? {}) as Record<string, unknown>
+    return msg.role === 'assistant'
+  })
+  const prefix = firstAssistantIndex === -1 ? messages : messages.slice(0, firstAssistantIndex)
+  return createHash('sha256')
+    .update(
+      JSON.stringify(
+        prefix.map((m) => {
+          const msg = (m ?? {}) as Record<string, unknown>
+          const role = typeof msg.role === 'string' ? msg.role : ''
+          const content =
+            typeof msg.content === 'string'
+              ? msg.content
+              : msg.content === undefined
+                ? ''
+                : JSON.stringify(msg.content)
+          return [role, content]
+        }),
+      ),
+    )
+    .digest('hex')
+}
+
 describe('extractSessionKey', () => {
   it('header 存在（大小写不敏感 X-OPENWEBUI-CHAT-ID）→ 返回 header 值、client=open-webui', () => {
     const req = makeReq({ 'X-OPENWEBUI-CHAT-ID': 'chat-uuid-123' })
@@ -152,5 +179,93 @@ describe('extractSessionKey', () => {
     const req = makeReq({ 'x-session-id': 'sess-xyz' })
     const body = { messages: [{ role: 'user', content: '你好' }] }
     expect(extractSessionKey(req, body)).toEqual({ raw: 'sess-xyz', client: 'x-session-id' })
+  })
+})
+
+describe('extractSessionKey github baggage 分支', () => {
+  it('baggage 值含 copilot → client=github，raw 为 64 位 hex 且与口径计算一致', () => {
+    const req = makeReq({ baggage: 'vs.copilot.InitiatorType = user' })
+    const body = { messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: '你好' }] }
+    const result = extractSessionKey(req, body)
+    expect(result).toBeDefined()
+    expect(result!.client).toBe('github')
+    expect(result!.raw).toMatch(/^[0-9a-f]{64}$/)
+    expect(result!.raw).toBe(expectedGithubHash(body.messages as unknown[]))
+  })
+
+  it('baggage 值含大小写混合 Copilot → 仍命中 github（验证转小写）', () => {
+    const req = makeReq({ baggage: 'Copilot=1; x=2' })
+    const body = { messages: [{ role: 'user', content: 'hi' }] }
+    const result = extractSessionKey(req, body)
+    expect(result).toBeDefined()
+    expect(result!.client).toBe('github')
+  })
+
+  it('baggage 头存在但不含 copilot → 不走 github，走 content-hash', () => {
+    const req = makeReq({ baggage: 'other-key=value' })
+    const body = { messages: [{ role: 'user', content: '你好' }] }
+    const result = extractSessionKey(req, body)
+    expect(result).toBeDefined()
+    expect(result!.client).toBe('content-hash')
+    expect(result!.raw).toBe(expectedHash(body.messages as unknown[]))
+  })
+
+  it('无 baggage 头 → 不走 github（只有 messages → content-hash）', () => {
+    const body = { messages: [{ role: 'user', content: '你好' }] }
+    const result = extractSessionKey(makeReq(), body)
+    expect(result).toBeDefined()
+    expect(result!.client).toBe('content-hash')
+  })
+
+  it('github hash 稳定性：第 1 个 assistant 之前的消息未变 → hash 相同', () => {
+    const short = {
+      messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: '你好' }],
+    }
+    const grown = {
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: '你好' },
+        { role: 'assistant', content: '好的' },
+        { role: 'user', content: '再问一个' },
+      ],
+    }
+    const req = makeReq({ baggage: 'vs.copilot.InitiatorType = user' })
+    expect(extractSessionKey(req, grown)?.raw).toBe(extractSessionKey(req, short)?.raw)
+  })
+
+  it('github 分支：无 assistant 取全部消息 → [user] 与 [user, assistant, user] hash 相同', () => {
+    const onlyUser = { messages: [{ role: 'user', content: 'hi' }] }
+    const withAssistant = {
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'hello' },
+        { role: 'user', content: 'again' },
+      ],
+    }
+    const req = makeReq({ baggage: 'vs.copilot.InitiatorType = user' })
+    expect(extractSessionKey(req, onlyUser)?.raw).toBe(extractSessionKey(req, withAssistant)?.raw)
+  })
+
+  it('github 分支：首条 user 内容不同 → hash 不同', () => {
+    const a = { messages: [{ role: 'user', content: '你好' }] }
+    const b = { messages: [{ role: 'user', content: '你好吗' }] }
+    const req = makeReq({ baggage: 'vs.copilot.InitiatorType = user' })
+    const hashA = extractSessionKey(req, a)?.raw
+    const hashB = extractSessionKey(req, b)?.raw
+    expect(hashA).toBeDefined()
+    expect(hashB).toBeDefined()
+    expect(hashA).not.toBe(hashB)
+  })
+
+  it('baggage 头为数组值（重复 header）→ 取第一个参与判断', () => {
+    // 第一个含 copilot → 命中 github
+    const firstHits = makeReq({ baggage: ['vs.copilot.InitiatorType = user', 'other=x'] })
+    expect(extractSessionKey(firstHits, { messages: [{ role: 'user', content: 'hi' }] })?.client).toBe(
+      'github',
+    )
+    // 第一个不含 copilot、第二个含 → 以第一个为准，不命中 github，走 content-hash
+    const firstMisses = makeReq({ baggage: ['other=x', 'vs.copilot.InitiatorType = user'] })
+    const result = extractSessionKey(firstMisses, { messages: [{ role: 'user', content: 'hi' }] })
+    expect(result?.client).toBe('content-hash')
   })
 })

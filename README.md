@@ -28,8 +28,9 @@ The router derives a session key from the request. The first source that matches
 | --- | --- | --- | --- |
 | 1 | HTTP header `X-OpenWebUI-Chat-Id` | case-insensitive header read, value used as-is (typically the Open WebUI chat UUID) | `open-webui` |
 | 2 | HTTP header `X-Session-Id` | case-insensitive header read, value used as-is; if the trimmed value starts with `ywnrs` the row is tagged `ywnrs` (so a specific client family can be filtered out), otherwise `x-session-id` | `x-session-id` / `ywnrs` |
-| 3 | Content-prefix hash | `sha256(role + content)` over the first two messages (typically `system` + first `user` turn), JSON-stringified for multimodal payloads (arrays / objects / `null` fields preserved) | `content-hash` |
-| 4 | *(none)* | falls back to round-robin | — |
+| 3 | HTTP header `baggage` containing `copilot` | header present and its value (lowercased) contains the substring `copilot` (GitHub Copilot & co. client marker, e.g. `vs.copilot.InitiatorType = user`); session key = `sha256` over the `[role, content]` tuples of all messages **before the first `assistant` turn** (all messages if none) | `github` |
+| 4 | Content-prefix hash | `sha256(role + content)` over the first two messages (typically `system` + first `user` turn), JSON-stringified for multimodal payloads (arrays / objects / `null` fields preserved) | `content-hash` |
+| 5 | *(none)* | falls back to round-robin | — |
 
 Open WebUI users get the strongest key (explicit UUID) **when** `ENABLE_FORWARD_USER_INFO_HEADERS=true` is set on the Open WebUI side; otherwise they fall through to the content hash, which is still correct but may re-bind if the user edits their first message.
 
@@ -39,7 +40,7 @@ Open WebUI users get the strongest key (explicit UUID) **when** `ENABLE_FORWARD_
   ```
   session_key          text  -- e.g. "<downstreamModel>::<rawKey>"
   session_id           text  -- the per-turn ID (e.g. Open WebUI chat id, or a content-hash)
-  client               text  -- 'open-webui' | 'x-session-id' | 'ywnrs' | 'content-hash'
+  client               text  -- 'open-webui' | 'x-session-id' | 'ywnrs' | 'github' | 'content-hash'
   downstream_model     text  -- the alias
   upstream_id          text  -- the currently bound upstream
   upstream_model       text  -- the model name on that upstream
@@ -371,8 +372,10 @@ curl -N http://127.0.0.1:3000/api/chat \
 **会话键来源**（优先级从高到低）：
 
 1. **HTTP header `X-OpenWebUI-Chat-Id`**：Open WebUI 专有头，值为聊天会话 UUID，命中即作为会话键
-2. **内容前缀哈希**：取请求体 `messages` 前 2 条（通常 system + 首条 user 消息）的 `role + content`，`sha256` 后作为会话键。无需 client 配合，相同前缀的请求自动汇聚到同一上游
-3. **两者都取不到**：回退原有轮询（round-robin），行为与旧版本一致
+2. **HTTP header `X-Session-Id`**：通用会话 id 头；值以 `ywnrs` 开头时 client 记为 `ywnrs`，否则记为 `x-session-id`
+3. **HTTP header `baggage` 含 `copilot`**：GitHub Copilot 等 client 的标识（典型值如 `vs.copilot.InitiatorType = user`）；命中时取「第 1 个 assistant 之前」的所有消息（无 assistant 则取全部）的 `[role, content]` 二元组 `sha256` 作为会话键，client 记为 `github`
+4. **内容前缀哈希**：取请求体 `messages` 前 2 条（通常 system + 首条 user 消息）的 `role + content`，`sha256` 后作为会话键。无需 client 配合，相同前缀的请求自动汇聚到同一上游
+5. **都取不到**：回退原有轮询（round-robin），行为与旧版本一致
 
 **粘附映射持久化**在 SQLite：`<userHome>/llmproxy/llmproxy.db`，表 `sessions`（`session_key` / `session_id` / `client` / `downstream_model` / `upstream_id` / `upstream_model` / `created_at` / `updated_at`）。
 
@@ -409,6 +412,7 @@ curl -N http://127.0.0.1:3000/api/chat \
 | GET | `/admin/api/config` | 当前生效配置（apiKey 已掩码） |
 | GET | `/admin/api/config/reload-error` | 最近一次配置重载错误（无则 `null`） |
 | GET | `/admin/api/sessions` | 会话粘附分页列表：`?offset&limit&client&keyword`（updated_at 倒序） |
+| GET | `/admin/api/session-clients` | 会话粘附库中出现的去重 client 类型（按字母序，空库返回 `[]`），供 Sessions 页客户端筛选下拉动态获取 |
 | DELETE | `/admin/api/sessions/:sessionKey` | 解绑单条会话（下次请求重新选上游） |
 | DELETE | `/admin/api/sessions` | 清空全部会话粘附映射 |
 | POST | `/admin/api/sessions/cleanup` | 立即执行一次过期清理 |
@@ -465,7 +469,7 @@ All routes are served on the single port (default `3000`).
 | `GET /admin/api/downstream-models` · `PUT` | ✅ | alias/candidate management |
 | `GET /admin/api/logs` | ✅ | log lines served from SQLite (type/level/time/keyword filters, offset/limit pagination, `hasMore`) |
 | `GET /admin/api/config` · `GET /admin/api/config/reload-error` | ✅ | config inspection + last reload error |
-| `GET /admin/api/sessions` · `DELETE /:sessionKey` · `DELETE` · `POST /cleanup` | ✅ | session-affinity mapping: list, unbind, clear-all, cleanup |
+| `GET /admin/api/sessions` · `GET /admin/api/session-clients` · `DELETE /:sessionKey` · `DELETE` · `POST /cleanup` | ✅ | session-affinity mapping: list, client types, unbind, clear-all, cleanup |
 | `/` (web UI) | ✅ | built admin SPA (requires `web/dist`, otherwise `503`) |
 
 Limitations: tool calls are stripped from upstream responses on the Ollama path (warned + dropped); `n > 1` is rejected with `400` on the Ollama path.

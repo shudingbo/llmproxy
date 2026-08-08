@@ -1234,6 +1234,24 @@ describe('会话粘附映射 /admin/api/sessions', () => {
     expect(over.body.error).toBe('invalid_query')
   })
 
+  it('GET session-clients 空库返回 clients=[]', async () => {
+    const res = await request(app).get('/admin/api/session-clients')
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ clients: [] })
+  })
+
+  it('GET session-clients 返回去重且按字母序的 client 列表', async () => {
+    sessionStore.bind('gpt-4o::chat-1', makeSessionInfo({ sessionId: 'sess-a', client: 'github' }))
+    sessionStore.bind('gpt-4o::chat-2', makeSessionInfo({ sessionId: 'sess-b', client: 'content-hash' }))
+    sessionStore.bind('gpt-4o::chat-3', makeSessionInfo({ sessionId: 'sess-c', client: 'open-webui' }))
+    // 重复 client：不应在结果中重复出现
+    sessionStore.bind('gpt-4o::chat-4', makeSessionInfo({ sessionId: 'sess-d', client: 'github' }))
+
+    const res = await request(app).get('/admin/api/session-clients')
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ clients: ['content-hash', 'github', 'open-webui'] })
+  })
+
   it('DELETE 单条：存在返回 { deleted: true } 且记录消失；不存在返回 { deleted: false }', async () => {
     sessionStore.bind('gpt-4o::chat-1', makeSessionInfo({ sessionId: 'sess-a' }))
 

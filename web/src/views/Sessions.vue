@@ -87,7 +87,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Brush, Delete, Search } from '@element-plus/icons-vue'
 import { api } from '../api/client'
@@ -110,15 +110,14 @@ interface SessionListResponse {
   total: number
 }
 
+// 客户端列表（从接口动态获取）
+const clientList = ref<string[]>([])
+
 // 客户端下拉选项：空串表示全部
-const clientOptions = [
+const clientOptions = computed(() => [
   { value: '', label: '全部' },
-  { value: 'open-webui', label: 'open-webui' },
-  { value: 'x-session-id', label: 'x-session-id' },
-  { value: 'ywnrs', label: 'ywnrs' },
-  { value: 'content-hash', label: 'content-hash' },
-  { value: 'unknown', label: 'unknown' },
-]
+  ...clientList.value.map(c => ({ value: c, label: c })),
+])
 
 const rows = ref<SessionRow[]>([])
 const total = ref(0)
@@ -131,7 +130,7 @@ const page = ref(1)
 const limit = ref(20)
 const offset = ref(0)
 
-// 客户端类型 → el-tag 颜色：open-webui=蓝、x-session-id=深蓝、ywnrs=紫、content-hash=绿、unknown=橙，其余=灰
+// 客户端类型 → el-tag 颜色：open-webui=蓝、x-session-id=深蓝、ywnrs=紫、content-hash=绿、unknown/github=橙，其余=灰
 function clientTag(c: string): 'primary' | 'success' | 'info' | 'warning' | 'danger' {
   switch (c) {
     case 'open-webui':
@@ -143,6 +142,7 @@ function clientTag(c: string): 'primary' | 'success' | 'info' | 'warning' | 'dan
     case 'content-hash':
       return 'success'
     case 'unknown':
+    case 'github':
       return 'warning'
     default:
       return 'info'
@@ -153,6 +153,16 @@ function clientTag(c: string): 'primary' | 'success' | 'info' | 'warning' | 'dan
 function formatTime(ts: number): string {
   if (!ts) return '-'
   return new Date(ts).toLocaleString()
+}
+
+// 拉取客户端列表（GET /admin/api/session-clients）
+async function fetchClients(): Promise<void> {
+  try {
+    const { data } = await api.get<{ clients: string[] }>('/session-clients')
+    clientList.value = data.clients
+  } catch (err: any) {
+    ElMessage.error(`加载客户端列表失败：${err?.response?.data?.error ?? err.message}`)
+  }
 }
 
 // 拉取列表（GET /admin/api/sessions）
@@ -265,7 +275,10 @@ watch([client, keyword], () => {
   }, 300)
 })
 
-onMounted(fetchList)
+onMounted(async () => {
+  await fetchClients()
+  await fetchList()
+})
 </script>
 
 <style scoped>

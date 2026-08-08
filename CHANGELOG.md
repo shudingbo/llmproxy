@@ -2,7 +2,7 @@
 
 本项目所有值得记录的变更都会汇总到本文件。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.5.1] / 2026-08-08
 
 ### 新增
 
@@ -12,10 +12,9 @@
 - **Ollama `POST /api/show` 模型详情端点**：按 Ollama 官方契约实现。请求体 `{ model }`（可选 `verbose`），响应含 `license` / `modelfile` / `parameters` / `template` / `details`（openai 占位）/ `model_info`（`general.architecture: "openai"`，并按别名分组内候选 `max_context_length` 聚合最小值输出 `openai.context_length`）/ `capabilities`（候选配置的并集，无配置为空数组）/ `modified_at`。**不代理上游**：数据全部来自 `downstreamModels` 别名配置。`model` 缺失或非字符串返回 `400 { error: 'invalid_request', field: 'model' }`；别名未配置返回 `404 { error: 'model_not_found' }`
 - **下行端点清单新增 `POST /api/show`**：`DOWNSTREAM_ENDPOINTS` 与 `/admin/api/health` 自动包含新条目
 - **下行候选 `capabilities` 字段**：`UpstreamCandidateSchema` 新增 `capabilities?: z.array(z.string())`（自由字符串，无枚举约束；Ollama 生态常用值：`completion` / `vision` / `tools` / `thinking` / `embedding` / `insert` / `audio` 等，扩展友好）。别名聚合语义：候选并集，按首次出现顺序去重；某别名任一候选配置非空数组即纳入聚合。`GET /api/tags` 在每个模型条目附加 `capabilities`（与 Ollama 较新版本对齐）；`GET /v1/models` 不附加（OpenAI 路径保持纯净，只在有 n_ctx 时附加 `meta`）。管理端 Models 页面每个候选行新增「能力」多选下拉（Element Plus `el-select multiple` + `allow-create`，支持选择 7 个预设能力 + 键入自定义字符串回车添加），保存时只在非空时下发，刷新页面自动回填
-
-## [0.6.0] / 2026-08-07
-
-### 新增
+- **会话键新增 github client 类型**：`session/key.ts` 会话键优先级新增第 3 级——HTTP header `baggage` 存在且其值（转小写后）包含子串 `copilot`（GitHub Copilot 等 client 的标识，典型值如 `vs.copilot.InitiatorType = user`）→ 命中；此时会话键取「第 1 个 assistant 之前」的所有消息（无 assistant 则取全部）的 `[role, content]` 二元组 JSON.stringify 后 sha256，client 标记 `github`。新优先级：`X-OpenWebUI-Chat-Id` → `X-Session-Id` → baggage/copilot → 内容前缀 hash → 轮询兜底
+- **管理端新增 `GET /admin/api/session-clients` 端点**：返回会话粘附库中出现的去重 client 类型（按字母序，空库返回 `[]`）；Sessions 页客户端筛选下拉改为动态获取，不再硬编码 client 枚举
+- **会话键 header 查找性能优化**：`findHeaderValue` 改为一次性规范化「小写 key → 首个值」Map 后 O(1) 查找；顺带移除调试用 console.log 与 printHeaders 参数
 
 - **`POST /v1/embeddings` 文本嵌入透传代理**：OpenAI 兼容下游新增文本嵌入端点。按 `/v1/chat/completions` 非流式模式实现：别名解析 → 轮询起点 → 顺序回退；仅改写 `model` 为上游侧模型名，其余字段原样透传。embeddings 无多轮会话语义，不走会话亲和（不写 sessions 表）。上游 404 视为该上游不支持 embeddings → 可回退（切下一候选），其余 4xx（401/403/400）立即中断；全部失败返回 `502 {"error": "no_upstream"}`
 - **下行端点清单**：`DOWNSTREAM_ENDPOINTS` 与 `/admin/api/health` 新增 `POST /v1/embeddings` 条目（文本嵌入）

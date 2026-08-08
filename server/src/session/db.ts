@@ -3,12 +3,13 @@
 // 会话键格式：${downstreamModel}::${raw}（raw 为 header 值或内容前缀 hash，见 session/key.ts）
 // 清理调度/定时器不属于本模块（由调用方负责）；本模块仅提供按过期时间删除的 cleanup 原语
 import Database from 'better-sqlite3'
+import { SessionClient } from './key.js'
 
 // 一条会话粘附记录（与 sessions 表字段一一对应，字段名与表列保持一致便于直接映射）
 export interface SessionRow {
   session_key: string // 主键：`${downstreamModel}::${raw}`
   session_id: string // 原始会话键值（header 值或内容 hash hex）
-  client: string // 'open-webui' | 'x-session-id' | 'ywnrs' | 'content-hash' | 'unknown'
+  client: string // 'open-webui' | 'x-session-id' | 'ywnrs' | 'github' | 'content-hash' | 'unknown'
   downstream_model: string
   upstream_id: string // 粘附的上游 id
   upstream_model: string // 上游侧模型名
@@ -148,6 +149,11 @@ export class SessionStore {
       .prepare(`SELECT COUNT(*) AS total FROM sessions${whereSql}`)
       .get(...params) as { total: number }
     return { rows, total: countRow.total }
+  }
+
+  // 列出全部 client 去重值（按字母序）；空库返回 []
+  listClients(): SessionClient[] {
+    return Object.values(SessionClient) as SessionClient[];
   }
 
   // 删除单条记录；返回是否删除成功

@@ -10,11 +10,13 @@ flowchart LR
     REQ[请求体 + headers] --> KEY[session/key.ts<br/>extractSessionKey]
     KEY -->|X-OpenWebUI-Chat-Id| K1[raw = header 值<br/>client = open-webui]
     KEY -->|X-Session-Id| K4[raw = header 值<br/>值以 ywnrs 开头 → client = ywnrs<br/>否则 → client = x-session-id]
+    KEY -->|baggage 含 copilot| K5[raw = 第 1 个 assistant 之前消息的 sha256<br/>client = github]
     KEY -->|内容前缀 hash| K2[raw = sha256 hex<br/>client = content-hash]
     KEY -->|都没有| K3[无会话键 → 轮询兜底]
 
     K1 --> JOIN[会话键 = `${downstreamModel}::${raw}`]
     K4 --> JOIN
+    K5 --> JOIN
     K2 --> JOIN
     JOIN --> LB[SessionAffinityLoadBalancer.pick]
     LB -->|命中且在候选| TOUCH[touch 刷新 updated_at<br/>返回粘附上游]
@@ -41,8 +43,9 @@ const ctx = {
 
 1. **header `X-OpenWebUI-Chat-Id`**（大小写不敏感查找，重复 header 取第一个；值 trim 后非空才生效）→ `{ raw: header值, client: 'open-webui' }`
 2. **header `X-Session-Id`**（部分客户端把会话 id 放在这个通用 header；大小写不敏感查找；trim 后非空）→ 值以 `ywnrs` 开头 → `{ raw: header值, client: 'ywnrs' }`；否则 → `{ raw: header值, client: 'x-session-id' }`
-3. **内容前缀 hash**：`body.messages` 为数组且长度 ≥ 1 → 取**前 2 条消息**的 `[role, content]` 二元组做 sha256 → `{ raw: hashHex, client: 'content-hash' }`
-4. 都不满足 → `undefined`（调用方走轮询兜底）
+3. **header `baggage` 含 `copilot`**（GitHub Copilot 等 client 的标识，典型值如 `vs.copilot.InitiatorType = user`）：header 存在且其值（转小写后）包含子串 `copilot` → 取**第 1 个 assistant 之前**的所有消息（无 assistant 则取全部）的 `[role, content]` 二元组 JSON.stringify 后做 sha256 → `{ raw: hashHex, client: 'github' }`
+4. **内容前缀 hash**：`body.messages` 为数组且长度 ≥ 1 → 取**前 2 条消息**的 `[role, content]` 二元组做 sha256 → `{ raw: hashHex, client: 'content-hash' }`
+5. 都不满足 → `undefined`（调用方走轮询兜底）
 
 内容前缀 hash 的稳定规则（`hashContentPrefix`）：
 
@@ -58,6 +61,8 @@ return createHash('sha256').update(JSON.stringify(prefix)).digest('hex')
 
 只序列化 `[role, content]`，**不序列化 id / timestamp 等多余字段**，保证同前缀稳定。
 
+github 分支复用同一序列化规则，但消息窗口不同：取「第 1 个 assistant 之前」的所有消息（无 assistant 则取全部），同样只序列化 `[role, content]`。
+
 ## 3. 粘附存储（`session/db.ts`，SessionStore）
 
 持久化到 `~/llmproxy/llmproxy.db` 的 `sessions` 表（WAL 模式，与日志表共存于同一文件）：
@@ -66,7 +71,7 @@ return createHash('sha256').update(JSON.stringify(prefix)).digest('hex')
 CREATE TABLE IF NOT EXISTS sessions (
   session_key      TEXT PRIMARY KEY,   -- `${downstreamModel}::${raw}`
   session_id       TEXT NOT NULL,      -- 原始会话键值（header 值或 hash hex）
-  client           TEXT NOT NULL,      -- 'open-webui' | 'x-session-id' | 'ywnrs' | 'content-hash' | 'unknown'
+  client           TEXT NOT NULL,      -- 'open-webui' | 'x-session-id' | 'ywnrs' | 'github' | 'content-hash' | 'unknown'
   downstream_model TEXT NOT NULL,
   upstream_id      TEXT NOT NULL,      -- 粘附的上游 id
   upstream_model   TEXT NOT NULL,
@@ -153,6 +158,7 @@ routing: {
 | 端点 | 说明 |
 | --- | --- |
 | `GET /admin/api/sessions` | 分页列表：updated_at 倒序；`client` 精确匹配、`keyword` 模糊匹配 session_id / upstream_id；offset 默认 0，limit 默认 100 上限 500；返回 `{ rows, total }` |
+| `GET /admin/api/session-clients` | 返回会话粘附库中出现的去重 client 类型（按字母序，空库返回 `[]`），供 Sessions 页客户端筛选下拉动态获取 |
 | `DELETE /admin/api/sessions/:sessionKey` | 删除单条（解绑），幂等，不存在也返回 200 `{ deleted: false }` |
 | `DELETE /admin/api/sessions` | 清空整表，返回删除条数 |
 | `POST /admin/api/sessions/cleanup` | 立即手动清理过期会话：保留期从 `routing.sessionAffinity.cleanupMaxAgeMs` 读取（缺省 1 周）；为 0 时跳过（返回 `{ deleted: 0 }`） |
@@ -161,7 +167,7 @@ routing: {
 
 ### 6.2 前端 Sessions 页（`web/src/views/Sessions.vue`）
 
-展示粘附列表（client / 下游模型 / 粘附上游 / 更新时间），支持按 client 筛选、关键字搜索、分页、单条删除 / 全部清空 / 手动清理。
+展示粘附列表（client / 下游模型 / 粘附上游 / 更新时间），支持按 client 筛选、关键字搜索、分页、单条删除 / 全部清空 / 手动清理。client 筛选下拉选项来自 `GET /admin/api/session-clients` 动态获取（不再硬编码枚举）。
 
 ## 7. 行为说明与边界
 

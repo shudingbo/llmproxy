@@ -168,6 +168,21 @@ describe('SessionStore', () => {
     expect(none.total).toBe(0)
   })
 
+  it('listClients：空库返回 []', () => {
+    expect(store.listClients()).toEqual([])
+  })
+
+  it('listClients：按 client 去重且按字母序返回；相同 client 多条只出现一次', () => {
+    store.bind('gpt-4o::chat-1', makeInfo({ client: 'github' }))
+    store.bind('gpt-4o::chat-2', makeInfo({ client: 'open-webui' }))
+    // 相同 client 多条只出现一次
+    store.bind('gpt-4o::chat-3', makeInfo({ client: 'github' }))
+    store.bind('gpt-4o::chat-4', makeInfo({ client: 'content-hash' }))
+    store.bind('gpt-4o::chat-5', makeInfo({ client: 'x-session-id' }))
+
+    expect(store.listClients()).toEqual(['content-hash', 'github', 'open-webui', 'x-session-id'])
+  })
+
   it('delete 存在 → 返回 true 且 get 为 undefined；delete 不存在 → 返回 false', () => {
     const key = 'gpt-4o::chat-uuid-1'
     store.bind(key, makeInfo())

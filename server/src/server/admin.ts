@@ -486,6 +486,16 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     }
   })
 
+  // 会话客户端类型列表：供前端筛选下拉动态获取（不硬编码 client 枚举）
+  app.get('/admin/api/session-clients', (_req: Request, res: Response) => {
+    try {
+      res.json({ clients: sessionStore.listClients() })
+    } catch (err) {
+      getLogger().warn({ err }, '会话客户端列表查询失败')
+      res.status(500).json({ error: 'session_clients_failed' })
+    }
+  })
+
   // 删除单条会话粘附（解绑）：下次请求重新选上游；幂等，不存在也返回 200 { deleted: false }
   app.delete('/admin/api/sessions/:sessionKey', (req: Request, res: Response) => {
     const sessionKey = String(req.params.sessionKey)

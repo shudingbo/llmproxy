@@ -156,6 +156,45 @@ describe('UpstreamCandidateSchema.max_context_length', () => {
   })
 })
 
+describe('UpstreamCandidateSchema.capabilities', () => {
+  it('缺省时为 undefined（不报错，向后兼容）', () => {
+    const result = UpstreamCandidateSchema.safeParse({ upstreamId: 'a', model: 'm1' })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.capabilities).toBeUndefined()
+  })
+
+  it('接受字符串数组（任意值，无枚举约束）', () => {
+    const result = UpstreamCandidateSchema.safeParse({
+      upstreamId: 'a',
+      model: 'm1',
+      capabilities: ['completion', 'vision', 'embedding'],
+    })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.capabilities).toEqual(['completion', 'vision', 'embedding'])
+  })
+
+  it('接受空数组', () => {
+    const result = UpstreamCandidateSchema.safeParse({ upstreamId: 'a', model: 'm1', capabilities: [] })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.capabilities).toEqual([])
+  })
+
+  it('非数组（字符串 / 数字 / 布尔）时拒绝', () => {
+    const base = { upstreamId: 'a', model: 'm1' }
+    expect(UpstreamCandidateSchema.safeParse({ ...base, capabilities: 'completion' }).success).toBe(false)
+    expect(UpstreamCandidateSchema.safeParse({ ...base, capabilities: 42 }).success).toBe(false)
+    expect(UpstreamCandidateSchema.safeParse({ ...base, capabilities: true }).success).toBe(false)
+  })
+
+  it('数组中含非字符串元素时拒绝', () => {
+    const base = { upstreamId: 'a', model: 'm1' }
+    expect(UpstreamCandidateSchema.safeParse({ ...base, capabilities: ['completion', 42] }).success).toBe(false)
+  })
+})
+
 describe('server 配置节（进程级 server 配置：host / port / bodyLimit）', () => {
   it('未指定 server 时 ConfigSchema 仍接受（向上兼容现有配置）', () => {
     const result = ConfigSchema.safeParse(validConfig)

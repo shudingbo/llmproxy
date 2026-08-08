@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import express, { type Express } from 'express'
 import request from 'supertest'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import type { Config } from '../../src/config/schema.js'
 import { ConfigStore } from '../../src/config/store.js'
 import { Router } from '../../src/router/index.js'
 import { RoundRobinLoadBalancer, SessionAffinityLoadBalancer, type SessionStoreLike } from '../../src/router/load-balancer.js'
@@ -30,6 +31,21 @@ const BASE_CONFIG = {
     'gpt-4': [
       { upstreamId: 'u1', model: 'gpt-4-u1' },
       { upstreamId: 'u2', model: 'gpt-4-u2' },
+    ],
+  },
+}
+
+// /api/show 测试专用配置：候选带 capabilities 与 max_context_length
+// （gpt-4 聚合结果：n_ctx = min(8192) = 8192，capabilities 并集 = [completion, vision, embedding]）
+const SHOW_CONFIG: Config = {
+  upstreams: [
+    { id: 'u1', baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'k1', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
+    { id: 'u2', baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'k2', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
+  ],
+  downstreamModels: {
+    'gpt-4': [
+      { upstreamId: 'u1', model: 'gpt-4-u1', max_context_length: 8192, capabilities: ['completion', 'vision'] },
+      { upstreamId: 'u2', model: 'gpt-4-u2', capabilities: ['vision', 'embedding'] },
     ],
   },
 }
@@ -422,11 +438,83 @@ describe('Ollama 下游服务', () => {
     expect(attempts).toHaveLength(0)
   })
 
-  it('未实现的路由（/api/show）返回 404', async () => {
-    const res = await request(app).post('/api/show').send({ model: 'gpt-4' })
+  it('未实现的路由（/api/generate）返回 404', async () => {
+    const res = await request(app).post('/api/generate').send({ model: 'gpt-4' })
     // 未注册路由 → Express 默认 404（不落入本模块的任何处理器）
     expect(res.status).toBe(404)
     expect(attempts).toHaveLength(0)
+  })
+})
+
+describe('POST /api/show 模型详情', () => {
+  it('200 返回聚合的 capabilities 并集与 context_length', async () => {
+    // 切换到带 capabilities / max_context_length 的配置（经 ConfigStore.set 走 schema 校验）
+    store.set(SHOW_CONFIG, { source: 'admin' })
+    const res = await request(app).post('/api/show').send({ model: 'gpt-4' })
+    expect(res.status).toBe(200)
+    const body = res.body as {
+      license?: string
+      modelfile?: string
+      parameters?: string
+      template?: string
+      capabilities?: string[]
+      model_info?: { 'general.architecture'?: string; 'openai.context_length'?: number }
+      details?: { format?: string; family?: string; families?: string[]; parameter_size?: string; quantization_level?: string }
+      modified_at?: string
+    }
+    // capabilities：候选 1 [completion, vision] ∪ 候选 2 [vision, embedding] = 并集去重保序
+    expect(body.capabilities).toEqual(['completion', 'vision', 'embedding'])
+    // context_length：有限正整数聚合值；general.architecture 固定 openai
+    expect(body.model_info).toEqual({ 'general.architecture': 'openai', 'openai.context_length': 8192 })
+    // details 占位结构
+    expect(body.details).toEqual({
+      format: 'openai',
+      family: 'openai',
+      families: [],
+      parameter_size: '',
+      quantization_level: '',
+    })
+    // 占位字段 + 当前时刻 ISO 时间
+    expect(body.license).toBe('')
+    expect(body.modelfile).toBe('')
+    expect(body.parameters).toBe('')
+    expect(body.template).toBe('')
+    expect(typeof body.modified_at).toBe('string')
+    expect(new Date(body.modified_at!).getTime()).not.toBeNaN()
+  })
+
+  it('200 未配置 capabilities 与 context_length 时返回空数组并省略 context_length', async () => {
+    // BASE_CONFIG 的 gpt-4 候选既无 capabilities 也无 max_context_length
+    const res = await request(app).post('/api/show').send({ model: 'gpt-4' })
+    expect(res.status).toBe(200)
+    const body = res.body as { capabilities?: string[]; model_info?: Record<string, unknown> }
+    expect(body.capabilities).toEqual([])
+    expect(body.model_info).toEqual({ 'general.architecture': 'openai' })
+    expect(body.model_info).not.toHaveProperty('openai.context_length')
+  })
+
+  it('404 未知模型别名', async () => {
+    const res = await request(app).post('/api/show').send({ model: 'nope' })
+    expect(res.status).toBe(404)
+    expect(res.body as { error?: string }).toEqual({ error: 'model_not_found' })
+  })
+
+  it('400 body.model 缺失', async () => {
+    const res = await request(app).post('/api/show').send({})
+    expect(res.status).toBe(400)
+    expect(res.body as { error?: string; field?: string }).toEqual({ error: 'invalid_request', field: 'model' })
+  })
+
+  it('400 body.model 非字符串', async () => {
+    const res = await request(app).post('/api/show').send({ model: 42 })
+    expect(res.status).toBe(400)
+    expect(res.body as { error?: string; field?: string }).toEqual({ error: 'invalid_request', field: 'model' })
+  })
+
+  it('400 无请求体', async () => {
+    const res = await request(app).post('/api/show')
+    expect(res.status).toBe(400)
+    expect(res.body as { error?: string; field?: string }).toEqual({ error: 'invalid_request', field: 'model' })
   })
 })
 

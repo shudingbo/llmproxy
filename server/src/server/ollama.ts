@@ -1,7 +1,7 @@
-// Ollama 兼容下游的 HTTP 服务模块：/api/tags 与 /api/chat
+// Ollama 兼容下游的 HTTP 服务模块：/api/tags、/api/chat 与 /api/show
 // 职责：模型列表（返回下游别名）、非流式/流式转发（OpenAI 上游 → Ollama 响应形状）、顺序回退、尝试计数
 // 请求体由装配层（T19）注入 express.json 解析；本模块不做体校验，一律转发给 T13 转换器
-// 只实现 /api/chat 与 /api/tags；/api/show、/api/generate、/api/embed、/api/create 明确不实现
+// 只实现 /api/tags、/api/chat 与 /api/show；/api/generate、/api/embed、/api/create 明确不实现
 import type { Express, Request, Response } from 'express'
 import type { Readable, Writable } from 'node:stream'
 import type { ConfigStore } from '../config/store.js'
@@ -16,6 +16,7 @@ import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
 import { extractSessionKey } from '../session/key.js'
 import type { OpenAIUpstreamClient, UpstreamChatRequest } from '../upstream/openai.js'
 import { buildAliasMetaMap } from './model-meta.js'
+import { registerOllamaShowRoute } from './ollama-show.js'
 
 // 依赖注入集合：由装配层（T19）构造后传入，形状与 openai.ts（T12）保持一致
 export interface OllamaDeps {
@@ -40,6 +41,7 @@ interface StreamSuccess {
  * 注册 Ollama 兼容下游路由（挂到传入的 Express 应用上）：
  * - GET /api/tags：返回下游别名列表（downstreamModels 的 key，转成 Ollama 形状）
  * - POST /api/chat：非流式/流式转发（OpenAI 上游 → Ollama 响应形状）+ 顺序回退
+ * - POST /api/show：模型详情（由别名配置聚合，见 ollama-show.ts）
  */
 export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
   const { store, getUpstreamClient, loadBalancer, onAttempt } = deps
@@ -234,6 +236,10 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
     const converted = convertModelsList({ data }, buildAliasMetaMap(config))
     res.json(converted)
   })
+
+  // 模型详情：数据来自下游别名配置（capabilities / max_context_length 聚合），不代理上游；
+  // 独立模块 ollama-show.ts 负责，本处仅注入 store
+  registerOllamaShowRoute(app, { store })
 
   // 聊天：非流式与流式两条路径，共用回退逻辑；n > 1 先于一切检查拒绝
   app.post('/api/chat', async (req: Request, res: Response) => {

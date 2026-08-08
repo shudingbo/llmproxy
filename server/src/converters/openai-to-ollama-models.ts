@@ -20,11 +20,13 @@ const PLACEHOLDER_MODIFIED_AT = '2026-01-01T00:00:00Z'
 /**
  * 把 OpenAI 模型列表转换为 Ollama /api/tags 响应结构。
  * name/model 复用 OpenAI 的 id；其余字段为占位 stub（不发起任何上游请求）。
- * metaById：别名 → 聚合上下文映射；条目命中时附加 meta 字段，未命中/不传时输出与原来一致
+ * metaById：别名 → 聚合元数据映射（n_ctx / capabilities 均可选）；
+ * 条目命中时：n_ctx 存在 → 附加 meta: { n_ctx }；capabilities 非空数组 → 附加 capabilities 字段；
+ * 未命中/不传时输出与原来一致
  */
 export function convertModelsList(
   openaiResp: OpenAIModelsResponse,
-  metaById?: Readonly<Record<string, { n_ctx: number }>>,
+  metaById?: Readonly<Record<string, { n_ctx?: number; capabilities?: string[] }>>,
 ): OllamaTagsResponse {
   const models: OllamaModel[] = openaiResp.data.map((entry) => {
     const model: OllamaModel = {
@@ -39,7 +41,14 @@ export function convertModelsList(
     }
     const meta = metaById?.[entry.id]
     if (meta !== undefined) {
-      model.meta = meta
+      // n_ctx 单独拆分（仅有限正整数，兼容旧 meta 形状）
+      if (meta.n_ctx !== undefined) {
+        model.meta = { n_ctx: meta.n_ctx }
+      }
+      // capabilities 仅注入非空数组；空数组/未配置则省略字段
+      if (meta.capabilities !== undefined && meta.capabilities.length > 0) {
+        model.capabilities = meta.capabilities
+      }
     }
     return model
   })

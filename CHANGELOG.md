@@ -9,6 +9,9 @@
 - **POST /rerank 与 /v1/rerank 重排序透传代理**：OpenAI 兼容下游新增文本重排序端点（`/v1/rerank` 为 `/rerank` 的同义路径，两路径共享同一 handler）。按 `/v1/embeddings` 模式实现：别名解析 → 轮询起点 → 顺序回退；仅改写 model 为上游侧模型名，其余字段原样透传；不走会话亲和（不写 sessions 表）；上游 404 视为不支持 → 可回退，其余 4xx 立即中断；全部失败返回 502 no_upstream。JSON body 上限由 server.bodyLimit 配置，见下条
 - **下行端点清单**：DOWNSTREAM_ENDPOINTS 与 /admin/api/health 新增 POST /rerank 与 POST /v1/rerank 条目
 - **server.bodyLimit 可配置 JSON body 上限**：server{} 节新增 bodyLimit（缺省 '10mb'，支持 '10mb' 字符串或数字字节数），全局生效（所有接口共用）；进程级配置，修改后需重启；非法 limit 值（如 'abc'）会导致启动失败；ServerListenSchema 更名为 ServerConfigSchema
+- **Ollama `POST /api/show` 模型详情端点**：按 Ollama 官方契约实现。请求体 `{ model }`（可选 `verbose`），响应含 `license` / `modelfile` / `parameters` / `template` / `details`（openai 占位）/ `model_info`（`general.architecture: "openai"`，并按别名分组内候选 `max_context_length` 聚合最小值输出 `openai.context_length`）/ `capabilities`（候选配置的并集，无配置为空数组）/ `modified_at`。**不代理上游**：数据全部来自 `downstreamModels` 别名配置。`model` 缺失或非字符串返回 `400 { error: 'invalid_request', field: 'model' }`；别名未配置返回 `404 { error: 'model_not_found' }`
+- **下行端点清单新增 `POST /api/show`**：`DOWNSTREAM_ENDPOINTS` 与 `/admin/api/health` 自动包含新条目
+- **下行候选 `capabilities` 字段**：`UpstreamCandidateSchema` 新增 `capabilities?: z.array(z.string())`（自由字符串，无枚举约束；Ollama 生态常用值：`completion` / `vision` / `tools` / `thinking` / `embedding` / `insert` / `audio` 等，扩展友好）。别名聚合语义：候选并集，按首次出现顺序去重；某别名任一候选配置非空数组即纳入聚合。`GET /api/tags` 在每个模型条目附加 `capabilities`（与 Ollama 较新版本对齐）；`GET /v1/models` 不附加（OpenAI 路径保持纯净，只在有 n_ctx 时附加 `meta`）。管理端 Models 页面每个候选行新增「能力」多选下拉（Element Plus `el-select multiple` + `allow-create`，支持选择 7 个预设能力 + 键入自定义字符串回车添加），保存时只在非空时下发，刷新页面自动回填
 
 ## [0.6.0] / 2026-08-07
 

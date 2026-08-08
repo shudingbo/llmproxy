@@ -32,11 +32,15 @@ export const UpstreamSchema = z.object({
  * - max_context_length：该上游上跑该模型时的最大上下文；
  *   可经管理端自动探测或手动设置；显式 null 表示清空，缺省即未设置
  *   （同一上游跑不同模型时各自独立，配置粒度对齐到候选而非上游）
+ * - capabilities：该候选对外宣称的能力集合（任意字符串，无枚举约束，兼容 Ollama 生态扩展）；
+ *   常用约定值：completion（文本补全）/ vision（图像输入）/ embedding（向量化）/
+ *   tools（工具调用）/ reasoning（推理）等；别名聚合时取各候选并集，缺省即未设置
  */
 export const UpstreamCandidateSchema = z.object({
   upstreamId: z.string(),
   model: z.string(),
   max_context_length: z.number().int().positive().nullable().optional(),
+  capabilities: z.array(z.string()).optional(),
 })
 
 /**

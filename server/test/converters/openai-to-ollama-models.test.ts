@@ -78,4 +78,39 @@ describe('convertModelsList', () => {
     const result = convertModelsList({ data: [{ id: 'gpt-4', object: 'model' }] })
     expect(result.models[0]).not.toHaveProperty('meta')
   })
+
+  it('传入 metaById 且带 capabilities 时条目附加 capabilities 字段（与 meta 并存）', () => {
+    const result = convertModelsList(
+      { data: [{ id: 'gpt-4', object: 'model' }] },
+      { 'gpt-4': { n_ctx: 8192, capabilities: ['completion', 'vision'] } },
+    )
+    expect(result.models[0]).toMatchObject({
+      meta: { n_ctx: 8192 },
+      capabilities: ['completion', 'vision'],
+    })
+  })
+
+  it('metaById 中 capabilities 为空数组时条目不带 capabilities 字段', () => {
+    const result = convertModelsList(
+      { data: [{ id: 'gpt-4', object: 'model' }] },
+      { 'gpt-4': { capabilities: [] } },
+    )
+    expect(result.models[0]).not.toHaveProperty('capabilities')
+    expect(result.models[0]).not.toHaveProperty('meta')
+  })
+
+  it('metaById 中仅含 capabilities 无 n_ctx 时条目带 capabilities 但不带 meta', () => {
+    const result = convertModelsList(
+      { data: [{ id: 'gpt-4', object: 'model' }] },
+      { 'gpt-4': { capabilities: ['completion'] } },
+    )
+    expect(result.models[0]).toMatchObject({ capabilities: ['completion'] })
+    expect(result.models[0]).not.toHaveProperty('meta')
+  })
+
+  it('metaById 中 capabilities 未定义时条目不带 capabilities 字段（n_ctx 行为不变）', () => {
+    const result = convertModelsList({ data: [{ id: 'gpt-4', object: 'model' }] }, { 'gpt-4': { n_ctx: 8192 } })
+    expect(result.models[0]).toMatchObject({ meta: { n_ctx: 8192 } })
+    expect(result.models[0]).not.toHaveProperty('capabilities')
+  })
 })

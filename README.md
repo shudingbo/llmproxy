@@ -156,6 +156,7 @@ Schema reference — see `server/src/config/schema.ts` for the authoritative Zod
 | `downstreamModels[alias][].upstreamId` | string | must match an `upstreams[].id` |
 | `downstreamModels[alias][].model` | string | model name used on the upstream side |
 | `downstreamModels[alias][].max_context_length` | number \| null | max context for that candidate (upstream × model); optional; admin UI can auto-detect from llama.cpp / LM Studio. Same upstream may host different models, each with its own n_ctx |
+| `downstreamModels[alias][].capabilities` | string[] | optional list of capability strings this candidate advertises (Ollama ecosystem convention: `completion` / `vision` / `tools` / `thinking` / `embedding` / `insert` / `audio` / `reasoning` / ...). Free-form strings accepted (no enum); surfaced via Ollama `POST /api/show` (`capabilities`) and `GET /api/tags` (`capabilities` per model) as the set union across the alias's candidates. Managed via the Models page UI (multi-select with allow-create) |
 | `routing` | object (optional) | routing behavior config, currently session affinity |
 | `routing.sessionAffinity` | object | session-affinity routing; omitted = defaults |
 | `routing.sessionAffinity.enabled` | boolean | master switch, default `true` |
@@ -334,7 +335,7 @@ const res = await ollama.chat({
 })
 ```
 
-> 限制：网关只实现了 Ollama 的 `/api/chat`、`/api/tags` 与 `/api/version`；`/api/generate`、`/api/embed`、`/api/show` 等未实现。`n > 1` 在 `/api/chat` 上会被拒绝（400）。
+> 限制：网关只实现了 Ollama 的 `/api/chat`、`/api/tags`、`/api/version` 与 `/api/show`；`/api/generate`、`/api/embed`、`/api/create` 等未实现。`n > 1` 在 `/api/chat` 上会被拒绝（400）。`/api/show` 数据来自下游别名配置（不代理上游）：返回 `capabilities`（候选配置并集）、`model_info.openai.context_length`（候选 `max_context_length` 聚合最小值）、`details`（openai 占位）等；缺失 `model` 字段返回 `400 invalid_request`，未知别名返回 `404 model_not_found`。
 
 #### 流式调用 Streaming
 
@@ -455,7 +456,8 @@ All routes are served on the single port (default `3000`).
 | `POST /v1/rerank` | ✅ | OpenAI 兼容重排序（rerank）；与 /rerank 等价，请求体 { model, query, documents, top_n? }，上游响应原样回写 |
 | `GET /v1/models` | ✅ | OpenAI-compatible model list (returns downstream model aliases) |
 | `POST /api/chat` | ✅ | Ollama-compatible chat; request/response converted to/from the OpenAI upstream format; NDJSON streaming |
-| `GET /api/tags` | ✅ | Ollama-compatible model list |
+| `GET /api/tags` | ✅ | Ollama-compatible model list (per-alias `capabilities` injected from candidate config) |
+| `POST /api/show` | ✅ | Ollama-compatible model details; data sourced from downstream alias config (no upstream proxy); returns aggregated `capabilities` + `model_info.openai.context_length` + `details` |
 | `GET /api/version` | ✅ | Ollama-compatible version probe (returns `0.5.12`) |
 | `GET /admin/api/health` | ✅ | health check |
 | `GET /admin/api/stats` | ✅ | per-alias attempt counters (60s snapshot) |

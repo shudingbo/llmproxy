@@ -25,6 +25,7 @@ export const DOWNSTREAM_ENDPOINTS: ReadonlyArray<DownstreamEndpoint> = [
   // Ollama 兼容下游
   { type: 'ollama', method: 'GET', path: '/api/tags', summary: '聚合后的 Ollama 模型列表' },
   { type: 'ollama', method: 'POST', path: '/api/chat', summary: 'Ollama 聊天接口（NDJSON 流 / JSON 非流）' },
+  { type: 'ollama', method: 'POST', path: '/api/show', summary: '查询模型详情（capabilities、context_length 等）' },
   { type: 'ollama', method: 'POST', path: '/api/version', summary: 'Ollama 版本查询' },
   // 管理端
   { type: 'admin', method: 'GET', path: '/admin/api/health', summary: '健康检查（upstreams / downstreams）' },

@@ -47,6 +47,20 @@
                     clearable
                     placeholder="Max Context"
                   />
+                  <el-select
+                    v-model="element.capabilities"
+                    class="caps-select"
+                    multiple
+                    collapse-tags
+                    collapse-tags-tooltip
+                    filterable
+                    allow-create
+                    default-first-option
+                    clearable
+                    placeholder="能力"
+                  >
+                    <el-option v-for="cap in CAPABILITY_OPTIONS" :key="cap" :label="cap" :value="cap" />
+                  </el-select>
                   <el-button
                     size="small"
                     :loading="probingKey === element._key"
@@ -91,6 +105,7 @@ interface Candidate {
   upstreamId: string
   model: string
   max_context_length?: number | null
+  capabilities?: string[]
 }
 
 // 上游信息（管理端接口返回的 apiKey 已脱敏）
@@ -104,6 +119,9 @@ interface Upstream {
 
 // 别名 → 有序候选列表（按顺序尝试、失败切换下一个）
 type DownstreamModels = Record<string, Candidate[]>
+
+// Ollama 风格能力选项
+const CAPABILITY_OPTIONS = ['completion', 'tools', 'vision', 'thinking', 'embedding', 'insert', 'audio']
 
 // 候选自增序号：为每个候选生成稳定且唯一的 key
 let seq = 0
@@ -175,6 +193,7 @@ function addCandidate(alias: string) {
     upstreamId: upstreams.value[0]?.id ?? '',
     model: '',
     max_context_length: null,
+    capabilities: [],
   })
 }
 
@@ -211,6 +230,9 @@ async function save() {
         const row: Record<string, unknown> = { upstreamId: c.upstreamId, model: c.model }
         if (typeof c.max_context_length === 'number') {
           row.max_context_length = c.max_context_length
+        }
+        if (c.capabilities && c.capabilities.length > 0) {
+          row.capabilities = c.capabilities
         }
         return row
       })
@@ -305,6 +327,11 @@ onMounted(load)
 
 .candidate-row .nctx-input {
   width: 160px;
+  flex-shrink: 0;
+}
+
+.candidate-row .caps-select {
+  width: 220px;
   flex-shrink: 0;
 }
 

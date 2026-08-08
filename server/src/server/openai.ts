@@ -566,9 +566,10 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
         object: 'model',
         owned_by: 'llmproxy',
       }
-      const meta: { n_ctx: number } | undefined = metaMap[id]
-      if (meta !== undefined) {
-        entry.meta = meta
+      const meta = metaMap[id]
+      // 仅当别名能聚合出 n_ctx 时附加 meta（capabilities 属 Ollama 侧字段，/v1/models 不输出）
+      if (meta !== undefined && meta.n_ctx !== undefined) {
+        entry.meta = { n_ctx: meta.n_ctx }
       }
       return entry
     })

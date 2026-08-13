@@ -157,3 +157,48 @@ export function extractSessionKey(
 
   return undefined
 }
+
+// 转发给上游时剔除的头：客户端鉴权头（绝不转发，上游鉴权只来自配置 apiKey）
+// 与 hop-by-hop / 传输层头（由 axios/Node 自己生成，原样转发会重复或冲突）
+const FORWARD_EXCLUDED_HEADERS = [
+  'authorization',
+  'x-api-key',
+  'host',
+  'content-length',
+  'content-type',
+  'accept',
+  'accept-encoding',
+  'connection',
+  'keep-alive',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+  'proxy-authenticate',
+  'proxy-authorization',
+] as const
+
+/**
+ * 构造透传给上游的请求头：
+ * - 原始请求的自带头（剔除黑名单后）原样转发
+ * - 原始请求没有 x-session-id 且能提取出会话键 → 用 extractSessionKey 计算出的
+ *   sessionId 作为 x-session-id 补充（仅在原始缺失时添加，绝不覆盖客户端显式值）
+ * - 两者皆无 → undefined（不添加会话头）
+ */
+export function buildUpstreamSessionHeaders(
+  req: Request,
+  session: SessionKeyResult | undefined,
+): Record<string, string> | undefined {
+  const header = normalizeHeaders(req)
+  const rawHeader = findHeaderValue(header, 'x-session-id')
+  if (rawHeader === undefined || rawHeader.trim() === '') {
+    if (session === undefined) {
+      return undefined
+    }
+    header.set('x-session-id', session.raw)
+  }
+  for (const name of FORWARD_EXCLUDED_HEADERS) {
+    header.delete(name)
+  }
+  return Object.fromEntries(header) as Record<string, string>
+}

@@ -111,6 +111,14 @@ export interface UpstreamStreamResult {
   connectError: Promise<Error | null>
 }
 
+// 上游请求公共选项：signal 中止 + 附加请求头（当前用于会话头 x-session-id 透传）。
+// headers 仅作附加：展开在鉴权头之前，绝不允许覆盖配置的 Authorization / Content-Type
+export interface UpstreamRequestOptions {
+  signal?: AbortSignal
+  includeUsage?: boolean
+  headers?: Record<string, string>
+}
+
 // 构造参数（baseUrl 形如 https://api.openai.com/v1）
 export interface OpenAIUpstreamClientOptions {
   baseUrl: string
@@ -139,20 +147,26 @@ export class OpenAIUpstreamClient {
     method: 'GET' | 'POST',
     path: string,
     body?: unknown,
-    options: { signal?: AbortSignal; stream?: boolean; timeout?: number } = {},
+    options: { signal?: AbortSignal; stream?: boolean; timeout?: number; headers?: Record<string, string> } = {},
   ): Promise<T> {
     const config: AxiosRequestConfig = {
       method,
       url: `${this.baseUrl}${path}`,
-      // 鉴权头只来自配置，绝不接受调用方传入的 Authorization
+      // 鉴权头只来自配置，绝不接受调用方传入的 Authorization；
+      // 附加头（如 x-session-id）展开在鉴权头之前，保证 Authorization / Content-Type 不可被覆盖
       headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        'Content-Type': 'application/json',
+        authorization: `Bearer ${this.apiKey}`,
+        'content-type': 'application/json',        
+        ...options.headers,
+        // Authorization: `Bearer ${this.apiKey}`,
+        // 'Content-Type': 'application/json',
+
       },
       // 未显式传 timeout 时沿用默认值，probe 等场景可单独覆盖
       timeout: options.timeout ?? this.timeoutMs,
       signal: options.signal,
     }
+    console.log('--config headers', config.headers, Object.keys(body as any), body?.stream_options)
     if (body !== undefined) {
       config.data = body
     }
@@ -174,7 +188,7 @@ export class OpenAIUpstreamClient {
   /** 非流式聊天补全：req.stream 为 true 时直接报错（应改用 chatCompletionStream） */
   async chatCompletion(
     req: UpstreamChatRequest,
-    options: { signal?: AbortSignal; includeUsage?: boolean } = {},
+    options: UpstreamRequestOptions = {},
   ): Promise<UpstreamChatResponse> {
     if (req.stream === true) {
       throw new Error('chatCompletion 不接受流式请求，请改用 chatCompletionStream')
@@ -183,33 +197,36 @@ export class OpenAIUpstreamClient {
     const body = { ...req, stream: false }
     return this.request<UpstreamChatResponse>('POST', '/chat/completions', body, {
       signal: options.signal,
+      headers: options.headers,
     })
   }
 
   /** 文本嵌入：embeddings 协议无 stream，请求体原样透传（模型名改写由路由层负责），不做任何强制改写 */
   async createEmbedding(
     req: UpstreamEmbeddingsRequest,
-    options: { signal?: AbortSignal } = {},
+    options: UpstreamRequestOptions = {},
   ): Promise<UpstreamEmbeddingsResponse> {
     return this.request<UpstreamEmbeddingsResponse>('POST', '/embeddings', req, {
       signal: options.signal,
+      headers: options.headers,
     })
   }
 
   /** 文本重排序：rerank 协议无 stream，请求体原样透传（模型名改写由路由层负责），不做任何强制改写 */
   async rerank(
     req: UpstreamRerankRequest,
-    options: { signal?: AbortSignal } = {},
+    options: UpstreamRequestOptions = {},
   ): Promise<UpstreamRerankResponse> {
     return this.request<UpstreamRerankResponse>('POST', '/rerank', req, {
       signal: options.signal,
+      headers: options.headers,
     })
   }
 
   /** 流式聊天补全：返回 SSE 响应流与 abort 函数（同步返回，请求在后台发起） */
   chatCompletionStream(
     req: UpstreamChatRequest,
-    options: { signal?: AbortSignal; includeUsage?: boolean } = {},
+    options: UpstreamRequestOptions = {},
   ): UpstreamStreamResult {
     return this.streamRequest('/chat/completions', req, options)
   }
@@ -217,20 +234,23 @@ export class OpenAIUpstreamClient {
   /** 非流式 Responses 调用：req.stream 为 true 时直接报错（应改用 responsesCompletionStream） */
   async responsesCompletion(
     req: UpstreamResponsesRequest,
-    options: { signal?: AbortSignal } = {},
+    options: UpstreamRequestOptions = {},
   ): Promise<unknown> {
     if (req.stream === true) {
       throw new Error('responsesCompletion 不接受流式请求，请改用 responsesCompletionStream')
     }
     // 拷贝请求体并强制关闭流式，确保走非流分支
     const body = { ...req, stream: false }
-    return this.request<unknown>('POST', '/responses', body, { signal: options.signal })
+    return this.request<unknown>('POST', '/responses', body, {
+      signal: options.signal,
+      headers: options.headers,
+    })
   }
 
   /** 流式 Responses 调用：返回 SSE 响应流与 abort 函数（同步返回，请求在后台发起） */
   responsesCompletionStream(
     req: UpstreamResponsesRequest,
-    options: { signal?: AbortSignal; includeUsage?: boolean } = {},
+    options: UpstreamRequestOptions = {},
   ): UpstreamStreamResult {
     return this.streamRequest('/responses', req, options)
   }
@@ -243,7 +263,7 @@ export class OpenAIUpstreamClient {
   private streamRequest(
     path: string,
     req: UpstreamStreamRequest,
-    options: { signal?: AbortSignal; includeUsage?: boolean } = {},
+    options: UpstreamRequestOptions = {},
   ): UpstreamStreamResult {
     // 拷贝请求体并强制开启流式
     const body: UpstreamStreamRequest = { ...req, stream: true }
@@ -303,6 +323,7 @@ export class OpenAIUpstreamClient {
     this.request<Readable>('POST', path, body, {
       signal: controller.signal,
       stream: true,
+      headers: options.headers,
     })
       .then((source) => {
         // 收到 2xx 响应：连接成功，通知调用方

@@ -878,3 +878,52 @@ describe('OpenAIUpstreamClient rerank', () => {
     })
   })
 })
+
+describe('OpenAIUpstreamClient 附加请求头', () => {
+  it('options.headers 原样透传到上游请求', async () => {
+    let capturedHeaders: Record<string, string | string[] | undefined> | undefined
+    await startMock(async (req, res) => {
+      capturedHeaders = req.headers
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'x', choices: [] }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await client.chatCompletion({ model: 'gpt-4', messages: [] }, { headers: { 'x-session-id': 'sess-1' } })
+    expect(capturedHeaders?.['x-session-id']).toBe('sess-1')
+  })
+
+  it('附加头不能覆盖配置的 Authorization / Content-Type', async () => {
+    let capturedHeaders: Record<string, string | string[] | undefined> | undefined
+    await startMock(async (req, res) => {
+      capturedHeaders = req.headers
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'x', choices: [] }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    // 恶意附加同名字段：鉴权头仍以配置为准
+    await client.chatCompletion(
+      { model: 'gpt-4', messages: [] },
+      { headers: { Authorization: 'Bearer evil', 'Content-Type': 'text/plain', 'x-session-id': 'sess-2' } },
+    )
+    expect(capturedHeaders?.authorization).toBe('Bearer sk-test')
+    expect(capturedHeaders?.['content-type']).toContain('application/json')
+    expect(capturedHeaders?.['x-session-id']).toBe('sess-2')
+  })
+
+  it('流式 chatCompletionStream 同样透传 headers', async () => {
+    let capturedHeaders: Record<string, string | string[] | undefined> | undefined
+    await startMock(async (req, res) => {
+      capturedHeaders = req.headers
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write('data: {"id":"x","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\n\n')
+      res.end('data: [DONE]\n\n')
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    const { stream } = client.chatCompletionStream(
+      { model: 'gpt-4', messages: [], stream: true },
+      { headers: { 'x-session-id': 'sess-3' } },
+    )
+    await drain(stream)
+    expect(capturedHeaders?.['x-session-id']).toBe('sess-3')
+  })
+})

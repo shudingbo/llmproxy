@@ -12,7 +12,7 @@ import { ModelNotFoundError } from '../router/errors.js'
 import { executeWithFallback, isFallbackableAxiosError } from '../router/fallback.js'
 import { Router } from '../router/index.js'
 import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
-import { extractSessionKey } from '../session/key.js'
+import { buildUpstreamSessionHeaders, extractSessionKey } from '../session/key.js'
 import type {
   OpenAIUpstreamClient,
   UpstreamChatRequest,
@@ -104,6 +104,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     // 提取会话键（header X-OpenWebUI-Chat-Id 优先，缺省内容前缀 hash）：
     // 有会话键 → 会话亲和路由粘附同一上游；无 → ctx 缺省 sessionKey，走轮询兜底
     const session = extractSessionKey(req, body)
+    // 透传给上游的会话头：原始请求带 x-session-id 则原样转发，否则用计算出的 sessionId 补充
+    const sessionHeaders = buildUpstreamSessionHeaders(req, session)
     const ctx = {
       downstreamModel: model,
       sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
@@ -125,7 +127,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
         body.model = candidate.model
         body.stream = false
         try {
-          const data = await client.chatCompletion(body as UpstreamChatRequest, { signal })
+          const data = await client.chatCompletion(body as UpstreamChatRequest, { signal, headers: sessionHeaders })
           reportAttempt(candidate.upstreamId, true, attemptStart, 200)
           return { ok: true, value: { status: 200, headers: {}, data } }
         } catch (err) {
@@ -161,6 +163,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
   ): Promise<void> => {
     const candidates = buildRouter().resolve(model)
     const session = extractSessionKey(req, body)
+    // 透传给上游的会话头：原始请求带 x-session-id 则原样转发，否则用计算出的 sessionId 补充
+    const sessionHeaders = buildUpstreamSessionHeaders(req, session)
     const ctx = {
       downstreamModel: model,
       sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
@@ -180,10 +184,14 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
         // 改写请求体：模型名换成上游侧名称，强制流式（includeUsage 让上游补发 usage 块）
         body.model = candidate.model
         body.stream = true
+
+        console.log('--sessionHeaders', sessionHeaders, req.headers)
+
         try {
           const { stream, abort, connectError } = client.chatCompletionStream(body as UpstreamChatRequest, {
             signal,
             includeUsage: true,
+            headers: sessionHeaders,
           })
           // 等待连接阶段结果：成功（null）→ 把流交给调用方；失败（Error）→ 可回退下一个候选
           // 必须 await：axios 流式调用是后台 promise，try/catch 抓不到它的 reject
@@ -253,6 +261,10 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     // 无 header 时用归一化后的内容前缀 hash——与 chat 的「messages 前 2 条」语义一致
     // （responses 前 2 条 = instructions + 首条 input），跨协议同内容可匹配同一会话
     const session = extractSessionKey(req, { messages: responsesToChatMessages(body as ResponsesRequest) })
+    // 透传给上游的会话头：原始请求带 x-session-id 则原样转发，否则用计算出的 sessionId 补充
+    const sessionHeaders = buildUpstreamSessionHeaders(req, session)
+
+    console.log('--sessionHeaders', sessionHeaders)
     const ctx = {
       downstreamModel: model,
       sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
@@ -281,7 +293,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
             try {
               const { stream, abort, connectError } = client.responsesCompletionStream(
                 { ...body, model: candidate.model, stream: true } as UpstreamResponsesRequest,
-                { signal },
+                { signal, headers: sessionHeaders },
               )
               // 等待连接阶段结果：成功（null）→ 把流交给调用方；失败（Error）→ 可回退下一个候选
               // 必须 await：axios 流式调用是后台 promise，try/catch 抓不到它的 reject
@@ -318,6 +330,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
             const { stream, abort, connectError } = client.chatCompletionStream(chatReq, {
               signal,
               includeUsage: true,
+              headers: sessionHeaders,
             })
             // 等待连接阶段结果：成功（null）→ 把流交给调用方；失败（Error）→ 可回退下一个候选
             // 必须 await：axios 流式调用是后台 promise，try/catch 抓不到它的 reject
@@ -393,7 +406,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
           try {
             const data = await client.responsesCompletion(
               { ...body, model: candidate.model, stream: false } as UpstreamResponsesRequest,
-              { signal },
+              { signal, headers: sessionHeaders },
             )
             reportAttempt(candidate.upstreamId, true, attemptStart, 200)
             return { ok: true, value: { status: 200, headers: {}, data } }
@@ -412,7 +425,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
         chatReq.model = candidate.model
         chatReq.stream = false
         try {
-          const data = await client.chatCompletion(chatReq, { signal })
+          const data = await client.chatCompletion(chatReq, { signal, headers: sessionHeaders })
           // chat 响应 → responses 响应对象（model 用下游别名，与 /v1/chat/completions 一致）
           const responsesBody = chatResponseToResponses(data, model)
           reportAttempt(candidate.upstreamId, true, attemptStart, 200)
@@ -583,6 +596,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       const body = req.body as Record<string, unknown>
       const model = typeof body.model === 'string' ? body.model : ''
       const signal = createRequestSignal(res)
+      console.log('--body orgi', Object.keys(body), req.headers)
+
       if (body.stream === true) {
         await handleStream(req, res, body, model, signal)
         return

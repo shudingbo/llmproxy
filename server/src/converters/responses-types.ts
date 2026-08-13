@@ -30,6 +30,10 @@ export interface ResponsesRequest {
   temperature?: number
   // 可选，透传（或忽略）
   include?: string[]
+  // 工具列表（扁平 function 结构），转换时保持顺序并包装为 chat 嵌套形状
+  tools?: unknown[]
+  // 工具选择：字符串（auto/none/required）或 { type: 'function', name } 对象
+  tool_choice?: unknown
   [key: string]: unknown
 }
 

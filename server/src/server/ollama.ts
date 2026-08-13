@@ -13,7 +13,7 @@ import { ModelNotFoundError } from '../router/errors.js'
 import { executeWithFallback, isFallbackableAxiosError } from '../router/fallback.js'
 import { Router } from '../router/index.js'
 import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
-import { extractSessionKey } from '../session/key.js'
+import { buildUpstreamSessionHeaders, extractSessionKey } from '../session/key.js'
 import type { OpenAIUpstreamClient, UpstreamChatRequest } from '../upstream/openai.js'
 import { buildAliasMetaMap } from './model-meta.js'
 import { registerOllamaShowRoute } from './ollama-show.js'
@@ -91,6 +91,8 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
     // 提取会话键（header X-OpenWebUI-Chat-Id 优先，缺省内容前缀 hash）：
     // 有会话键 → 会话亲和路由粘附同一上游；无 → ctx 缺省 sessionKey，走轮询兜底
     const session = extractSessionKey(req, body)
+    // 透传给上游的会话头：原始请求带 x-session-id 则原样转发，否则用计算出的 sessionId 补充
+    const sessionHeaders = buildUpstreamSessionHeaders(req, session)
     const ctx = {
       downstreamModel: model,
       sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
@@ -112,7 +114,10 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
           // 下游 Ollama 形状请求 → OpenAI 请求（模型名替换为上游侧名称）→ 调用上游
           const ollamaReq = convertChatRequest({ ...body, model: candidate.model })
           // OllamaChatRequest 结构是 UpstreamChatRequest 的子集（缺索引签名），此处收窄到上游客户端签名
-          const openaiResp = await client.chatCompletion(ollamaReq as unknown as UpstreamChatRequest, { signal })
+          const openaiResp = await client.chatCompletion(ollamaReq as unknown as UpstreamChatRequest, {
+            signal,
+            headers: sessionHeaders,
+          })
           // OpenAI 响应 → Ollama 非流式响应（model 字段回填下游别名）
           const ollamaResp = convertChatResponse(openaiResp, model)
           reportAttempt(candidate.upstreamId, true, attemptStart, 200)
@@ -150,6 +155,8 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
   ): Promise<void> => {
     const candidates = buildRouter().resolve(model)
     const session = extractSessionKey(req, body)
+    // 透传给上游的会话头：原始请求带 x-session-id 则原样转发，否则用计算出的 sessionId 补充
+    const sessionHeaders = buildUpstreamSessionHeaders(req, session)
     const ctx = {
       downstreamModel: model,
       sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
@@ -171,6 +178,7 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
           const { stream, abort, connectError } = client.chatCompletionStream(ollamaReq as unknown as UpstreamChatRequest, {
             signal,
             includeUsage: true,
+            headers: sessionHeaders,
           })
           // 等待连接阶段结果：成功（null）→ 转换流；失败（Error）→ 可回退下一个候选
           // 必须 await：axios 流式调用是后台 promise，try/catch 抓不到它的 reject

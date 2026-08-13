@@ -19,6 +19,7 @@ const PASSTHROUGH_KEYS = [
   'presence_penalty',
   'frequency_penalty',
   'response_format',
+  'prompt_cache_key'
 ] as const
 
 // instructions 存在且非空 → 前置 system 消息；否则缺省
@@ -63,6 +64,41 @@ const mapInputItem = (item: unknown): ResponsesChatMessage | undefined => {
   return { role: record.role, content: normalizeContent(record.content) }
 }
 
+// 单条工具转换：Responses 扁平 function 工具（{type, name, description, parameters, ...}）
+// → chat 嵌套形状（{type: 'function', function: {name, description, parameters, ...}}）；
+// 其余字段（除 type 外）按原顺序收进 function；非 function 类型（custom / web_search 等）
+// 原样保留，由上游决定是否忽略。返回新对象，绝不修改入参
+const convertTool = (tool: unknown): unknown => {
+  if (typeof tool !== 'object' || tool === null) {
+    return tool
+  }
+  const record = tool as Record<string, unknown>
+  if (record.type !== 'function') {
+    return tool
+  }
+  // 除 type 外其余字段按原顺序收进 function（Object.entries 保持插入顺序）
+  const fn: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(record)) {
+    if (key !== 'type') {
+      fn[key] = value
+    }
+  }
+  return { type: 'function', function: fn }
+}
+
+// tool_choice 转换：Responses 对象形状 {type: 'function', name} → chat 嵌套
+// {type: 'function', function: {name}}；字符串（auto / none / required）原样透传
+const convertToolChoice = (toolChoice: unknown): unknown => {
+  if (typeof toolChoice !== 'object' || toolChoice === null) {
+    return toolChoice
+  }
+  const record = toolChoice as Record<string, unknown>
+  if (record.type === 'function' && typeof record.name === 'string') {
+    return { type: 'function', function: { name: record.name } }
+  }
+  return toolChoice
+}
+
 /**
  * 把 Responses 请求体的 input/instructions 转换为 chat messages：
  * - instructions 存在 → 前置 system 消息
@@ -93,13 +129,23 @@ export function responsesToChatMessages(body: ResponsesRequest): ResponsesChatMe
  * - messages 由 responsesToChatMessages 产出
  * - max_output_tokens → max_tokens（Responses 参数名到 chat 参数名的映射）
  * - stream 与 body.stream 一致（网关处理器会按分支强制为 true/false）
+ * - tools / tool_choice 转换后透传（保持工具顺序；结构扁平 → 嵌套）
  * - 其余白名单字段（temperature/top_p 等）原样透传
+ * 输出字段顺序固定：model → messages → stream → tools → tool_choice → max_tokens → 白名单
+ * （对象按构造顺序插入，对 JSON 序列化与顺序敏感消费方可预测）
  */
 export function responsesRequestToChat(body: ResponsesRequest): UpstreamChatRequest {
   const chat: UpstreamChatRequest = {
     model: body.model,
     messages: responsesToChatMessages(body),
     stream: body.stream === true,
+  }
+  // tools 逐项转换（保序），仅数组且非空时注入
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    chat.tools = body.tools.map(convertTool)
+  }
+  if (body.tool_choice !== undefined) {
+    chat.tool_choice = convertToolChoice(body.tool_choice)
   }
   if (typeof body.max_output_tokens === 'number') {
     chat.max_tokens = body.max_output_tokens
@@ -110,5 +156,8 @@ export function responsesRequestToChat(body: ResponsesRequest): UpstreamChatRequ
       chat[key] = value
     }
   }
+
+  console.log('--body', Object.keys(body), Object.keys(chat))
+
   return chat
 }

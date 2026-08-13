@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto'
 import type { Request } from 'express'
 import { describe, expect, it } from 'vitest'
-import { extractSessionKey } from '../../src/session/key.js'
+import { buildUpstreamSessionHeaders, extractSessionKey } from '../../src/session/key.js'
 
 // 构造最小 express Request（只含 headers，仅被只读访问）
 const makeReq = (headers: Record<string, unknown> = {}): Request =>
@@ -267,5 +267,46 @@ describe('extractSessionKey github baggage 分支', () => {
     const firstMisses = makeReq({ baggage: ['other=x', 'vs.copilot.InitiatorType = user'] })
     const result = extractSessionKey(firstMisses, { messages: [{ role: 'user', content: 'hi' }] })
     expect(result?.client).toBe('content-hash')
+  })
+})
+
+describe('buildUpstreamSessionHeaders', () => {
+  it('原始请求带 x-session-id（大小写不敏感）→ 保留原值并转发其余头，剔除黑名单', () => {
+    const req = makeReq({
+      'X-Session-Id': 'client-session-1',
+      'user-agent': 'test-agent',
+      authorization: 'Bearer client-token',
+      host: 'example.com',
+      'content-length': '100',
+    })
+    const session = { raw: 'computed-hash', client: 'content-hash' as const }
+    const result = buildUpstreamSessionHeaders(req, session)
+    // 客户端显式会话原样保留，其余自带头转发
+    expect(result?.['x-session-id']).toBe('client-session-1')
+    expect(result?.['user-agent']).toBe('test-agent')
+    // 鉴权 / 传输层头被剔除（绝不上行）
+    expect(result?.['authorization']).toBeUndefined()
+    expect(result?.['host']).toBeUndefined()
+    expect(result?.['content-length']).toBeUndefined()
+  })
+
+  it('原始请求没有 x-session-id + 有计算 session → 转发其余头并补充 x-session-id', () => {
+    const req = makeReq({ 'user-agent': 'test', 'X-OpenWebUI-Chat-Id': 'chat-uuid-9' })
+    const session = { raw: 'chat-uuid-9', client: 'open-webui' as const }
+    const result = buildUpstreamSessionHeaders(req, session)
+    expect(result?.['x-session-id']).toBe('chat-uuid-9')
+    expect(result?.['user-agent']).toBe('test')
+    // 计算来源头（X-OpenWebUI-Chat-Id）也被转发，保持原始请求头语义
+    expect(result?.['x-openwebui-chat-id']).toBe('chat-uuid-9')
+  })
+
+  it('原始请求 x-session-id 为空白 → 视为缺失，用计算 session 补充', () => {
+    const req = makeReq({ 'x-session-id': '   ' })
+    const session = { raw: 'hash-abc', client: 'content-hash' as const }
+    expect(buildUpstreamSessionHeaders(req, session)?.['x-session-id']).toBe('hash-abc')
+  })
+
+  it('原始请求与计算 session 皆无 → undefined（不添加会话头）', () => {
+    expect(buildUpstreamSessionHeaders(makeReq(), undefined)).toBeUndefined()
   })
 })

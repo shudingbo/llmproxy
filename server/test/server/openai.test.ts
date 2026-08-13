@@ -1,6 +1,7 @@
 // OpenAI 下游服务模块测试：supertest + 真实 ConfigStore + http.createServer 模拟上游
 // 覆盖：非流式透传、流式透传、模型列表聚合与缓存、顺序回退、全失败 502、未知模型 404
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -183,6 +184,66 @@ describe('OpenAI 下游服务', () => {
     // 统计钩子恰好记录一次成功尝试
     expect(attempts).toHaveLength(1)
     expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: true })
+  })
+
+  it('请求无 x-session-id → 上游收到 key.ts 计算出的内容前缀 hash 作为 x-session-id', async () => {
+    // 捕获上游实际收到的 x-session-id 头
+    let capturedSessionId: string | string[] | undefined
+    const url = await startMock(async (req, res) => {
+      capturedSessionId = req.headers['x-session-id']
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'chatcmpl-1', choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }] }))
+    })
+    addClient('u1', url)
+
+    const messages = [
+      { role: 'system', content: 'you are helpful' },
+      { role: 'user', content: 'hi' },
+    ]
+    const res = await request(app)
+      .post('/v1/chat/completions')
+      .send({ model: 'gpt-4', messages })
+    expect(res.status).toBe(200)
+    // 无 x-session-id → 补充计算出的会话键（前 2 条消息 sha256，与 key.ts 口径一致）
+    expect(capturedSessionId).toBe(
+      createHash('sha256')
+        .update(JSON.stringify(messages.map((m) => [m.role, m.content])))
+        .digest('hex'),
+    )
+  })
+
+  it('请求带 x-session-id → 原样透传给上游（不覆盖客户端显式会话）', async () => {
+    let capturedSessionId: string | string[] | undefined
+    const url = await startMock(async (req, res) => {
+      capturedSessionId = req.headers['x-session-id']
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'chatcmpl-1', choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }] }))
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/chat/completions')
+      .set('X-Session-Id', 'client-session-42')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+    expect(capturedSessionId).toBe('client-session-42')
+  })
+
+  it('请求仅带 X-OpenWebUI-Chat-Id（无 x-session-id）→ 上游收到该 chat id 作为 x-session-id', async () => {
+    let capturedSessionId: string | string[] | undefined
+    const url = await startMock(async (req, res) => {
+      capturedSessionId = req.headers['x-session-id']
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ id: 'chatcmpl-1', choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }] }))
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/chat/completions')
+      .set('X-OpenWebUI-Chat-Id', 'chat-uuid-abc')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+    expect(capturedSessionId).toBe('chat-uuid-abc')
   })
 
   it('流式请求透传 SSE 响应直到 [DONE]', async () => {

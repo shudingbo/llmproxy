@@ -2,7 +2,7 @@
 // 覆盖：string input、数组 input、instructions 前置、多模态 content 文本提取、
 // max_output_tokens 映射、参数透传、入参不可变、不可映射项忽略
 import { describe, expect, it } from 'vitest'
-import { responsesRequestToChat, responsesToChatMessages, type ResponsesChatMessage } from '../../src/converters/responses-request.js'
+import { responsesRequestToChat, responsesToChatMessages } from '../../src/converters/responses-request.js'
 
 describe('responsesToChatMessages 输入映射', () => {
   it('string input → 单条 user 消息', () => {
@@ -107,6 +107,97 @@ describe('responsesRequestToChat 整体转换', () => {
     expect('include' in chat).toBe(false)
   })
 
+  it('tools：扁平 function 包装为嵌套，工具顺序保持不变', () => {
+    const chat = responsesRequestToChat({
+      model: 'm',
+      input: 'hi',
+      tools: [
+        { type: 'function', name: 'get_weather', description: '查天气', parameters: { type: 'object' } },
+        { type: 'function', name: 'get_stock', description: '查股价', parameters: { type: 'object' } },
+      ],
+    })
+    expect(chat.tools).toEqual([
+      { type: 'function', function: { name: 'get_weather', description: '查天气', parameters: { type: 'object' } } },
+      { type: 'function', function: { name: 'get_stock', description: '查股价', parameters: { type: 'object' } } },
+    ])
+    // 顺序保持：第二个工具仍是 get_stock（未被排序/重排）
+    expect((chat.tools as Array<{ function: { name: string } }>)[1].function.name).toBe('get_stock')
+  })
+
+  it('tools：function 工具内部字段顺序保持，strict 等扩展字段一并收进 function', () => {
+    const chat = responsesRequestToChat({
+      model: 'm',
+      input: 'hi',
+      tools: [
+        { type: 'function', name: 'fn', description: 'd', parameters: { type: 'object' }, strict: true },
+      ],
+    })
+    // 除 type 外其余字段按原顺序收进 function（Object.keys 顺序验证）
+    const tool = (chat.tools as Array<{ function: Record<string, unknown> }>)[0]
+    expect(Object.keys(tool.function)).toEqual(['name', 'description', 'parameters', 'strict'])
+  })
+
+  it('tools：非 function 类型（custom/web_search）原样保留、位置不变', () => {
+    const chat = responsesRequestToChat({
+      model: 'm',
+      input: 'hi',
+      tools: [
+        { type: 'custom', id: 'c1' },
+        { type: 'function', name: 'fn1', description: 'd' },
+        { type: 'web_search', max_results: 5 },
+      ],
+    })
+    expect(chat.tools).toEqual([
+      { type: 'custom', id: 'c1' },
+      { type: 'function', function: { name: 'fn1', description: 'd' } },
+      { type: 'web_search', max_results: 5 },
+    ])
+  })
+
+  it('tools 缺失/空数组 → 不注入 tools 字段', () => {
+    expect('tools' in responsesRequestToChat({ model: 'm', input: 'hi' })).toBe(false)
+    expect('tools' in responsesRequestToChat({ model: 'm', input: 'hi', tools: [] })).toBe(false)
+  })
+
+  it('tool_choice：{type:function, name} 包装为嵌套，字符串形式原样透传', () => {
+    const obj = responsesRequestToChat({ model: 'm', input: 'hi', tool_choice: { type: 'function', name: 'get_weather' } })
+    expect(obj.tool_choice).toEqual({ type: 'function', function: { name: 'get_weather' } })
+    expect(responsesRequestToChat({ model: 'm', input: 'hi', tool_choice: 'auto' }).tool_choice).toBe('auto')
+    expect(responsesRequestToChat({ model: 'm', input: 'hi', tool_choice: 'none' }).tool_choice).toBe('none')
+  })
+
+  it('输出字段顺序固定：model → messages → stream → tools → tool_choice → max_tokens → 白名单', () => {
+    const chat = responsesRequestToChat({
+      model: 'm',
+      input: 'hi',
+      tools: [{ type: 'function', name: 'fn1' }],
+      tool_choice: { type: 'function', name: 'fn1' },
+      max_output_tokens: 10,
+      temperature: 0.5,
+      seed: 7,
+      top_p: 0.9,
+      stop: ['END'],
+      presence_penalty: 0.1,
+      frequency_penalty: 0.2,
+      response_format: { type: 'json_object' },
+    })
+    expect(Object.keys(chat)).toEqual([
+      'model',
+      'messages',
+      'stream',
+      'tools',
+      'tool_choice',
+      'max_tokens',
+      'temperature',
+      'top_p',
+      'stop',
+      'seed',
+      'presence_penalty',
+      'frequency_penalty',
+      'response_format',
+    ])
+  })
+
   it('绝不修改入参对象', () => {
     const input = {
       model: 'm',
@@ -114,6 +205,8 @@ describe('responsesRequestToChat 整体转换', () => {
       input: [{ role: 'user', content: 'hi' }],
       max_output_tokens: 50,
       temperature: 0.3,
+      tools: [{ type: 'function', name: 'fn1', description: 'd', parameters: { type: 'object' } }],
+      tool_choice: { type: 'function', name: 'fn1' },
     }
     const snapshot = structuredClone(input)
     responsesRequestToChat(input)

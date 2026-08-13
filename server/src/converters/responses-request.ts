@@ -157,7 +157,5 @@ export function responsesRequestToChat(body: ResponsesRequest): UpstreamChatRequ
     }
   }
 
-  console.log('--body', Object.keys(body), Object.keys(chat))
-
   return chat
 }

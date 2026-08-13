@@ -185,8 +185,6 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
         body.model = candidate.model
         body.stream = true
 
-        console.log('--sessionHeaders', sessionHeaders, req.headers)
-
         try {
           const { stream, abort, connectError } = client.chatCompletionStream(body as UpstreamChatRequest, {
             signal,
@@ -263,8 +261,6 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     const session = extractSessionKey(req, { messages: responsesToChatMessages(body as ResponsesRequest) })
     // 透传给上游的会话头：原始请求带 x-session-id 则原样转发，否则用计算出的 sessionId 补充
     const sessionHeaders = buildUpstreamSessionHeaders(req, session)
-
-    console.log('--sessionHeaders', sessionHeaders)
     const ctx = {
       downstreamModel: model,
       sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
@@ -596,7 +592,6 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       const body = req.body as Record<string, unknown>
       const model = typeof body.model === 'string' ? body.model : ''
       const signal = createRequestSignal(res)
-      console.log('--body orgi', Object.keys(body), req.headers)
 
       if (body.stream === true) {
         await handleStream(req, res, body, model, signal)

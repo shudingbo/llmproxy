@@ -183,15 +183,38 @@ const FORWARD_EXCLUDED_HEADERS = [
  * - 原始请求的自带头（剔除黑名单后）原样转发
  * - 原始请求没有 x-session-id 且能提取出会话键 → 用 extractSessionKey 计算出的
  *   sessionId 作为 x-session-id 补充（仅在原始缺失时添加，绝不覆盖客户端显式值）
- * - 两者皆无 → undefined（不添加会话头）
+ * - 请求来自 opencode 客户端（user-agent 含 opencode）时，把其会话头
+ *   （X-Session-Id / x-session-affinity）提升为 x-opencode-session 一并转发：
+ *   opencode 原生服务端只从 x-opencode-session 识别会话；非 opencode 客户端不注入
+ * - 无任何会话标识 → undefined（不添加会话头）
  */
 export function buildUpstreamSessionHeaders(
   req: Request,
   session: SessionKeyResult | undefined,
 ): Record<string, string> | undefined {
   const header = normalizeHeaders(req)
+
+  // opencode 客户端（user-agent 含 opencode）发送 x-session-affinity / X-Session-Id 会话头，
+  // 但其原生服务端只认 x-opencode-session：仅在来源确认为 opencode 时提升，避免向
+  // 非 opencode 上游 / 普通客户端（curl、Open WebUI 等）泄漏会话标识
+  const userAgent = findHeaderValue(header, 'user-agent')
+  if (userAgent !== undefined && userAgent.toLowerCase().includes('opencode')) {
+    const sessionId = findHeaderValue(header, 'x-session-id')
+    const affinity = findHeaderValue(header, 'x-session-affinity')
+    const openCodeSession = sessionId ?? affinity
+    if (openCodeSession !== undefined && openCodeSession.trim() !== '') {
+      header.set('x-opencode-session', openCodeSession)
+    }
+  }
+
+  // 会话标识判定：原始 x-session-id 或 opencode 的 x-session-affinity 均视为有效会话标识
+  // （opencode 客户端两者同值发送；仅带 affinity 时同样不应被丢弃）
   const rawHeader = findHeaderValue(header, 'x-session-id')
-  if (rawHeader === undefined || rawHeader.trim() === '') {
+  const affinity = findHeaderValue(header, 'x-session-affinity')
+  const hasSessionIdentity =
+    (rawHeader !== undefined && rawHeader.trim() !== '') ||
+    (affinity !== undefined && affinity.trim() !== '')
+  if (!hasSessionIdentity) {
     if (session === undefined) {
       return undefined
     }

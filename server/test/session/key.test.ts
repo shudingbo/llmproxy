@@ -309,4 +309,37 @@ describe('buildUpstreamSessionHeaders', () => {
   it('原始请求与计算 session 皆无 → undefined（不添加会话头）', () => {
     expect(buildUpstreamSessionHeaders(makeReq(), undefined)).toBeUndefined()
   })
+
+  it('user-agent 含 opencode + 带 X-Session-Id/x-session-affinity → 提升为 x-opencode-session', () => {
+    const req = makeReq({
+      'user-agent': 'opencode/0.4.12 (cli)',
+      'X-Session-Id': 'ses_abc123',
+      'x-session-affinity': 'ses_abc123',
+    })
+    const result = buildUpstreamSessionHeaders(req, { raw: 'computed-hash', client: 'content-hash' as const })
+    expect(result?.['x-opencode-session']).toBe('ses_abc123')
+    // 原始会话头原样保留
+    expect(result?.['x-session-id']).toBe('ses_abc123')
+    expect(result?.['x-session-affinity']).toBe('ses_abc123')
+  })
+
+  it('user-agent 含 opencode 但仅有 x-session-affinity → 提升且不丢弃会话头', () => {
+    const req = makeReq({ 'user-agent': 'opencode/0.4.12 (cli)', 'x-session-affinity': 'ses_xyz' })
+    const result = buildUpstreamSessionHeaders(req, undefined)
+    expect(result?.['x-opencode-session']).toBe('ses_xyz')
+    expect(result?.['x-session-affinity']).toBe('ses_xyz')
+  })
+
+  it('user-agent 含 OpenCode（大写）→ 大小写不敏感命中提升', () => {
+    const req = makeReq({ 'user-agent': 'OpenCode TUI', 'X-Session-Id': 'ses_upper' })
+    const result = buildUpstreamSessionHeaders(req, undefined)
+    expect(result?.['x-opencode-session']).toBe('ses_upper')
+  })
+
+  it('user-agent 不含 opencode → 不注入 x-opencode-session', () => {
+    const req = makeReq({ 'user-agent': 'curl/8.0', 'X-Session-Id': 'ses_curl' })
+    const result = buildUpstreamSessionHeaders(req, undefined)
+    expect(result?.['x-opencode-session']).toBeUndefined()
+    expect(result?.['x-session-id']).toBe('ses_curl')
+  })
 })

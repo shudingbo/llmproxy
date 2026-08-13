@@ -155,18 +155,14 @@ export class OpenAIUpstreamClient {
       // 鉴权头只来自配置，绝不接受调用方传入的 Authorization；
       // 附加头（如 x-session-id）展开在鉴权头之前，保证 Authorization / Content-Type 不可被覆盖
       headers: {
-        authorization: `Bearer ${this.apiKey}`,
-        'content-type': 'application/json',        
         ...options.headers,
-        // Authorization: `Bearer ${this.apiKey}`,
-        // 'Content-Type': 'application/json',
-
+        Authorization: `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
       },
       // 未显式传 timeout 时沿用默认值，probe 等场景可单独覆盖
       timeout: options.timeout ?? this.timeoutMs,
       signal: options.signal,
     }
-    console.log('--config headers', config.headers, Object.keys(body as any), body?.stream_options)
     if (body !== undefined) {
       config.data = body
     }

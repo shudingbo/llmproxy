@@ -9,7 +9,7 @@ import { SessionClient } from './key.js'
 export interface SessionRow {
   session_key: string // 主键：`${downstreamModel}::${raw}`
   session_id: string // 原始会话键值（header 值或内容 hash hex）
-  client: string // 'open-webui' | 'x-session-id' | 'ywnrs' | 'github' | 'content-hash' | 'unknown'
+  client: string // 'open-webui' | 'x-session-id' | 'ywnrs' | 'github' | 'opencode' | 'content-hash' | 'unknown'
   downstream_model: string
   upstream_id: string // 粘附的上游 id
   upstream_model: string // 上游侧模型名

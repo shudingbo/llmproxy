@@ -39,7 +39,7 @@
         </el-table-column>
         <el-table-column label="Client" width="140">
           <template #default="{ row }">
-            <el-tag :type="clientTag(row.client)" size="small" effect="dark">{{ row.client }}</el-tag>
+            <el-tag :type="clientTag(row.client)" :color="clientColor(row.client)" size="small" effect="dark">{{ row.client }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="虚拟模型" min-width="160">
@@ -147,6 +147,14 @@ function clientTag(c: string): 'primary' | 'success' | 'info' | 'warning' | 'dan
     default:
       return 'info'
   }
+}
+
+// opencode 专属 tag 底色（其余类型走 clientTag 的语义色，这里返回 undefined 交由 type 决定）
+function clientColor(c: string): string | undefined {
+  if (c === 'opencode') {
+    return '#2d6cdf'
+  }
+  return undefined
 }
 
 // epoch ms → 本地时间字符串（参考 Logs.vue 的 formatTime）

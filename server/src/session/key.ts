@@ -10,6 +10,7 @@ export enum SessionClient {
   XSessionId = 'x-session-id',
   Ywnrs = 'ywnrs',
   Github = 'github',
+  OpenCode = 'opencode',
   ContentHash = 'content-hash',
   Unknown = 'unknown',
 }
@@ -104,12 +105,14 @@ const hashBeforeFirstAssistant = (body: Record<string, unknown>): string | undef
 /**
  * 提取会话键（优先级从高到低，返回第一个命中）：
  * 1. header X-OpenWebUI-Chat-Id 非空 → { raw: 值.trim(), client: 'open-webui' }
- * 2. header X-Session-Id 非空 → 值以 'ywnrs' 开头 → { raw: 值.trim(), client: 'ywnrs' }；
+ * 2. header user-agent 含 opencode → 会话键取 X-Session-Id / x-session-affinity（两者同值），
+ *    { raw: 值.trim(), client: 'opencode' }
+ * 3. header X-Session-Id 非空 → 值以 'ywnrs' 开头 → { raw: 值.trim(), client: 'ywnrs' }；
  *    否则 → { raw: 值.trim(), client: 'x-session-id' }
- * 3. header baggage 非空且值（转小写后）包含 'copilot'（GitHub Copilot 等 client）→
+ * 4. header baggage 非空且值（转小写后）包含 'copilot'（GitHub Copilot 等 client）→
  *    第 1 个 assistant 之前的消息 sha256 → { raw: hashHex, client: 'github' }
- * 4. body.messages 为数组且长度 ≥ 1 → 前 2 条内容前缀 sha256 → { raw: hashHex, client: 'content-hash' }
- * 5. 都不满足 → undefined（调用方走轮询兜底）
+ * 5. body.messages 为数组且长度 ≥ 1 → 前 2 条内容前缀 sha256 → { raw: hashHex, client: 'content-hash' }
+ * 6. 都不满足 → undefined（调用方走轮询兜底）
  * header 查找方式：开头一次性把 req.headers 规范化为「小写 key → 首个值」的 Map，
  * 后续所有 header 查询均走该 Map（O(1)），避免重复全量遍历
  */
@@ -124,6 +127,21 @@ export function extractSessionKey(
     const trimmed = openWebuiHeader.trim()
     if (trimmed !== '') {
       return { raw: trimmed, client: SessionClient.OpenWebUI }
+    }
+  }
+
+  // opencode CLI 分支：user-agent 含 opencode（如 'opencode/0.4.12 (cli)'）即命中。
+  // opencode 客户端会同时发送 X-Session-Id 与 x-session-affinity（两者同值），
+  // 以其值作为会话键、标记 client=opencode，便于运维按来源筛选。
+  // 判断置于 X-Session-Id 通用分支之前：opencode 也携带 X-Session-Id，
+  // 若后置会被通用分支抢先归类为 x-session-id，永远无法命中本分支
+  const userAgent = findHeaderValue(headers, 'user-agent')
+  if (userAgent !== undefined && userAgent.toLowerCase().includes('opencode')) {
+    const sessionId = findHeaderValue(headers, 'x-session-id')
+    const affinity = findHeaderValue(headers, 'x-session-affinity')
+    const openCodeSession = sessionId ?? affinity
+    if (openCodeSession !== undefined && openCodeSession.trim() !== '') {
+      return { raw: openCodeSession.trim(), client: SessionClient.OpenCode }
     }
   }
 

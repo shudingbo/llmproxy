@@ -182,6 +182,61 @@ describe('extractSessionKey', () => {
   })
 })
 
+describe('extractSessionKey opencode 分支', () => {
+  it('user-agent 含 opencode + 带 X-Session-Id → client=opencode，raw 取会话值', () => {
+    const req = makeReq({ 'user-agent': 'opencode/0.4.12 (cli)', 'x-session-id': 'ses_abc123' })
+    expect(extractSessionKey(req, {})).toEqual({ raw: 'ses_abc123', client: 'opencode' })
+  })
+
+  it('user-agent 含 OpenCode（大写）→ 大小写不敏感命中', () => {
+    const req = makeReq({ 'user-agent': 'OpenCode TUI', 'X-Session-Id': 'ses_upper' })
+    expect(extractSessionKey(req, {})).toEqual({ raw: 'ses_upper', client: 'opencode' })
+  })
+
+  it('user-agent 含 opencode + 仅 x-session-affinity → 用 affinity 值', () => {
+    const req = makeReq({ 'user-agent': 'opencode/0.4.12 (cli)', 'x-session-affinity': 'ses_aff' })
+    expect(extractSessionKey(req, {})).toEqual({ raw: 'ses_aff', client: 'opencode' })
+  })
+
+  it('user-agent 含 opencode 且两者同时存在 → 优先 X-Session-Id', () => {
+    const req = makeReq({
+      'user-agent': 'opencode/0.4.12 (cli)',
+      'x-session-id': 'ses_id',
+      'x-session-affinity': 'ses_aff',
+    })
+    expect(extractSessionKey(req, {})).toEqual({ raw: 'ses_id', client: 'opencode' })
+  })
+
+  it('优先级：user-agent 含 opencode 优先于普通 X-Session-Id 归类', () => {
+    const req = makeReq({ 'user-agent': 'opencode/0.4.12 (cli)', 'x-session-id': 'ywnrs-001' })
+    // 即使值以 ywnrs 开头，opencode 分支优先级更高
+    expect(extractSessionKey(req, {})).toEqual({ raw: 'ywnrs-001', client: 'opencode' })
+  })
+
+  it('user-agent 含 opencode 但无会话头 → 不命中 opencode 分支，走内容 hash 兜底', () => {
+    const req = makeReq({ 'user-agent': 'opencode/0.4.12 (cli)' })
+    const body = { messages: [{ role: 'user', content: '你好' }] }
+    const result = extractSessionKey(req, body)
+    expect(result).toBeDefined()
+    expect(result!.client).toBe('content-hash')
+    expect(result!.raw).toBe(expectedHash(body.messages as unknown[]))
+  })
+
+  it('user-agent 不含 opencode → 不命中 opencode 分支，走 x-session-id', () => {
+    const req = makeReq({ 'user-agent': 'curl/8.0', 'x-session-id': 'ses_curl' })
+    expect(extractSessionKey(req, {})).toEqual({ raw: 'ses_curl', client: 'x-session-id' })
+  })
+
+  it('优先级：X-OpenWebUI-Chat-Id 优先于 opencode 分支', () => {
+    const req = makeReq({
+      'user-agent': 'opencode/0.4.12 (cli)',
+      'x-openwebui-chat-id': 'chat-uuid-789',
+      'x-session-id': 'ses_abc',
+    })
+    expect(extractSessionKey(req, {})).toEqual({ raw: 'chat-uuid-789', client: 'open-webui' })
+  })
+})
+
 describe('extractSessionKey github baggage 分支', () => {
   it('baggage 值含 copilot → client=github，raw 为 64 位 hex 且与口径计算一致', () => {
     const req = makeReq({ baggage: 'vs.copilot.InitiatorType = user' })

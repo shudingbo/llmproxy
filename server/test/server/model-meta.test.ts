@@ -179,7 +179,7 @@ describe('isAliasExposed', () => {
     expect(isAliasExposed(config, 'off')).toBe(false)
   })
 
-  it('总开关 on → true（候选列表任意都不影响）', () => {
+  it('总开关 on + 候选引用健康上游 → true', () => {
     const config: Config = {
       upstreams: [{ id: 'u1', baseUrl: 'https://a.example', apiKey: 'k', timeoutMs: 5000, disabled: false, responsesApi: 'convert' }],
       downstreamModels: {
@@ -192,19 +192,58 @@ describe('isAliasExposed', () => {
     expect(isAliasExposed(config, 'a')).toBe(true)
   })
 
-  it('上游级 disabled（upstream.disabled=true）不影响暴露判定', () => {
+  it('所有候选引用的上游都被 disabled → false（列表剔除）', () => {
+    // 用户场景：qwen3.5-9b 的唯一上游 A 被 disabled → 不应在 /v1/models 出现
     const config: Config = {
       upstreams: [
         { id: 'u1', baseUrl: 'https://a.example', apiKey: 'k', timeoutMs: 5000, disabled: true, responsesApi: 'convert' },
       ],
-      downstreamModels: { a: groupOf([{ upstreamId: 'u1', model: 'm' }]) },
+      downstreamModels: {
+        qwen3: {
+          disabled: false,
+          candidates: [{ upstreamId: 'u1', model: 'qwen3.5-9b' }],
+        },
+      },
     }
-    // 上游级 disabled 与别名级 / 候选级是两层概念，列表端点只走 alias.disabled
-    expect(isAliasExposed(config, 'a')).toBe(true)
+    expect(isAliasExposed(config, 'qwen3')).toBe(false)
+  })
+
+  it('多候选中至少一条引用健康上游 → true', () => {
+    // 用户场景：qwen3.5-9b 配了 A / B，A 被 disabled，B 健康 → 仍可见
+    const config: Config = {
+      upstreams: [
+        { id: 'u1', baseUrl: 'https://a.example', apiKey: 'k', timeoutMs: 5000, disabled: true, responsesApi: 'convert' },
+        { id: 'u2', baseUrl: 'https://b.example', apiKey: 'k', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
+      ],
+      downstreamModels: {
+        qwen3: {
+          disabled: false,
+          candidates: [
+            { upstreamId: 'u1', model: 'qwen3.5-9b' },
+            { upstreamId: 'u2', model: 'qwen3.5-9b' },
+          ],
+        },
+      },
+    }
+    expect(isAliasExposed(config, 'qwen3')).toBe(true)
+  })
+
+  it('候选引用的上游在配置中不存在（配置漂移）→ 视为不可用，按 false', () => {
+    // 候选 upstreamId 找不到对应上游 → 也视为这条候选失效
+    const config: Config = {
+      upstreams: [{ id: 'u1', baseUrl: 'https://a.example', apiKey: 'k', timeoutMs: 5000, disabled: false, responsesApi: 'convert' }],
+      downstreamModels: {
+        a: {
+          disabled: false,
+          candidates: [{ upstreamId: 'ghost-upstream', model: 'm' }],
+        },
+      },
+    }
+    expect(isAliasExposed(config, 'a')).toBe(false)
   })
 })
 
-describe('listExposedAliases（别名级总开关语义）', () => {
+describe('listExposedAliases（与 Router 解析语义对齐）', () => {
   it('按配置插入顺序返回对外暴露的别名', () => {
     const config: Config = {
       upstreams: [{ id: 'u1', baseUrl: 'https://a.example', apiKey: 'k', timeoutMs: 5000, disabled: false, responsesApi: 'convert' }],
@@ -226,5 +265,19 @@ describe('listExposedAliases（别名级总开关语义）', () => {
       },
     }
     expect(listExposedAliases(config)).toEqual([])
+  })
+
+  it('别名开启但所有候选上游都 disabled → 该别名从列表剔除', () => {
+    const config: Config = {
+      upstreams: [
+        { id: 'main', baseUrl: 'https://main.example', apiKey: 'k', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
+        { id: 'paused', baseUrl: 'https://paused.example', apiKey: 'k', timeoutMs: 5000, disabled: true, responsesApi: 'convert' },
+      ],
+      downstreamModels: {
+        ok: { disabled: false, candidates: [{ upstreamId: 'main', model: 'm1' }] },
+        allUpstreamsPaused: { disabled: false, candidates: [{ upstreamId: 'paused', model: 'm2' }] },
+      },
+    }
+    expect(listExposedAliases(config)).toEqual(['ok'])
   })
 })

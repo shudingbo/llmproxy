@@ -8,10 +8,12 @@ import { ModelNotFoundError } from './errors.js'
  * 路由解析器：持有完整配置（含 upstreams 与 downstreamModels），
  * 提供 resolve() 把下游模型别名映射为有序候选列表。
  *
- * 过滤规则（两层开关，收敛后）：
- * - alias.disabled（别名级总开关）：true → 整个别名不可用，解析即 ModelNotFoundError
- * - upstream.disabled（上游级）：保留原语义，仅跳过该上游对应的候选
- * （候选级 disabled 已移除：临时禁用走 upstream.disabled；永久移除走 Models 页面删除候选）
+ * 过滤规则：
+ * - 别名不在 downstreamModels 中 → 抛 ModelNotFoundError
+ * - 别名被整体禁用（alias.disabled === true）→ 抛 ModelNotFoundError（总开关关闭）
+ * - 别名未关闭，但所有候选引用的上游都被禁用 → 抛 ModelNotFoundError
+ *   （与 listExposedAliases 列表判定对齐，避免出现「列表可见但调用 502」的体验割裂）
+ * - 否则按候选顺序返回，过滤掉上游级 disabled 的候选
  */
 export class Router {
   // 上游 id → 是否禁用 的预计算映射，避免每次 resolve 都线性扫描 upstreams
@@ -24,8 +26,9 @@ export class Router {
   /**
    * 解析下游模型别名：
    * - 别名不在 downstreamModels 中 → 抛 ModelNotFoundError
-   * - 别名被整体禁用（alias.disabled === true）→ 抛 ModelNotFoundError（总开关关闭）
-   * - 过滤掉 disabled 上游对应的候选；若过滤后空但原列表非空：记警告并返回原列表
+   * - 别名被整体禁用（alias.disabled === true）→ 抛 ModelNotFoundError
+   * - 别名开启但所有候选 upstream 都关 → 抛 ModelNotFoundError（与列表端点语义一致）
+   * - 否则按顺序返回，过滤掉 upstream.disabled 的候选
    */
   resolve(downstreamModel: string): UpstreamCandidate[] {
     const group = this.config.downstreamModels[downstreamModel]
@@ -37,16 +40,16 @@ export class Router {
       getLogger().debug({ downstreamModel }, '下游别名已关闭（别名级总开关），按未注册处理')
       throw new ModelNotFoundError(downstreamModel)
     }
-    // 上游级 disabled：仅跳过该候选，其余候选保持原顺序
+    // 过滤掉 upstream.disabled 的候选
     const active = group.candidates.filter((c) => this.disabledUpstreams.get(c.upstreamId) !== true)
-    console.log("---re",this.disabledUpstreams, active)
-    
-    if (active.length === 0 && group.candidates.length > 0) {
-      getLogger().warn(
+    if (active.length === 0) {
+      // 全部候选引用的上游都被禁用：与列表不可见语义对齐，按 model_not_found 处理
+      // （避免出现用户看到模型在列表里、调用却 502 的体验割裂）
+      getLogger().debug(
         { downstreamModel },
-        '下游模型的所有上游候选均被禁用，按原列表返回',
+        '下游别名所有候选引用的上游均被禁用，按未注册处理',
       )
-      return group.candidates
+      throw new ModelNotFoundError(downstreamModel)
     }
     return active
   }

@@ -10,19 +10,28 @@ export interface AliasMeta {
 }
 
 /**
- * 别名在「别名级总开关」语义下是否对外暴露：
+ * 别名在「用户视角」下是否对外暴露：
  * - 别名不在 downstreamModels 中 → false（由调用方按 404 处理）
- * - 别名被整体禁用（group.disabled === true）→ false
+ * - 别名被总开关关闭（group.disabled === true）→ false
+ * - 别名未关闭，但所有候选引用的上游全部 disabled → false
+ *   理由：用户看到列表就会以为可调用，调一下却返回 no_upstream，体验割裂。
+ *   「所有上游都关」的别名与「被总开关关闭」在列表中应一视同仁地对用户不可见。
  * - 否则 → true
  *
- * 候选级 disabled 已移除：列表端点只看别名总开关；上游 disabled 不影响对外暴露，
- * （上游整体禁用时该别名实际无活候选，但「对外可见性」与「实际可调用性」解耦，
- * 给运维更显式的状态：模型列表中能看到 alias 关闭，反馈是从上游到别名层面的诊断信号）
+ * 与 Router.resolve() 的语义对齐：列表里看不到的别名，调用时也应 model_not_found。
  */
 export function isAliasExposed(config: Config, alias: string): boolean {
   const group = config.downstreamModels[alias]
   if (!group) return false
-  return group.disabled !== true
+  if (group.disabled === true) return false
+  // 别名未关闭：再判断「是否有候选引用的上游仍是活跃的」
+  for (const candidate of group.candidates) {
+    const upstream = config.upstreams.find((u) => u.id === candidate.upstreamId)
+    if (upstream && upstream.disabled !== true) {
+      return true
+    }
+  }
+  return false
 }
 
 /**
@@ -30,8 +39,6 @@ export function isAliasExposed(config: Config, alias: string): boolean {
  * 仅在总开关 off 时剔除；具体见 isAliasExposed
  */
 export function listExposedAliases(config: Config): string[] {
-  console.log("---listExposedAliases", config.downstreamModels)
-
   return Object.keys(config.downstreamModels).filter((alias) => isAliasExposed(config, alias))
 }
 

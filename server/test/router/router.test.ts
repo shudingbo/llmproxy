@@ -7,8 +7,8 @@ import { Router } from '../../src/router/index.js'
 
 // 默认 4 个别名 / 3 个上游的标准样本（group 形态）：
 // - gpt-4 → 2 个候选（openai-main / openai-backup，均活跃、别名开）
-// - mixed → 2 个候选（openai-paused 禁用 / openai-main 活跃）
-// - paused → 1 个候选（openai-paused 上游级禁用）
+// - mixed → 2 个候选（openai-paused 禁用 / openai-main 活跃；按新语义仍可解析）
+// - paused → 1 个候选（openai-paused 上游级禁用，唯一候选引用被关上游 → 抛 model_not_found）
 // - llama3 → 1 个候选（openai-main 活跃）
 function buildConfig(): Config {
   return {
@@ -57,22 +57,21 @@ describe('Router.resolve（基础行为）', () => {
     ])
   })
 
-  it('部分候选上游级禁用时只过滤被禁用的，其余保持顺序返回且不告警', () => {
-    const warnSpy = vi.spyOn(getLogger(), 'warn').mockImplementation(() => true)
+  it('部分候选上游级禁用时只过滤被禁用的，其余保持顺序返回', () => {
+    const debugSpy = vi.spyOn(getLogger(), 'debug').mockImplementation(() => true)
     const router = new Router(buildConfig())
     expect(router.resolve('mixed')).toEqual([{ upstreamId: 'openai-main', model: 'gpt-4' }])
-    expect(warnSpy).not.toHaveBeenCalled()
+    // 候选仍有健康上游 → 不应打 debug 告警
+    expect(debugSpy).not.toHaveBeenCalled()
   })
 
-  it('唯一候选上游级禁用（全部过滤）时记警告并返回原列表', () => {
-    const warnSpy = vi.spyOn(getLogger(), 'warn').mockImplementation(() => true)
+  it('唯一候选上游级禁用（全部过滤）→ 抛 ModelNotFoundError（与列表语义对齐）', () => {
     const router = new Router(buildConfig())
-    expect(router.resolve('paused')).toEqual([{ upstreamId: 'openai-paused', model: 'gpt-4' }])
-    expect(warnSpy).toHaveBeenCalledTimes(1)
+    // 这种别名不会出现在 /v1/models 中；调用时也应 model_not_found，与列表语义对齐
+    expect(() => router.resolve('paused')).toThrow(ModelNotFoundError)
   })
 
-  it('上游全部禁用时（多候选）同样警告并返回原候选列表', () => {
-    const warnSpy = vi.spyOn(getLogger(), 'warn').mockImplementation(() => true)
+  it('上游全部禁用时（多候选引用两个 disabled 上游）→ 抛 ModelNotFoundError', () => {
     const config: Config = {
       upstreams: [
         { id: 'a', baseUrl: 'https://a.example', apiKey: 'k', timeoutMs: 30000, disabled: true, responsesApi: 'convert' },
@@ -89,11 +88,7 @@ describe('Router.resolve（基础行为）', () => {
       },
     }
     const router = new Router(config)
-    expect(router.resolve('m')).toEqual([
-      { upstreamId: 'a', model: 'm1' },
-      { upstreamId: 'b', model: 'm2' },
-    ])
-    expect(warnSpy).toHaveBeenCalledTimes(1)
+    expect(() => router.resolve('m')).toThrow(ModelNotFoundError)
   })
 
   it('未知模型抛 ModelNotFoundError', () => {
@@ -112,7 +107,7 @@ describe('Router.resolve（基础行为）', () => {
   })
 })
 
-describe('Router.resolve（别名级总开关）', () => {
+describe('Router.resolve（别名级总开关 / 上游全关 语义对齐）', () => {
   it('总开关 off → resolve 抛 ModelNotFoundError（不论上游状态如何）', () => {
     const config: Config = {
       upstreams: [{ id: 'a', baseUrl: 'https://a.example', apiKey: 'k', timeoutMs: 30000, disabled: false, responsesApi: 'convert' }],
@@ -151,8 +146,7 @@ describe('Router.resolve（别名级总开关）', () => {
     expect(router.resolve('mix')).toEqual([{ upstreamId: 'upB', model: 'm-b' }])
   })
 
-  it('总开关 on + 唯一候选上游级关闭 → 记警告并返回原列表', () => {
-    const warnSpy = vi.spyOn(getLogger(), 'warn').mockImplementation(() => true)
+  it('总开关 on + 唯一候选上游级关闭 → 抛 ModelNotFoundError（与列表语义对齐）', () => {
     const config: Config = {
       upstreams: [{ id: 'a', baseUrl: 'https://a.example', apiKey: 'k', timeoutMs: 30000, disabled: true, responsesApi: 'convert' }],
       downstreamModels: {
@@ -163,8 +157,7 @@ describe('Router.resolve（别名级总开关）', () => {
       },
     }
     const router = new Router(config)
-    expect(router.resolve('only-disabled-up')).toEqual([{ upstreamId: 'a', model: 'm-a' }])
-    expect(warnSpy).toHaveBeenCalledTimes(1)
+    expect(() => router.resolve('only-disabled-up')).toThrow(ModelNotFoundError)
   })
 
   it('总开关显式 false 与字段缺失行为等价', () => {
@@ -176,5 +169,43 @@ describe('Router.resolve（别名级总开关）', () => {
     }
     const router = new Router(configA)
     expect(router.resolve('a')).toEqual([{ upstreamId: 'a', model: 'm-a' }])
+  })
+
+  it('同一别名多候选中至少有一条引用健康上游 → 仍可解析', () => {
+    // 用户场景：qwen3.5-9b 配了多个上游，其中部分被关闭
+    const config: Config = {
+      upstreams: [
+        { id: 'main', baseUrl: 'https://main.example', apiKey: 'k', timeoutMs: 30000, disabled: false, responsesApi: 'convert' },
+        { id: 'paused', baseUrl: 'https://paused.example', apiKey: 'k', timeoutMs: 30000, disabled: true, responsesApi: 'convert' },
+      ],
+      downstreamModels: {
+        qwen3: {
+          disabled: false,
+          candidates: [
+            { upstreamId: 'paused', model: 'qwen3.5-9b' },
+            { upstreamId: 'main', model: 'qwen3.5-9b' },
+          ],
+        },
+      },
+    }
+    const router = new Router(config)
+    expect(router.resolve('qwen3')).toEqual([{ upstreamId: 'main', model: 'qwen3.5-9b' }])
+  })
+
+  it('所有候选引用的上游都被关闭 → 抛 ModelNotFoundError', () => {
+    // 用户场景：qwen3.5-9b 仅配一个上游 A，A 被 disabled
+    const config: Config = {
+      upstreams: [
+        { id: 'only-up', baseUrl: 'https://only.example', apiKey: 'k', timeoutMs: 30000, disabled: true, responsesApi: 'convert' },
+      ],
+      downstreamModels: {
+        qwen3: {
+          disabled: false,
+          candidates: [{ upstreamId: 'only-up', model: 'qwen3.5-9b' }],
+        },
+      },
+    }
+    const router = new Router(config)
+    expect(() => router.resolve('qwen3')).toThrow(ModelNotFoundError)
   })
 })

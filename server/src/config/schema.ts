@@ -110,11 +110,28 @@ export const RoutingSchema = z.object({
 })
 
 /**
+ * 鉴权配置（可选）：
+ * - enabled：全局鉴权开关；开启后所有下行流调用（/v1/*、/api/*）必须携带有效 API Key，
+ *   否则返回 401；关闭时完全旁路中间件、向后兼容现有部署
+ * - keyBytes：生成的 API Key 随机字节数（默认 24 → 32 hex 字符 + 'sk-' 前缀）
+ *
+ * 允许只写 enabled 或不写本节；整个 auth 可缺省（即 disabled）。
+ * 注：API Key 本身存 SQLite（hash + 前缀），不在配置文件中保存；本节只描述开关
+ */
+export const AuthConfigSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    keyBytes: z.number().int().min(8).max(64).default(24),
+  })
+  .prefault({})
+
+/**
  * 完整配置：
  * - upstreams：上游列表（至少 1 个）
  * - downstreamModels：别名 → DownstreamAliasGroup 的映射（运行时归一化形态，见 loader）
  * - server：可选的进程级 server 配置（host / port / bodyLimit）；未指定时按缺省值
  * - routing：可选的路由配置（会话亲和等）；未指定时按缺省值
+ * - auth：可选的鉴权配置（开关 + Key 长度）；未指定时按缺省值（disabled）
  *
  * 注意：raw 形态（未归一化）见 DownstreamModelEntrySchema，由 loader 负责在落库前归一化
  */
@@ -123,6 +140,7 @@ export const ConfigSchema = z.object({
   downstreamModels: DownstreamModelsSchema,
   server: ServerConfigSchema.optional(),
   routing: RoutingSchema.optional(),
+  auth: AuthConfigSchema.optional(),
 })
 
 // 导出的推断类型：全项目统一使用该类型表示一份配置
@@ -132,6 +150,7 @@ export type UpstreamCandidate = z.infer<typeof UpstreamCandidateSchema>
 export type DownstreamAliasGroup = z.infer<typeof DownstreamAliasGroupSchema>
 export type ServerConfig = z.infer<typeof ServerConfigSchema>
 export type Routing = z.infer<typeof RoutingSchema>
+export type AuthConfig = z.infer<typeof AuthConfigSchema>
 
 // 别名 → 候选列表（运行时便利类型，等价于 downstreamModels[alias].candidates）
 export type DownstreamModelCandidates = UpstreamCandidate[]

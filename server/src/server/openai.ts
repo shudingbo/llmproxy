@@ -33,6 +33,8 @@ export interface OpenAIDeps {
   onAttempt: (info: { upstreamId: string; ok: boolean; durationMs: number; status?: number }) => void
   // 可选：会话亲和存储，用于请求回退成功后把会话粘附改绑到实际成功上游；未注入则跳过改绑
   sessionStore?: SessionStoreLike
+  // 鉴权中间件：装配层注入，挂到所有 /v1/* 路由前置；未注入则跳过（向后兼容）
+  authMiddleware?: (req: Request, res: Response, next: () => void) => void
 }
 
 // 非流式成功响应的包络：上游客户端只暴露响应体（axios 非 2xx 即抛错），status 恒为 2xx
@@ -58,6 +60,11 @@ interface StreamSuccess {
  */
 export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
   const { store, getUpstreamClient, loadBalancer, onAttempt } = deps
+
+  // 鉴权中间件优先于所有 /v1/* 路由注册；未注入则跳过（向后兼容旧装配层）
+  if (deps.authMiddleware !== undefined) {
+    app.use('/v1', deps.authMiddleware)
+  }
 
   // 按请求重建路由器：直接取 store 最新配置，避免订阅时序造成过期引用
   const buildRouter = (): Router => new Router(store.get())

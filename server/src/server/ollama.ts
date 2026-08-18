@@ -29,6 +29,8 @@ export interface OllamaDeps {
   onAttempt: (info: { upstreamId: string; ok: boolean; durationMs: number; status?: number }) => void
   // 可选：会话亲和存储，用于请求回退成功后把会话粘附改绑到实际成功上游；未注入则跳过改绑
   sessionStore?: SessionStoreLike
+  // 鉴权中间件：装配层注入，挂到所有 /api/* 路由前置；未注入则跳过（向后兼容）
+  authMiddleware?: (req: Request, res: Response, next: () => void) => void
 }
 
 // 流式成功结果：转换后的 Ollama NDJSON 流 + 拆线函数
@@ -45,6 +47,11 @@ interface StreamSuccess {
  */
 export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
   const { store, getUpstreamClient, loadBalancer, onAttempt } = deps
+
+  // 鉴权中间件优先于所有 /api/* 路由注册；未注入则跳过（向后兼容旧装配层）
+  if (deps.authMiddleware !== undefined) {
+    app.use('/api', deps.authMiddleware)
+  }
 
   // 按请求重建路由器：直接取 store 最新配置，避免订阅时序造成过期引用
   const buildRouter = (): Router => new Router(store.get())

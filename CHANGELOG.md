@@ -2,6 +2,19 @@
 
 本项目所有值得记录的变更都会汇总到本文件。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **API Key 鉴权（Bearer Token）**：
+  - **配置开关**：`llmproxy.jsonc` 新增 `auth` 节（`{ enabled: boolean, keyBytes?: number }`，缺省 `disabled`）。全局开关开启时，所有 `/v1/*`（含 `/v1/models`/`/v1/chat/completions`/`/v1/responses`/`/v1/embeddings`/`/v1/rerank`）与 `/api/*`（含 `/api/version`/`/api/tags`/`/api/chat`/`/api/show`）请求必须携带 `Authorization: Bearer <key>`，否则返回 401。管理端 `/admin/api/*` 不挂鉴权（由部署层防护）。开关读取每次请求走 `store.get()`，支持热更新；关闭时中间件完全旁路、零 IO
+  - **API Key 存储**：新增 `api_keys` 表（SQLite，与 sessions/logs 表共存于 `~/llmproxy/llmproxy.db`），字段 `id / name / key_hash (SHA-256) / key_prefix (前 8 字符) / created_at / expires_at (0=永不过期) / last_used_at / disabled`。明文 Key 仅创建时一次性返回；DB 仅存哈希 + 前缀（用于 UI 识别），单向不可逆。`last_used_at` 鉴权成功后异步触摸（失败仅告警，不阻断业务）
+  - **过期清理**：`api_keys` 表每天一次清理 `expires_at > 0 && expires_at < now` 的记录；过期与「不存在/已停用」在鉴权层用相同 401 文案（`invalid_api_key`），仅服务端 `code` 字段细分（`unknown_api_key` / `expired_api_key`），避免客户端枚举 Key 状态
+  - **管理端 CRUD**：`GET /admin/api/keys`（分页：`offset/limit`、`keyword` 模糊匹配 name/key_prefix、`includeDisabled=true` 包含停用记录）；`POST /admin/api/keys`（`{ name, expiresAt }`，返回 `{ ` id, name, apiKey (明文一次), keyPrefix, expiresAt, disabled, createdAt }`）；`PUT /admin/api/keys/:id`（`name / expiresAt / disabled` 任意子集）；`DELETE /admin/api/keys/:id`（幂等）；`GET /admin/api/auth/status`（`{ enabled, total }`，供前端开关切换前的提示）。`expiresAt <= now` 返回 400 `invalid_expires_at`
+  - **管理端 UI**：「API Keys」页面（侧边栏新增入口 + 路由 `/api-keys`）：顶部鉴权状态卡（开关 + Key 数）+ 列表（名称 / 前缀 / 过期时间 / 创建时间 / 状态标签：正常/已停用/已过期）+ 分页器（10/20/50/100，total 与服务端一致）+ 新建弹窗（name 必填 + 永不过期/日期选择器切换 + 创建结果明文一次弹窗，提示立即复制保存）+ 编辑弹窗（name / 过期时间）+ 启用/停用切换 + 删除确认
+  - **响应包络**：鉴权 401 响应遵循 OpenAI 风格 `{ error: { message, type: 'invalid_request_error', code: 'invalid_api_key' }, code: '<细因>' }`，附 `WWW-Authenticate: Bearer realm="llmproxy"` 响应头；敏感字段（明文 Key）绝不入日志（requestLogger 已过滤 `authorization`，且 `LogStore` 的 `sanitizeRawValue` 兜底；DB 中只存 SHA-256 哈希）
+  - **配置文件 bootstrap**：自动生成的 `llmproxy.jsonc` 中新增 `auth` 节注释示例（关闭状态）
+
 ## [0.5.1] / 2026-08-08
 
 ### 新增

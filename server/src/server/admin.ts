@@ -22,6 +22,8 @@ import type { StatsCounter } from '../stats/counter.js'
 import { SessionStore } from '../session/db.js'
 import { probeMaxContext } from '../upstream/context.js'
 import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
+import { ApiKeyStore } from '../auth/db.js'
+import { extractKeyPrefix, generateApiKey, hashApiKey } from '../auth/key.js'
 import { DOWNSTREAM_ENDPOINTS } from './downstreams.js'
 import { resolveListen, type CliArgs } from './listen.js'
 import { maskApiKey } from './admin-helpers.js'
@@ -35,6 +37,8 @@ export interface AdminDeps {
   sessionStore: SessionStore
   // 日志存储：/admin/api/logs 查询走 LogStore.query（SQLite），路由层不直接碰文件
   logStore: LogStore
+  // API Key 鉴权存储：列表/CRUD 路由层不直接碰 SQLite，统一走 ApiKeyStore
+  apiKeyStore: ApiKeyStore
   // 命令行 --host/--port：透传到 /admin/api/health，保证返回值与 app.listen 实际生效值一致
   cli?: CliArgs
 }
@@ -76,6 +80,38 @@ const SessionQuerySchema: ZodType<SessionQuery> = z.object({
   // query 参数均为字符串，用 coerce 转数字；int/min/max 校验不通过返回 400
   offset: z.coerce.number().int().min(0).default(0),
   limit: z.coerce.number().int().min(1).max(500).default(100),
+})
+
+// API Key 列表查询参数：keyword 模糊匹配 name/key_prefix；includeDisabled=true 同时返回停用记录；
+// offset/limit 游标分页，total 为满足筛选条件的总数（不含分页）
+interface ApiKeyQuery {
+  keyword?: string
+  includeDisabled?: boolean
+  offset: number
+  limit: number
+}
+
+const ApiKeyQuerySchema: ZodType<ApiKeyQuery> = z.object({
+  keyword: z.string().optional(),
+  includeDisabled: z
+    .union([z.boolean(), z.string()])
+    .optional()
+    .transform((v) => v === true || v === 'true'),
+  offset: z.coerce.number().int().min(0).default(0),
+  limit: z.coerce.number().int().min(1).max(500).default(100),
+})
+
+// API Key 创建入参：name 必填（1-64 字符）；expiresAt 0 表示永不过期；其他值需 > now
+const ApiKeyCreateSchema = z.object({
+  name: z.string().min(1).max(64),
+  expiresAt: z.number().int().min(0).default(0),
+})
+
+// API Key 更新入参：name / expiresAt / disabled 任意子集；未提供字段保留原值
+const ApiKeyUpdateSchema = z.object({
+  name: z.string().min(1).max(64).optional(),
+  expiresAt: z.number().int().min(0).optional(),
+  disabled: z.boolean().optional(),
 })
 
 // log4js / pino 共同的级别数值映射（前端 Logs 视图契约）：trace=10 debug=20 info=30 warn=40 error=50 fatal=60
@@ -146,7 +182,7 @@ function resolvePublicBaseUrl(listen: { host: string; port: number }): string {
  * 假定装配层已注入 express.json（10mb）与请求日志中间件。
  */
 export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
-  const { store, getUpstreamClient, stats, sessionStore, logStore, cli } = deps
+  const { store, getUpstreamClient, stats, sessionStore, logStore, apiKeyStore, cli } = deps
 
   // 上游列表：apiKey 掩码后返回（仅展示用途，绝不回传明文）
   app.get('/admin/api/upstreams', (_req: Request, res: Response) => {
@@ -557,6 +593,150 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
       getLogger().warn({ err, maxAgeMs }, '会话粘附过期清理失败')
       res.status(500).json({ error: 'session_cleanup_failed' })
     }
+  })
+
+  // API Key 列表：keyword 模糊匹配 name/key_prefix；includeDisabled=true 同时返回停用记录；
+  // offset/limit 游标分页，total 为满足筛选条件的总数（不含分页）；列表中的 keyHash 不回传
+  app.get('/admin/api/keys', (req: Request, res: Response) => {
+    const parsed = ApiKeyQuerySchema.safeParse(req.query)
+    if (!parsed.success) {
+      res.status(400).json({ error: 'invalid_query', issues: parsed.error.issues.map((i) => i.message) })
+      return
+    }
+    const { keyword, includeDisabled, offset, limit } = parsed.data
+    try {
+      const { rows, total } = apiKeyStore.list({ offset, limit, keyword, includeDisabled })
+      // 列表统一过滤敏感字段（keyHash）后再返回，前端只展示 keyPrefix 便于辨识
+      res.json({
+        rows: rows.map((r) => ({
+          id: r.id,
+          name: r.name,
+          keyPrefix: r.key_prefix,
+          expiresAt: r.expires_at,
+          disabled: r.disabled,
+          createdAt: r.created_at,
+        })),
+        total,
+      })
+    } catch (err) {
+      getLogger().warn({ err }, 'API Key 列表查询失败')
+      res.status(500).json({ error: 'api_key_list_failed' })
+    }
+  })
+
+  // 创建 API Key：name 必填，expiresAt 0 表示永不过期；返回完整明文 apiKey（仅创建时可见一次，列表/详情不再回传）
+  app.post('/admin/api/keys', (req: Request, res: Response) => {
+    const parsed = ApiKeyCreateSchema.safeParse(req.body)
+    if (!parsed.success) {
+      res.status(400).json({ error: 'invalid_request', issues: parsed.error.issues.map((i) => i.message) })
+      return
+    }
+    const { name, expiresAt } = parsed.data
+    const now = Date.now()
+    if (expiresAt !== 0 && expiresAt <= now) {
+      res.status(400).json({ error: 'invalid_expires_at' })
+      return
+    }
+    const apiKey = generateApiKey()
+    const keyPrefix = extractKeyPrefix(apiKey)
+    const keyHash = hashApiKey(apiKey)
+    try {
+      const row = apiKeyStore.insert({
+        name,
+        keyHash,
+        keyPrefix,
+        expiresAt,
+      })
+      res.status(201).json({
+        id: row.id,
+        name: row.name,
+        apiKey, // 明文仅此处返回一次
+        keyPrefix,
+        expiresAt: row.expires_at,
+        disabled: row.disabled,
+        createdAt: row.created_at,
+      })
+    } catch (err) {
+      getLogger().warn({ err }, 'API Key 创建失败')
+      res.status(500).json({ error: 'api_key_create_failed' })
+    }
+  })
+
+  // 更新 API Key：name / expiresAt / disabled 任意子集；记录不存在返回 404
+  app.put('/admin/api/keys/:id', (req: Request, res: Response) => {
+    const id = Number(req.params.id)
+    if (!Number.isInteger(id) || id <= 0) {
+      res.status(400).json({ error: 'invalid_id' })
+      return
+    }
+    const parsed = ApiKeyUpdateSchema.safeParse(req.body)
+    if (!parsed.success) {
+      res.status(400).json({ error: 'invalid_request', issues: parsed.error.issues.map((i) => i.message) })
+      return
+    }
+    const { expiresAt } = parsed.data
+    if (expiresAt !== undefined) {
+      const now = Date.now()
+      if (expiresAt !== 0 && expiresAt <= now) {
+        res.status(400).json({ error: 'invalid_expires_at' })
+        return
+      }
+    }
+    const updateInfo: { name?: string; expiresAt?: number; disabled?: boolean } = {}
+    if (parsed.data.name !== undefined) updateInfo.name = parsed.data.name
+    if (parsed.data.expiresAt !== undefined) updateInfo.expiresAt = parsed.data.expiresAt
+    if (parsed.data.disabled !== undefined) updateInfo.disabled = parsed.data.disabled
+    try {
+      const ok = apiKeyStore.update(id, updateInfo)
+      if (!ok) {
+        res.status(404).json({ error: 'api_key_not_found' })
+        return
+      }
+      const row = apiKeyStore.getById(id)
+      if (row === undefined) {
+        // 理论上不可达：update 已返回 true，但兜底返回 404
+        res.status(404).json({ error: 'api_key_not_found' })
+        return
+      }
+      res.json({
+        id: row.id,
+        name: row.name,
+        keyPrefix: row.key_prefix,
+        expiresAt: row.expires_at,
+        disabled: row.disabled,
+        createdAt: row.created_at,
+      })
+    } catch (err) {
+      getLogger().warn({ err, id }, 'API Key 更新失败')
+      res.status(500).json({ error: 'api_key_update_failed' })
+    }
+  })
+
+  // 删除 API Key：幂等，不存在也返回 200 { deleted: false }
+  app.delete('/admin/api/keys/:id', (req: Request, res: Response) => {
+    const id = Number(req.params.id)
+    if (!Number.isInteger(id) || id <= 0) {
+      res.status(400).json({ error: 'invalid_id' })
+      return
+    }
+    try {
+      res.json({ deleted: apiKeyStore.delete(id) })
+    } catch (err) {
+      getLogger().warn({ err, id }, 'API Key 删除失败')
+      res.status(500).json({ error: 'api_key_delete_failed' })
+    }
+  })
+
+  // 鉴权状态：返回当前开关 + Key 数（供前端开关切换前的提示）
+  app.get('/admin/api/auth/status', (_req: Request, res: Response) => {
+    const enabled = store.get().auth?.enabled === true
+    let total = 0
+    try {
+      total = apiKeyStore.list({ offset: 0, limit: 1, includeDisabled: true }).total
+    } catch (err) {
+      getLogger().warn({ err }, '鉴权状态查询失败')
+    }
+    res.json({ enabled, total })
   })
 
   // 健康检查：进程存活 + 版本 + 各上游健康状态（disabled → paused）

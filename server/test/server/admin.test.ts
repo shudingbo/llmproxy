@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ConfigStore } from '../../src/config/store.js'
 import { LogStore, type LogEntry } from '../../src/logstore/index.js'
 import { SessionStore, type SessionBindInfo } from '../../src/session/db.js'
+import { ApiKeyStore } from '../../src/auth/db.js'
 import { StatsCounter } from '../../src/stats/counter.js'
 import { probeMaxContext } from '../../src/upstream/context.js'
 import type { OpenAIUpstreamClient } from '../../src/upstream/openai.js'
@@ -126,6 +127,8 @@ let sessionStore: SessionStore
 let sessionDbPath: string
 let logStore: LogStore
 let logDbPath: string
+let apiKeyStore: ApiKeyStore
+let apiKeyDbPath: string
 let app: Express
 let clients: Map<string, OpenAIUpstreamClient>
 
@@ -139,6 +142,7 @@ function buildApp(cli?: { host?: string; port?: number }): void {
     stats,
     sessionStore,
     logStore,
+    apiKeyStore,
     cli,
   })
 }
@@ -156,6 +160,9 @@ beforeEach(() => {
   // 日志存储：真实 LogStore + 临时 DB 文件（独立文件，避免与 sessions 表互相干扰）
   logDbPath = join(tmpDir, 'logs.db')
   logStore = new LogStore(logDbPath)
+  // API Key 鉴权存储：真实 ApiKeyStore + 临时 DB 文件
+  apiKeyDbPath = join(tmpDir, 'apikeys.db')
+  apiKeyStore = new ApiKeyStore(apiKeyDbPath)
   clients = new Map()
   buildApp()
   // Windows 读 USERPROFILE，POSIX 读 HOME：两个都 stub 才跨平台生效
@@ -173,6 +180,11 @@ afterEach(async () => {
   }
   try {
     logStore.close()
+  } catch {
+    // 连接已关闭，无需处理
+  }
+  try {
+    apiKeyStore.close()
   } catch {
     // 连接已关闭，无需处理
   }

@@ -12,6 +12,8 @@ import { SessionStore } from '../session/db.js'
 import { LogStore } from '../logstore/index.js'
 import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
 import { StatsCounter } from '../stats/counter.js'
+import { ApiKeyStore } from '../auth/db.js'
+import { createAuthMiddleware } from '../auth/middleware.js'
 import { getConfigPath, getDataDir, getLogDir } from '../paths.js'
 import { getLogger, initLogRetention, requestLogger, configureLogging, setLogStore } from '../logger/index.js'
 import { RETENTION_DAYS } from '../logger/sweep.js'
@@ -75,6 +77,8 @@ export function createApp(deps: AppDeps): Express {
   const sessionStore = new SessionStore(join(getDataDir(), 'llmproxy.db'))
   // 日志 SQLite 存储：与 SessionStore 共用 ~/llmproxy/llmproxy.db（WAL 多连接安全）
   const logStore = new LogStore(join(getDataDir(), 'llmproxy.db'))
+  // API Key 鉴权存储：与 SessionStore / LogStore 共用 ~/llmproxy/llmproxy.db
+  const apiKeyStore = new ApiKeyStore(join(getDataDir(), 'llmproxy.db'))
   // 双写：所有 getLogger().info/warn/... 在写文件的同时写 SQLite
   setLogStore(logStore)
   // 会话亲和总开关：routing.sessionAffinity.enabled 缺省为 true（schema 已给默认值），
@@ -115,6 +119,19 @@ export function createApp(deps: AppDeps): Express {
   cleanupLogs() // 启动执行一次
   setInterval(cleanupLogs, LOG_SWEEP_INTERVAL_MS).unref()
 
+  // API Key 过期清理：每天一次清理已过期的 Key；过期记录仍可能被某些客户端缓存在调用链上，
+  // 但 DB 端及时回收避免列表噪声
+  const cleanupApiKeys = (): void => {
+    try {
+      const deleted = apiKeyStore.cleanupExpired()
+      if (deleted > 0) getLogger().info(`过期 API Key 清理完成，删除 ${deleted} 条`, 'apikey-cleanup')
+    } catch (err) {
+      getLogger().warn('API Key 清理失败', err)
+    }
+  }
+  cleanupApiKeys() // 启动执行一次
+  setInterval(cleanupApiKeys, 24 * 60 * 60 * 1000).unref()
+
   // 每次上游尝试的统计钩子：直接计入计数器（status 字段被忽略，AttemptInfo 不需它）
   const onAttempt = (info: { upstreamId: string; ok: boolean; durationMs: number; status?: number }): void => {
     stats.recordAttempt(info)
@@ -130,10 +147,29 @@ export function createApp(deps: AppDeps): Express {
   app.use(express.json({ limit: store.get().server?.bodyLimit ?? '10mb' }))
   // 请求日志中间件：每个请求生成 requestId 并记录方法/URL/状态码/耗时
   app.use(requestLogger)
+  // API Key 鉴权中间件：仅作用于 /v1/* 与 /api/*；管理端 /admin/api 无鉴权（由部署层防护）。
+  // 鉴权开关关闭时中间件旁路，开关读取每次请求走 store.get() 支持热更新
+  const authMiddleware = createAuthMiddleware({ store, apiKeyStore })
   // 三组 API 路由：管理端 / OpenAI 兼容 / Ollama 兼容
-  registerAdminRoutes(app, { store, getUpstreamClient, stats, sessionStore, logStore, cli })
-  registerOpenAIRoutes(app, { store, getUpstreamClient, router, loadBalancer, onAttempt, sessionStore })
-  registerOllamaRoutes(app, { store, getUpstreamClient, router, loadBalancer, onAttempt, sessionStore })
+  registerAdminRoutes(app, { store, getUpstreamClient, stats, sessionStore, logStore, apiKeyStore, cli })
+  registerOpenAIRoutes(app, {
+    store,
+    getUpstreamClient,
+    router,
+    loadBalancer,
+    onAttempt,
+    sessionStore,
+    authMiddleware,
+  })
+  registerOllamaRoutes(app, {
+    store,
+    getUpstreamClient,
+    router,
+    loadBalancer,
+    onAttempt,
+    sessionStore,
+    authMiddleware,
+  })
 
   // 静态 SPA 产物（由 web 包 vite build 生成）；目录缺失时 express.static 只回 404，不抛错
   app.use(express.static(webDistPath))

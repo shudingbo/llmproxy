@@ -150,9 +150,11 @@ export function createApp(deps: AppDeps): Express {
 
   const app = express()
   // 请求体解析：先于路由；上限取 server.bodyLimit（缺省 '10mb'，大体积多模态请求）。
-  // 与监听 host/port 同属进程级配置：createApp 装配时读取一次，热重载不重新应用，改后需重启
+  // 与监听 host/port 同属进程级配置：createApp 装配时读取一次配置，热重载不重新应用，改后需重启
   app.use(express.json({ limit: store.get().server?.bodyLimit ?? '10mb' }))
-  // 请求日志中间件：每个请求生成 requestId 并记录方法/URL/状态码/耗时
+  // 请求日志中间件：每个请求生成 requestId 并记录方法/URL/状态码/耗时；
+  // 白名单（logger 模块内硬编码 LOG_EXCLUDE_PATHS，含 '/admin/api/logs'）内的请求跳过日志写入，
+  // 避免日志查询接口自身污染日志
   app.use(requestLogger)
   // API Key 鉴权中间件：仅作用于 /v1/* 与 /api/*；管理端 /admin/api 无鉴权（由部署层防护）。
   // 鉴权开关关闭时中间件旁路，开关读取每次请求走 store.get() 支持热更新

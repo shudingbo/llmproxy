@@ -311,9 +311,40 @@ function redactHeaders(headers: IncomingHttpHeaders): Record<string, string | st
 }
 
 /**
+ * API 请求日志白名单：精确路径前缀，命中任一前缀的请求不写入 api 日志
+ * （既不写文件也不入 SQLite）。典型用途：高 QPS 的管理端查询自身（/admin/api/logs），
+ * 防止日志查询反过来污染日志。
+ *
+ * 当前白名单：
+ * - /admin/api/logs：日志查询接口（GET /admin/api/logs、DELETE /admin/api/logs/cleanup 等）
+ *
+ * 如需扩展白名单，直接修改本常量即可；前缀匹配（保留尾部 /），子路径自动命中
+ */
+const LOG_EXCLUDE_PATHS: readonly string[] = ['/admin/api/logs']
+
+/**
+ * 路径是否命中白名单：精确前缀匹配，命中任一前缀即返回 true
+ * - 例 prefixes=['/admin/api/logs']，path='/admin/api/logs' 或 '/admin/api/logs/cleanup' → true
+ *
+ * 仅以 req.originalUrl（路由完整 URL，未做路由替换）与 req.url 兜底为基础做字符串比对，
+ * 不解析查询串；查询串在 Express 5 中已自动剥离
+ */
+function isPathExcluded(url: string): boolean {
+  for (const prefix of LOG_EXCLUDE_PATHS) {
+    if (url === prefix || url.startsWith(`${prefix}`)) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
  * Express 请求日志中间件：使用 api category（JSON 格式）。
  * 与原 pino 版本行为一致：每个请求生成 requestId，响应完成输出结构化日志。
  * 绝不记录请求体，也绝不记录 Authorization / x-api-key。
+ *
+ * 白名单内的请求（精确前缀命中 LOG_EXCLUDE_PATHS）既不写 api 文件日志，也不入 SQLite 日志库；
+ * 用于避免日志查询接口自身污染日志
  */
 export function requestLogger(req: RequestWithLog, res: ResponseWithLog, next: NextFunction): void {
   const requestId = nanoid()
@@ -321,6 +352,12 @@ export function requestLogger(req: RequestWithLog, res: ResponseWithLog, next: N
   res.requestId = requestId
   const startedAt = process.hrtime.bigint()
   const reqLogger = getApiLogger()
+  const url = req.originalUrl ?? req.url ?? ''
+  // 白名单内的请求跳过 finish 日志（连 res.on('finish') 都不挂，零开销）
+  if (isPathExcluded(url)) {
+    next()
+    return
+  }
   res.on('finish', () => {
     const durationMs = Math.round((Number(process.hrtime.bigint() - startedAt) / 1e6) * 100) / 100
     reqLogger.info(

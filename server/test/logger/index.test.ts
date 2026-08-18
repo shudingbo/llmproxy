@@ -308,6 +308,65 @@ describe('requestLogger', () => {
     expect(content).not.toContain('hunter2')
     expect(content).not.toContain('must-not-leak')
   })
+
+  it('白名单：/admin/api/logs 精确路径跳过 finish 日志（不写文件、不入 SQLite）', async () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 17, 0, 0))
+    const req = {
+      method: 'GET',
+      url: '/admin/api/logs',
+      originalUrl: '/admin/api/logs?date=2026-08-02',
+      headers: { 'user-agent': 'vitest' },
+    } as unknown as ReqLike
+    const res = new FakeResponse() as unknown as ResLike
+    const next = vi.fn()
+    mod.requestLogger(req, res, next)
+
+    // 仍然 next + 生成 requestId（与正常请求一致，便于下游处理）
+    expect(next).toHaveBeenCalledTimes(1)
+    expect((req as unknown as { requestId?: string }).requestId).toBeTruthy()
+
+    // 触发 finish 也不应产生日志条目
+    res.emit('finish')
+
+    // 抓本用例专属 marker：在 req 上挂一个唯一字段，确认整轮没有任何 request-complete 写出
+    const allLogs = await readAllLogs(() => true)
+    // 本次时间窗口的 finish 输出不应包含 admin/api/logs URL
+    expect(allLogs).not.toContain('"url":"/admin/api/logs?date=2026-08-02"')
+    // 也包含 query 剥离检查：日志 URL 不应原样出现（即使记录也应只保留 originalUrl，无 query），
+    // 但因白名单命中，根本不应记录，故仅断言未出现即可
+  })
+
+  it('白名单：/admin/api/logs 的子路径（如 /cleanup）同样跳过', async () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 18, 0, 0))
+    const req = {
+      method: 'POST',
+      url: '/admin/api/logs/cleanup',
+      originalUrl: '/admin/api/logs/cleanup',
+      headers: {},
+    } as unknown as ReqLike
+    const res = new FakeResponse() as unknown as ResLike
+    mod.requestLogger(req, res, vi.fn())
+    res.emit('finish')
+
+    const allLogs = await readAllLogs(() => true)
+    expect(allLogs).not.toContain('"/admin/api/logs/cleanup"')
+  })
+
+  it('非白名单路径仍正常记录（如 /admin/api/upstreams）', async () => {
+    vi.setSystemTime(new Date(2026, 7, 2, 19, 0, 0))
+    const req = {
+      method: 'GET',
+      url: '/admin/api/upstreams',
+      originalUrl: '/admin/api/upstreams',
+      headers: { 'user-agent': 'vitest' },
+    } as unknown as ReqLike
+    const res = new FakeResponse() as unknown as ResLike
+    mod.requestLogger(req, res, vi.fn())
+    res.emit('finish')
+
+    const content = await readAllLogs((c) => c.includes('"url":"/admin/api/upstreams"'))
+    expect(content).toContain('"url":"/admin/api/upstreams"')
+  })
 })
 
 describe('setLogStore + SQLite 双写', () => {

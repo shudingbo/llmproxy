@@ -109,7 +109,7 @@ describe('鉴权中间件 createAuthMiddleware', () => {
   })
 
   it('auth.enabled=true 但 DB 中无 Key → 缺失 Authorization 返回 401', async () => {
-    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24 } }, { source: 'admin' })
+    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24, cleanupRetentionDays: 7 } }, { source: 'admin' })
     const res = await request(app).get('/v1/models')
     expect(res.status).toBe(401)
     expect(res.body.code).toBe('missing_or_malformed_authorization')
@@ -117,7 +117,7 @@ describe('鉴权中间件 createAuthMiddleware', () => {
   })
 
   it('auth.enabled=true 但格式错误（不带 Bearer / 空 token）→ 401', async () => {
-    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24 } }, { source: 'admin' })
+    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24, cleanupRetentionDays: 7 } }, { source: 'admin' })
     const r1 = await request(app).get('/v1/models').set('Authorization', 'Basic abc')
     expect(r1.status).toBe(401)
     expect(r1.body.code).toBe('missing_or_malformed_authorization')
@@ -126,7 +126,7 @@ describe('鉴权中间件 createAuthMiddleware', () => {
   })
 
   it('auth.enabled=true 携带合法 Key → 200，并通过 last_used_at 触摸', async () => {
-    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24 } }, { source: 'admin' })
+    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24, cleanupRetentionDays: 7 } }, { source: 'admin' })
     const plain = generateApiKey()
     const row = apiKeyStore.insert({
       name: 'test',
@@ -144,7 +144,7 @@ describe('鉴权中间件 createAuthMiddleware', () => {
   })
 
   it('auth.enabled=true 携带错误 Key → 401（unknown_api_key）', async () => {
-    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24 } }, { source: 'admin' })
+    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24, cleanupRetentionDays: 7 } }, { source: 'admin' })
     const res = await request(app)
       .get('/v1/models')
       .set('Authorization', 'Bearer sk-llmproxy-wrong-key-zzzzz')
@@ -153,7 +153,7 @@ describe('鉴权中间件 createAuthMiddleware', () => {
   })
 
   it('auth.enabled=true 携带已停用 Key → 401（unknown_api_key，与不存在同形）', async () => {
-    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24 } }, { source: 'admin' })
+    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24, cleanupRetentionDays: 7 } }, { source: 'admin' })
     const plain = generateApiKey()
     const row = apiKeyStore.insert({
       name: 'stopped',
@@ -168,7 +168,7 @@ describe('鉴权中间件 createAuthMiddleware', () => {
   })
 
   it('auth.enabled=true 携带已过期 Key → 401（expired_api_key）', async () => {
-    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24 } }, { source: 'admin' })
+    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24, cleanupRetentionDays: 7 } }, { source: 'admin' })
     const plain = generateApiKey()
     const row = apiKeyStore.insert({
       name: 'old',
@@ -185,7 +185,7 @@ describe('鉴权中间件 createAuthMiddleware', () => {
 
   it('auth.enabled=true 配置热切换：关闭后立即旁路', async () => {
     // 先开启
-    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24 } }, { source: 'admin' })
+    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24, cleanupRetentionDays: 7 } }, { source: 'admin' })
     const plain = generateApiKey()
     apiKeyStore.insert({
       name: 'x',
@@ -197,13 +197,13 @@ describe('鉴权中间件 createAuthMiddleware', () => {
     const r1 = await request(app).get('/v1/models')
     expect(r1.status).toBe(401)
     // 关闭
-    store.set({ ...BASE_CONFIG, auth: { enabled: false, keyBytes: 24 } }, { source: 'admin' })
+    store.set({ ...BASE_CONFIG, auth: { enabled: false, keyBytes: 24, cleanupRetentionDays: 7 } }, { source: 'admin' })
     const r2 = await request(app).get('/v1/models')
     expect(r2.status).toBe(200)
   })
 
   it('Bearer 大小写不敏感：bearer / BEARER 均识别', async () => {
-    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24 } }, { source: 'admin' })
+    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24, cleanupRetentionDays: 7 } }, { source: 'admin' })
     const plain = generateApiKey()
     apiKeyStore.insert({
       name: 'case',
@@ -218,7 +218,7 @@ describe('鉴权中间件 createAuthMiddleware', () => {
   })
 
   it('管理端 /admin/api/* 无需 Key，即使开关开启也可访问', async () => {
-    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24 } }, { source: 'admin' })
+    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24, cleanupRetentionDays: 7 } }, { source: 'admin' })
     // 无 token 直接请求 /admin/api/auth/status → 200（管理端由部署层防护）
     const res = await request(app).get('/admin/api/auth/status')
     expect(res.status).toBe(200)
@@ -349,7 +349,7 @@ describe('管理端 API Key CRUD /admin/api/keys', () => {
     expect(s.body.enabled).toBe(false)
 
     // 开启 auth
-    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24 } }, { source: 'admin' })
+    store.set({ ...BASE_CONFIG, auth: { enabled: true, keyBytes: 24, cleanupRetentionDays: 7 } }, { source: 'admin' })
     s = await request(app).get('/admin/api/auth/status')
     expect(s.body.enabled).toBe(true)
     expect(s.body.total).toBe(1)

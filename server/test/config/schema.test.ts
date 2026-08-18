@@ -1,6 +1,7 @@
 // 模式测试：默认值补齐、非法字段拒绝
 import { describe, expect, it } from 'vitest'
 import {
+  AuthConfigSchema,
   ConfigSchema,
   RoutingSchema,
   UpstreamCandidateSchema,
@@ -421,5 +422,39 @@ describe('RoutingSchema', () => {
       cleanupMaxAgeMs: 604800000,
       cleanupIntervalMs: 3600000,
     })
+  })
+})
+
+describe('AuthConfigSchema', () => {
+  it('空对象解析成功且取全部默认值（enabled=false, keyBytes=24, cleanupRetentionDays=7）', () => {
+    const result = AuthConfigSchema.safeParse({})
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data).toEqual({
+      enabled: false,
+      keyBytes: 24,
+      cleanupRetentionDays: 7,
+    })
+  })
+
+  it('仅写 enabled=true，其余字段取默认值', () => {
+    const result = AuthConfigSchema.safeParse({ enabled: true })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.enabled).toBe(true)
+    expect(result.data.keyBytes).toBe(24)
+    expect(result.data.cleanupRetentionDays).toBe(7)
+  })
+
+  it('cleanupRetentionDays=0 允许（过期即清理）', () => {
+    const result = AuthConfigSchema.safeParse({ cleanupRetentionDays: 0 })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.cleanupRetentionDays).toBe(0)
+  })
+
+  it('cleanupRetentionDays 为负或超 3650 拒绝', () => {
+    expect(AuthConfigSchema.safeParse({ cleanupRetentionDays: -1 }).success).toBe(false)
+    expect(AuthConfigSchema.safeParse({ cleanupRetentionDays: 3651 }).success).toBe(false)
   })
 })

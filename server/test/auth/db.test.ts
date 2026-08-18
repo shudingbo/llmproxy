@@ -195,7 +195,7 @@ describe('ApiKeyStore', () => {
     expect(store.delete(row.id)).toBe(false)
   })
 
-  it('cleanupExpired：expires_at=0 永不过期；expires_at 已过期的被清理；未过期保留', () => {
+  it('cleanupExpired：retentionDays=0 → 过期即清理（默认行为）；永不过期与未过期保留', () => {
     const { hash: h1, prefix: p1 } = makeKey()
     const { hash: h2, prefix: p2 } = makeKey()
     const { hash: h3, prefix: p3 } = makeKey()
@@ -204,13 +204,51 @@ describe('ApiKeyStore', () => {
     store.insert({ name: 'expired', keyHash: h2, keyPrefix: p2, expiresAt: now - 1000 })
     store.insert({ name: 'valid', keyHash: h3, keyPrefix: p3, expiresAt: now + 60000 })
 
-    // 传 now：过期（expired）被删；forever (0) 不动；valid (>now) 保留
-    const deleted = store.cleanupExpired(now)
+    // retentionDays=0 → cutoff = now：过期（expired）被删；forever (0) 不动；valid (>now) 保留
+    const deleted = store.cleanupExpired(0, now)
     expect(deleted).toBe(1)
     // expired 行已删
     expect(store.list({ offset: 0, limit: 10, keyword: 'expired', includeDisabled: true }).total).toBe(0)
     // forever 与 valid 仍在
     expect(store.list({ offset: 0, limit: 10, includeDisabled: true }).total).toBe(2)
+  })
+
+  it('cleanupExpired：retentionDays>0 → 仅清理「已过期 N 天以上」的记录', () => {
+    const { hash: h1, prefix: p1 } = makeKey()
+    const { hash: h2, prefix: p2 } = makeKey()
+    const { hash: h3, prefix: p3 } = makeKey()
+    const { hash: h4, prefix: p4 } = makeKey()
+    const now = Date.now()
+    const day = 86400000
+    // 永不过期
+    store.insert({ name: 'forever', keyHash: h1, keyPrefix: p1, expiresAt: 0 })
+    // 刚过期 1 天（保留期内）
+    store.insert({ name: 'fresh-expired', keyHash: h2, keyPrefix: p2, expiresAt: now - 1 * day })
+    // 已过期 30 天（保留期外）
+    store.insert({ name: 'stale-expired', keyHash: h3, keyPrefix: p3, expiresAt: now - 30 * day })
+    // 未来 60 天
+    store.insert({ name: 'future', keyHash: h4, keyPrefix: p4, expiresAt: now + 60 * day })
+
+    // retentionDays=7：cutoff = now - 7*day
+    // → fresh-expired (now - 1d) > cutoff → 保留
+    // → stale-expired (now - 30d) < cutoff → 清理
+    // → forever 与 future 不动
+    const deleted = store.cleanupExpired(7, now)
+    expect(deleted).toBe(1)
+    // 剩余 3 条
+    expect(store.list({ offset: 0, limit: 10, includeDisabled: true }).total).toBe(3)
+    // stale-expired 已删
+    expect(store.list({ offset: 0, limit: 10, keyword: 'stale', includeDisabled: true }).total).toBe(0)
+    // fresh-expired 仍存在（保留期内未到清理阈值）
+    expect(store.list({ offset: 0, limit: 10, keyword: 'fresh', includeDisabled: true }).total).toBe(1)
+  })
+
+  it('cleanupExpired：retentionDays 缺省（0）时等价于过期即清理', () => {
+    const { hash, prefix } = makeKey()
+    const now = Date.now()
+    store.insert({ name: 'just-expired', keyHash: hash, keyPrefix: prefix, expiresAt: now - 1000 })
+    // 不传 retentionDays → 走缺省 0 → 过期即清
+    expect(store.cleanupExpired(undefined, now)).toBe(1)
   })
 
   it('close 后重新 open 同一文件 → 数据仍在', () => {

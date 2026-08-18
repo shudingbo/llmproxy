@@ -67,10 +67,12 @@ const BOOTSTRAP_JSONC = `{
   // API Key 鉴权（可选）：
   // enabled = true 后所有 /v1/* 与 /api/* 请求必须携带 Authorization: Bearer <Key>，
   // 否则返回 401。Key 通过管理端「API Keys」页面管理（增删改查），存 SQLite。
-  // 关闭（缺省）时完全旁路鉴权中间件，向后兼容现有部署
+  // 关闭（缺省）时完全旁路鉴权中间件，向后兼容现有部署。
+  // cleanupRetentionDays：过期 Key 在 DB 中保留多少天后才被自动清理（缺省 7，0 = 过期即清理）
   // "auth": {
   //   "enabled": false,
-  //   "keyBytes": 24
+  //   "keyBytes": 24,
+  //   "cleanupRetentionDays": 7
   // }
 }
 `

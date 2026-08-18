@@ -168,11 +168,15 @@ export class ApiKeyStore {
     return this.deleteStmt.run(id).changes > 0
   }
 
-  // 过期清理：删除 (expires_at > 0 AND expires_at < now) 的记录；返回删除条数
+  // 过期清理：删除 (expires_at > 0 AND expires_at < cutoff) 的记录；返回删除条数
   // 永不过期（expires_at = 0）的不受影响；返回条数供统计
-  cleanupExpired(now: number = Date.now()): number {
+  // - retentionDays = 0：cutoff = now（已过期即清理，行为同旧版「过期即删」）
+  // - retentionDays > 0：cutoff = now - retentionDays * 86400000（过期 N 天后才删，审计回溯）
+  cleanupExpired(retentionDays: number | undefined = 0, now: number = Date.now()): number {
+    const days = retentionDays ?? 0
+    const cutoff = days > 0 ? now - days * 86400000 : now
     const stmt = this.db.prepare('DELETE FROM api_keys WHERE expires_at > 0 AND expires_at < ?')
-    return stmt.run(now).changes
+    return stmt.run(cutoff).changes
   }
 
   // 关闭连接（WAL 模式下关闭后数据仍持久化在 db 文件中）

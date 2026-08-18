@@ -114,14 +114,17 @@ export const RoutingSchema = z.object({
  * - enabled：全局鉴权开关；开启后所有下行流调用（/v1/*、/api/*）必须携带有效 API Key，
  *   否则返回 401；关闭时完全旁路中间件、向后兼容现有部署
  * - keyBytes：生成的 API Key 随机字节数（默认 24 → 32 hex 字符 + 'sk-' 前缀）
+ * - cleanupRetentionDays：过期 API Key 在 SQLite 中的保留天数；过期超过该天数才被自动清理，
+ *   0 表示已过期即立即清理（缺省 7 天；保留期用于审计回溯，防止过期即丢）
  *
  * 允许只写 enabled 或不写本节；整个 auth 可缺省（即 disabled）。
- * 注：API Key 本身存 SQLite（hash + 前缀），不在配置文件中保存；本节只描述开关
+ * 注：API Key 本身存 SQLite（hash + 前缀），不在配置文件中保存；本节只描述开关与策略
  */
 export const AuthConfigSchema = z
   .object({
     enabled: z.boolean().default(false),
     keyBytes: z.number().int().min(8).max(64).default(24),
+    cleanupRetentionDays: z.number().int().min(0).max(3650).default(7),
   })
   .prefault({})
 

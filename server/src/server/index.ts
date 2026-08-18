@@ -119,12 +119,19 @@ export function createApp(deps: AppDeps): Express {
   cleanupLogs() // 启动执行一次
   setInterval(cleanupLogs, LOG_SWEEP_INTERVAL_MS).unref()
 
-  // API Key 过期清理：每天一次清理已过期的 Key；过期记录仍可能被某些客户端缓存在调用链上，
-  // 但 DB 端及时回收避免列表噪声
+  // API Key 过期清理：每天一次清理「已过期超过 cleanupRetentionDays 天」的 Key；
+  // 保留期由 auth.cleanupRetentionDays 控制（缺省 7 天，0 = 过期即清理），
+  // 启动时读一次配置；配置变更后下次清理周期生效，不重启进程
   const cleanupApiKeys = (): void => {
     try {
-      const deleted = apiKeyStore.cleanupExpired()
-      if (deleted > 0) getLogger().info(`过期 API Key 清理完成，删除 ${deleted} 条`, 'apikey-cleanup')
+      const retentionDays = store.get().auth?.cleanupRetentionDays ?? 7
+      const deleted = apiKeyStore.cleanupExpired(retentionDays)
+      if (deleted > 0) {
+        getLogger().info(
+          `过期 API Key 清理完成（保留 ${retentionDays} 天），删除 ${deleted} 条`,
+          'apikey-cleanup',
+        )
+      }
     } catch (err) {
       getLogger().warn('API Key 清理失败', err)
     }

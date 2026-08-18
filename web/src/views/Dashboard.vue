@@ -217,7 +217,9 @@ onUnmounted(() => {
         <!-- 当前进程生效的下行流入口 + 来源标签：方便运维一眼看到访问地址与生效来源 -->
         <div v-if="baseUrl" class="base-url-pill" :title="`来源：${sourceLabel(listenSource)}`">
           <span class="base-url-label">Base URL</span>
-          <a :href="baseUrl" target="_blank" class="base-url-value">{{ baseUrl }}</a>
+          <CopyText class="alias-title" :copy-text="baseUrl">
+            <a :href="baseUrl" target="_blank" class="base-url-value">{{ baseUrl }}</a>
+          </CopyText>
         </div>
       </div>
       <el-row :gutter="16">

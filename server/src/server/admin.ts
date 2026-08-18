@@ -1,5 +1,5 @@
 // 管理端 REST 接口：/admin/api/* 全部端点
-// 职责：上游增删改查与连通性测试、下游模型映射替换、日志查询、统计、健康检查、配置查看与重载错误
+// 职责：上游增删改查与连通性测试、下游模型映射替换、日志查询、统计、健康检查、配置查看/保存与重载错误
 // 无鉴权（由部署层防护）、无 CORS（开发期走 web/vite 代理）；apiKey 一律不落日志、响应中全部掩码
 import { readFileSync } from 'node:fs'
 import { networkInterfaces } from 'node:os'
@@ -8,6 +8,7 @@ import { z, type ZodType } from 'zod'
 import type { Config } from '../config/schema.js'
 import type { ConfigStore } from '../config/store.js'
 import {
+  ConfigSchema,
   DownstreamAliasGroupSchema,
   DownstreamModelEntrySchema,
   UpstreamSchema,
@@ -765,6 +766,43 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
   app.get('/admin/api/config', (_req: Request, res: Response) => {
     const config = store.get()
     res.json({ ...config, upstreams: config.upstreams.map((u) => ({ ...u, apiKey: maskApiKey(u.apiKey) })) })
+  })
+
+  // 保存系统配置：部分更新 server / routing / auth 三节（请求体缺省的键不修改现有值）
+  // 校验用 ConfigSchema.pick（三节本身 optional，未知顶层键被过滤）；写回复用 store.set（原子写盘 + deepEqual 防自环）
+  // restartRequired 语义：本次请求体实际提供的、需重启才生效的顶层键——
+  //   server 节（监听 host/port 与 bodyLimit 在进程启动时绑定）→ 含 'server'；
+  //   routing 节（会话亲和开关与清理参数在启动时读取，节内无其它字段）→ 含 'routing'；
+  //   auth 节每请求实时读 store，永不列入
+  app.put('/admin/api/config', (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const parsed = ConfigSchema.pick({ server: true, routing: true, auth: true }).safeParse(req.body)
+    if (!parsed.success) {
+      const issues = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`)
+      res
+        .status(400)
+        .json({ status: false, msg: `系统配置校验失败：${issues.join('；')}`, error: 'invalid_config', issues })
+      return
+    }
+    // 注：AuthConfigSchema 的 .prefault({}) 会使未提供的 auth 节也带默认值出现在 parsed.data，
+    // 直接合并会把未提供的节静默重置为默认值（例如把已启用的鉴权关掉），故按请求体实际提供的键过滤
+    const patch: Partial<Pick<Config, 'server' | 'routing' | 'auth'>> = {}
+    if (body.server !== undefined) patch.server = parsed.data.server
+    if (body.routing !== undefined) patch.routing = parsed.data.routing
+    if (body.auth !== undefined) patch.auth = parsed.data.auth
+    // 需重启的顶层键：以请求体实际提供的键为准（与写入过滤同一判据）
+    const restartRequired: string[] = []
+    if (body.server !== undefined) restartRequired.push('server')
+    if (body.routing !== undefined) restartRequired.push('routing')
+    try {
+      const config = store.get()
+      store.set({ ...config, ...patch }, { source: 'admin' })
+    } catch (err) {
+      getLogger().warn({ err }, '保存系统配置失败')
+      res.status(500).json({ status: false, msg: '保存系统配置失败', error: 'config_save_failed' })
+      return
+    }
+    res.json({ status: true, msg: '系统配置已保存', config: patch, restartRequired })
   })
 
   // 最近一次外部重载错误（无则 null）

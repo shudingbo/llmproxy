@@ -15,7 +15,7 @@
 
 首次启动时若文件不存在，会自动生成一份带注释的示例配置，落盘权限 `0600`（仅属主可读写，保护明文 apiKey）。
 
-修改保存后由文件监听（chokidar，200ms 防抖）自动热重载，**无需重启**。唯一例外是 `server` 监听配置（见下文）。重载失败不会阻塞启动，会保留旧配置并在管理界面与日志中显示告警（管理端可查 `GET /admin/api/config/reload-error`）。
+修改保存后由文件监听（chokidar，200ms 防抖）自动热重载，**无需重启**。唯一例外是 `server` 监听配置与 `routing.sessionAffinity` 参数（见下文）。重载失败不会阻塞启动，会保留旧配置并在管理界面与日志中显示告警（管理端可查 `GET /admin/api/config/reload-error`）。
 
 ## Schema 一览
 
@@ -42,6 +42,10 @@
 | `routing.sessionAffinity.enabled` | boolean | 否 | `true` | 会话亲和总开关 |
 | `routing.sessionAffinity.cleanupMaxAgeMs` | number | 否 | `604800000`（1 周） | 会话保留期（毫秒）；`0` = 永不过期 |
 | `routing.sessionAffinity.cleanupIntervalMs` | number | 否 | `3600000`（1 小时） | 自动清理周期（毫秒）；`0` = 关闭自动清理调度 |
+| `auth` | object | 否 | — | API Key 鉴权配置（整节可缺省，缺省即关闭） |
+| `auth.enabled` | boolean | 否 | `false` | 鉴权总开关；开启后 `/v1/*` 与 `/api/*` 请求必须携带 `Authorization: Bearer sk-llmproxy-...`，否则 401；管理端 `/admin/api` 无鉴权 |
+| `auth.keyBytes` | number | 否 | `24` | 生成 API Key 的随机字节数（8–64）；⚠️ 预留字段，当前版本生成 API Key 时未消费（生成固定走默认 24） |
+| `auth.cleanupRetentionDays` | number | 否 | `7` | 过期 API Key 在 SQLite 中的保留天数（0–3650）；`0` = 过期即清理；启动时读取，下次每日清理周期生效 |
 
 > 默认值说明：Zod 的 `.default()` / `.prefault()` 在解析时补齐缺省字段，因此 `upstreams[].timeoutMs`、`upstreams[].disabled`、`routing` 各键均可省略。`routing` 整节省略时按缺省值生效（会话亲和开启）；`server` 整节省略时进程按缺省监听 `0.0.0.0:3000`（`server/src/server/listen.ts` 的 `DEFAULT_HOST` / `DEFAULT_PORT`）。
 
@@ -104,12 +108,23 @@
 
   // ---- routing：路由行为（可选；整节可缺省，缺省即启用默认值）----
   // 会话亲和：同一会话的请求粘附到同一上游，最大化 prompt cache 复用
+  // 注意：本节参数在进程启动时读取，修改后需重启进程才能生效
   "routing": {
     "sessionAffinity": {
       "enabled": true,               // 总开关，默认 true
       "cleanupMaxAgeMs": 604800000,  // 会话保留期，默认 1 周；0 = 永不过期
       "cleanupIntervalMs": 3600000   // 自动清理周期，默认 1 小时；0 = 关闭自动清理
     }
+  },
+
+  // ---- auth：API Key 鉴权（可选；整节可缺省，缺省即关闭）----
+  // 开启后 /v1/* 与 /api/* 请求必须携带 Authorization: Bearer sk-llmproxy-...，否则 401；
+  // 管理端 /admin/api 无鉴权；Key 通过管理端「API Keys」页面管理（存 SQLite，不在本文件）
+  // 修改保存后实时生效（enabled 每请求读取），无需重启
+  "auth": {
+    "enabled": false,                // 鉴权总开关，默认 false
+    "keyBytes": 24,                  // 生成 Key 的随机字节数（8-64），默认 24；预留字段，暂未接入生成逻辑
+    "cleanupRetentionDays": 7        // 过期 Key 保留天数（0-3650），默认 7；0 = 过期即清理
   }
 }
 ```
@@ -147,6 +162,7 @@
 - **`bodyLimit`**：JSON 请求体上限，缺省 `'10mb'`。支持 `'10mb'` 这类 `bytes` 单位字符串（`'1kb'` / `'1mb'` / `'1gb'` 等），也支持直接写数字字节数（正整数，如 `10485760`）。全局生效——所有接口（`/v1/*`、`/api/*`、`/admin/api/*` 与 `/rerank`）共用该上限；请求体超限返回 `413`。该值在 `createApp` 装配时读入 `express.json({ limit })`，**非法值（如 `'abc'`）zod 虽能通过（非空字符串），但会在启动装配 body-parser 时抛错导致启动失败**，因此请确保填写合法值。进程级配置，**改后需重启**（见下条）。
 - **监听优先级**：命令行 `--host` / `--port` > `server` 节 > 缺省值。命令行参数最高优先级，host/port 相互独立可选，未指定的一侧回落下一优先级；也支持 `--host=0.0.0.0` / `--port=8080` 等号形式。**不再支持环境变量 `HOST` / `PORT` 覆盖监听地址**（0.2.0 起移除）。
 - **需要重启**：socket 在进程启动时绑定、bodyLimit 在 `createApp` 装配时读取，**修改本节或命令行参数的变更不会通过文件监听即时应用**（避免端口漂移 / 重复绑定），必须重启进程。例如 `pnpm start -- --host 0.0.0.0 --port 8080` 或 `node scripts/start.js --host 0.0.0.0 --port 8080`。
+- **保存方式**：除直接编辑 `llmproxy.jsonc` 外，管理端「System Config」页面（`PUT /admin/api/config`）也可保存本节。两种方式都只写盘，**生效仍需重启进程**；`PUT` 响应 `restartRequired` 含 `'server'` 即提示需重启。
 
 ### routing（路由，可选）
 
@@ -154,13 +170,24 @@
   - **`enabled`**：总开关，缺省 `true`。关闭后所有请求回到轮询 + 回退行为。
   - **`cleanupMaxAgeMs`**：会话保留期（毫秒），缺省 `604800000`（1 周）。超过该时长的粘附映射会被清理；`0` 表示会话永不过期。
   - **`cleanupIntervalMs`**：自动清理的调度周期（毫秒），缺省 `3600000`（1 小时）；`0` 表示关闭自动清理调度（仍可手动触发，见管理端 Sessions 页的「立即清理」）。
+- **生效语义**：`sessionAffinity` 的 `enabled` / `cleanupMaxAgeMs` / `cleanupIntervalMs` 均在**进程启动时读取**（自动清理调度在启动时装配），**修改后需重启进程**；`cleanupMaxAgeMs` 同时被管理端「立即清理」端点按当前配置读取。保存方式：编辑 `llmproxy.jsonc` 或管理端「System Config」页面（`PUT /admin/api/config`，响应 `restartRequired` 含 `'routing'` 即提示需重启）。
 - 会话键来源（优先级从高到低）：HTTP header `X-OpenWebUI-Chat-Id` → HTTP header `X-Session-Id`（值以 `ywnrs` 开头时 Client 记为 `ywnrs`，否则记为 `x-session-id`） → 请求体前 2 条消息的 `role + content` 的 sha256 → 都取不到则回退轮询。粘附映射持久化在 SQLite（`<userHome>/llmproxy/llmproxy.db` 的 `sessions` 表）。
 - 粘附的上游被禁用 / 删除时自动重新选择；粘附请求回退到其它上游成功后自动改绑（绑定跟随实际可用性）。
 
+### auth（鉴权，可选）
+
+- **`enabled`**：鉴权总开关，缺省 `false`。开启后所有下行流调用（`/v1/*` 与 `/api/*`）必须携带 `Authorization: Bearer sk-llmproxy-...`（API Key 前缀固定 `sk-llmproxy-`），缺失或无效返回 `401`（OpenAI 风格 `{ error: { code: 'invalid_api_key' } }`，所有失败同形避免枚举 Key 状态）；管理端 `/admin/api` 无鉴权。**实时生效**：中间件每请求读取 `store.get().auth.enabled`，保存后立即生效，无需重启。
+- **`keyBytes`**：生成 API Key 的随机字节数（8–64），缺省 `24`（对应 32 字符 hex）。⚠️ **预留字段**：当前版本该字段定义于 schema 但生成 API Key 时未消费（`admin.ts` 生成走 `generateApiKey()` 默认 24），修改后不会改变新生成 Key 的长度，文档如实注明。
+- **`cleanupRetentionDays`**：过期 API Key 在 SQLite 中的保留天数（0–3650），缺省 `7`；`0` = 过期即立即清理。保留期用于审计回溯，防止过期即丢。**启动时读取一次**，修改后在下一次每日清理周期生效。
+- **保存方式**：编辑 `llmproxy.jsonc` 热重载，或管理端「System Config」页面（`PUT /admin/api/config`）。API Key 本身存 SQLite（SHA-256 hash + 前缀），**不在配置文件中保存**；本节只描述开关与策略。
+- **Key 管理**：管理端「API Keys」页面（`/admin/api/keys`）负责 Key 的增删改查与停用。
+
 ### 热重载
 
-- 除 `server` 监听配置外，其余配置（上游增删改、别名映射、路由参数）保存后**即时生效**，由文件监听自动重载，无需重启。
+- 上游增删改、别名映射、`auth` 节保存后**即时生效**，由文件监听自动重载，无需重启。
+- `server` 节与 `routing.sessionAffinity` 参数在进程启动时读取，**修改后需重启进程**（见上文对应小节）。
 - 重载失败保留旧配置，不阻塞服务；错误可经 `GET /admin/api/config/reload-error` 查询，日志只记录错误码。
+- 管理端「System Config」页面通过 `PUT /admin/api/config` 部分更新 `server` / `routing` / `auth` 三节（请求体缺省的键不修改），写回配置文件并返回 `restartRequired` 列出本次需重启的顶层键；校验失败返回 400 `invalid_config`，写盘失败返回 500 `config_save_failed`。
 
 ## 常见问题
 
@@ -170,3 +197,5 @@
 | 改了配置"没反应" | 检查文件是否为合法 JSONC、监听重载是否成功（`GET /admin/api/config/reload-error`） |
 | 上游不可达 → 502 后回退 | 用 `POST /admin/api/upstreams/:id/test` 验证 `baseUrl` 可达性、`apiKey`、`timeoutMs` |
 | 改了 host/port 不生效 | `server` 节或命令行 `--host` / `--port` 都在进程启动时绑定，需重启进程 |
+| 改了 routing 会话亲和参数不生效 | `routing.sessionAffinity` 各参数在进程启动时读取，需重启进程 |
+| 鉴权开启后请求返回 401 | 在管理端「API Keys」页生成 Key，请求携带 `Authorization: Bearer sk-llmproxy-...` |

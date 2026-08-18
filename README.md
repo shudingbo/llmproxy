@@ -12,7 +12,7 @@ A single-port LLM gateway that aggregates multiple OpenAI-compatible upstreams (
 - **Round-robin + sequential failover** — per-alias round-robin pick; if the chosen upstream fails (network error / timeout / `429` / `5xx`), try the next candidate in declared order. Non-recoverable `4xx` (`401` / `403` / `404`) aborts immediately. All candidates exhausted → `502 {"error": "no_upstream"}`.
 - **Hot-reload config** — edits to `<userHome>/llmproxy/llmproxy.jsonc` are picked up by a `chokidar` watcher; no restart. Add or disable upstreams → effective immediately. Invalid edits keep the old config and surface as a warning.
 - **Dual-write logs** — every log line goes to both a date-rotated file (`logs/app-*.log` text + `logs/api-*.log` JSON) **and** SQLite (`llmproxy.db` `logs` table). DB writes never block business logic; the admin UI queries SQLite directly.
-- **Built-in admin SPA** — Vue 3 + Element Plus, six pages: Dashboard / Upstreams / Models / Sessions / Logs / Stats. Auto-imported Vue / Element Plus APIs (no manual `import { ElButton } from ...`).
+- **Built-in admin SPA** — Vue 3 + Element Plus, eight pages: Dashboard / Upstreams / Models / API Keys / Logs / Sessions / Stats / System Config. Auto-imported Vue / Element Plus APIs (no manual `import { ElButton } from ...`).
 - **API key safety** — never logged (header-side filter + SQLite sanitizer at any nesting depth), never forwarded from a client `Authorization` header, never echoed in cleartext (admin endpoints return masked values, edit leaves the key untouched when blank).
 - **Context-length probing** — `POST /admin/api/candidates/probe-context` reads `n_ctx` straight from llama.cpp (`/v1/models` → `data[].meta.n_ctx`) or LM Studio (`/api/v1/models` → `models[].loaded_instances[].config.context_length`). `/v1/models` and `/api/tags` aggregate per-alias `meta.n_ctx = min(candidates.max_context_length)`.
 
@@ -209,7 +209,7 @@ Example:
 
 ### 管理界面 Management UI
 
-管理端是 Vue 3 + Element Plus 单页应用，挂在 `/` 路径。左侧导航共 6 个页面，所有操作都通过 `/admin/api` 接口并立即生效（配置类操作落到配置文件，会话粘附与日志查询落到 SQLite）。
+管理端是 Vue 3 + Element Plus 单页应用，挂在 `/` 路径。左侧导航共 8 个页面，所有操作都通过 `/admin/api` 接口并立即生效（配置类操作落到配置文件，会话粘附与日志查询落到 SQLite）。
 
 #### Dashboard
 
@@ -277,6 +277,18 @@ Example:
 - **解绑**：点「解绑」调用 `DELETE /admin/api/sessions/:sessionKey`，该会话下次请求重新选上游
 - **清空全部**：调用 `DELETE /admin/api/sessions`，删除全部粘附映射
 - **立即清理**：调用 `POST /admin/api/sessions/cleanup`，立即执行一次过期清理（受 `cleanupMaxAgeMs` 约束）
+
+#### System Config（系统配置）
+
+三张卡片分别对应 `llmproxy.jsonc` 的三个可编辑节，点「保存」通过 `PUT /admin/api/config` 一次提交（未修改的节保持原值，不做全量覆盖）：
+
+| 卡片 | 内容 | 生效方式 |
+| --- | --- | --- |
+| Server | 进程级监听配置（host / port / bodyLimit） | **需手动重启**：socket 与 bodyLimit 在进程启动时绑定，保存后 `restartRequired` 含 `'server'` 并提示重启 |
+| Auth | 鉴权配置（enabled / keyBytes / cleanupRetentionDays） | **实时生效**：`enabled` 每请求读取，保存即生效，无需重启；`cleanupRetentionDays` 下次每日清理周期生效 |
+| Routing | 会话亲和参数（enabled / cleanupMaxAgeMs / cleanupIntervalMs） | **部分需重启**：`sessionAffinity` 各参数在进程启动时读取，保存后 `restartRequired` 含 `'routing'` 并提示重启 |
+
+页面加载 `GET /admin/api/config` 回填当前生效值，并读取 `GET /admin/api/config/reload-error`（有最近热重载错误时顶部提示）。表单做前端校验（host 非空、port 1–65535、keyBytes 8–64、cleanupRetentionDays 0–3650、清理周期 ≥ 0），非法值阻断提交。保存成功按实际变更的节提示：仅改 Auth → success「实时生效」；改 Server / Routing → warning「需重启后生效」。
 
 ### 客户端接入 Client Integration
 
@@ -410,6 +422,7 @@ curl -N http://127.0.0.1:3000/api/chat \
 | GET | `/admin/api/logs` | 日志查询（走 SQLite）：`?type=app|api&date=YYYY-MM-DD&level=info&keyword=xx&offset=0&limit=100`，返回 `lines` / `hasMore` |
 | GET | `/admin/api/stats` | 统计：`since` / `totals` / `perUpstream` |
 | GET | `/admin/api/config` | 当前生效配置（apiKey 已掩码） |
+| PUT | `/admin/api/config` | 部分更新 `server` / `routing` / `auth` 三节（body 缺省的键不修改，未知顶层键被过滤）；返回 `{ status, msg, config, restartRequired }`，`restartRequired` 列出本次需重启的顶层键（`server` / `routing`，auth 实时生效永不列入）；校验失败 400 `invalid_config`（`issues` 带字段路径），写盘失败 500 `config_save_failed` |
 | GET | `/admin/api/config/reload-error` | 最近一次配置重载错误（无则 `null`） |
 | GET | `/admin/api/sessions` | 会话粘附分页列表：`?offset&limit&client&keyword`（updated_at 倒序） |
 | GET | `/admin/api/session-clients` | 会话粘附库中出现的去重 client 类型（按字母序，空库返回 `[]`），供 Sessions 页客户端筛选下拉动态获取 |
@@ -445,6 +458,11 @@ curl 'http://127.0.0.1:3000/admin/api/logs?type=app&date=2026-08-02&level=info&k
 # 统计与重载错误
 curl http://127.0.0.1:3000/admin/api/stats
 curl http://127.0.0.1:3000/admin/api/config/reload-error
+
+# 保存系统配置（部分更新三节，未提供的键不修改；响应 restartRequired 提示需重启的节）
+curl -X PUT http://127.0.0.1:3000/admin/api/config \
+  -H 'Content-Type: application/json' \
+  -d '{"server": {"port": 8080}, "auth": {"enabled": true}}'
 ```
 
 ## Protocol Support Matrix
@@ -468,7 +486,7 @@ All routes are served on the single port (default `3000`).
 | `GET /admin/api/upstreams` · `POST` · `PUT /:id` · `DELETE /:id` · `POST /:id/test` · `POST /:id/detect-responses` | ✅ | upstream CRUD + connectivity test + Responses API capability detection |
 | `GET /admin/api/downstream-models` · `PUT` | ✅ | alias/candidate management |
 | `GET /admin/api/logs` | ✅ | log lines served from SQLite (type/level/time/keyword filters, offset/limit pagination, `hasMore`) |
-| `GET /admin/api/config` · `GET /admin/api/config/reload-error` | ✅ | config inspection + last reload error |
+| `GET /admin/api/config` · `PUT` · `GET /admin/api/config/reload-error` | ✅ | config inspection + partial update (server/routing/auth, returns `restartRequired`) + last reload error |
 | `GET /admin/api/sessions` · `GET /admin/api/session-clients` · `DELETE /:sessionKey` · `DELETE` · `POST /cleanup` | ✅ | session-affinity mapping: list, client types, unbind, clear-all, cleanup |
 | `/` (web UI) | ✅ | built admin SPA (requires `web/dist`, otherwise `503`) |
 

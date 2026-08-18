@@ -15,6 +15,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'logs', component: () => import('./views/Logs.vue'), meta: { title: 'Logs', icon: 'Document' } },
       { path: 'sessions', component: () => import('./views/Sessions.vue'), meta: { title: 'Sessions', icon: 'Link' } },
       { path: 'stats', component: () => import('./views/Stats.vue'), meta: { title: 'Stats', icon: 'TrendCharts' } },
+      { path: 'system-config', component: () => import('./views/SystemConfig.vue'), meta: { title: 'System Config', icon: 'Setting' } },
     ],
   },
 ]

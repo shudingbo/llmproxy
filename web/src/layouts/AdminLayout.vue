@@ -32,6 +32,7 @@ import {
   Document,
   Link,
   TrendCharts,
+  Setting,
 } from '@element-plus/icons-vue'
 
 // 菜单配置：路径与图标一一对应（与路由表保持一致）
@@ -43,6 +44,7 @@ const menuItems = [
   { path: '/logs', title: 'Logs', icon: Document },
   { path: '/sessions', title: 'Sessions', icon: Link },
   { path: '/stats', title: 'Stats', icon: TrendCharts },
+  { path: '/system-config', title: 'System Config', icon: Setting },
 ]
 
 // 当前激活菜单项：跟随路由路径高亮

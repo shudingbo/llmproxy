@@ -31,6 +31,9 @@
             </el-form-item>
             <el-form-item label="请求体上限" prop="server.bodyLimit">
               <el-input v-model="form.server.bodyLimit" placeholder="10mb" />
+              <el-text class="field-note" type="info" size="small">
+                支持 kb / mb / gb 等字节单位字符串（如 10mb、1kb、1gb），或直接填写数字字节数（如 10485760）；格式非法会导致服务启动失败
+              </el-text>
             </el-form-item>
           </el-form>
         </el-tab-pane>
@@ -45,7 +48,7 @@
             <el-form-item label="Key 长度" prop="auth.keyBytes">
               <el-input-number v-model="form.auth.keyBytes" :min="8" :max="64" :step="1" />
             </el-form-item>
-            <el-form-item label="过期 Key 保留" prop="auth.cleanupRetentionDays">
+            <el-form-item label="过期 Key 保留 (天)" prop="auth.cleanupRetentionDays">
               <el-input-number v-model="form.auth.cleanupRetentionDays" :min="0" :max="3650" :step="1" />
             </el-form-item>
           </el-form>
@@ -58,11 +61,12 @@
             <el-form-item label="会话亲和" prop="routing.sessionAffinity.enabled">
               <el-switch v-model="form.routing.sessionAffinity.enabled" />
             </el-form-item>
-            <el-form-item label="会话保留期 (ms)" prop="routing.sessionAffinity.cleanupMaxAgeMs">
-              <el-input-number v-model="form.routing.sessionAffinity.cleanupMaxAgeMs" :min="0" :step="60000" />
+            <!-- 时间字段前端以分钟为单位显示与输入，加载/保存时与后端 ms 契约互转 -->
+            <el-form-item label="会话保留期 (分钟)" prop="routing.sessionAffinity.cleanupMaxAgeMin">
+              <el-input-number v-model="form.routing.sessionAffinity.cleanupMaxAgeMin" :min="0" :step="1" />
             </el-form-item>
-            <el-form-item label="自动清理周期 (ms)" prop="routing.sessionAffinity.cleanupIntervalMs">
-              <el-input-number v-model="form.routing.sessionAffinity.cleanupIntervalMs" :min="0" :step="60000" />
+            <el-form-item label="自动清理周期 (分钟)" prop="routing.sessionAffinity.cleanupIntervalMin">
+              <el-input-number v-model="form.routing.sessionAffinity.cleanupIntervalMin" :min="0" :step="1" />
             </el-form-item>
           </el-form>
         </el-tab-pane>
@@ -76,12 +80,14 @@ import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { api } from '../api/client'
 
-// 表单结构：与 llmproxy.jsonc 的 server / auth / routing 三节一一对应
+// 表单结构：server / auth 与 llmproxy.jsonc 一一对应；
+// routing 的清理时间字段前端以「分钟」为单位（cleanupMaxAgeMin / cleanupIntervalMin），
+// 加载与保存时再与后端的 ms 契约字段（cleanupMaxAgeMs / cleanupIntervalMs）互转
 interface SystemConfigForm {
   server: { host: string; port: number; bodyLimit: string }
   auth: { enabled: boolean; keyBytes: number; cleanupRetentionDays: number }
   routing: {
-    sessionAffinity: { enabled: boolean; cleanupMaxAgeMs: number; cleanupIntervalMs: number }
+    sessionAffinity: { enabled: boolean; cleanupMaxAgeMin: number; cleanupIntervalMin: number }
   }
 }
 
@@ -113,10 +119,20 @@ interface ConfigSaveResponse {
 }
 
 // 表单缺省值：与后端 schema 默认值对齐（首次加载失败时表单仍可用）
+// routing 默认值已换算为分钟：604800000ms → 10080 分钟（1 周）、3600000ms → 60 分钟（1 小时）
 const DEFAULT_FORM: SystemConfigForm = {
   server: { host: '127.0.0.1', port: 3000, bodyLimit: '10mb' },
   auth: { enabled: false, keyBytes: 24, cleanupRetentionDays: 7 },
-  routing: { sessionAffinity: { enabled: true, cleanupMaxAgeMs: 604800000, cleanupIntervalMs: 3600000 } },
+  routing: { sessionAffinity: { enabled: true, cleanupMaxAgeMin: 10080, cleanupIntervalMin: 60 } },
+}
+
+// 单位换算：后端契约为毫秒，表单为分钟（后端值均为整分钟，round 不会失真；0 分钟 = 0 ms 语义保留）
+function toMinutes(ms: number): number {
+  return Math.round(ms / 60000)
+}
+
+function toMs(minutes: number): number {
+  return minutes * 60000
 }
 
 // 深拷贝（表单为纯 JSON 数据，JSON 序列化即可）
@@ -175,8 +191,8 @@ const rules = reactive<FormRules>({
   },
   routing: {
     sessionAffinity: {
-      cleanupMaxAgeMs: [intRangeRule(0, undefined, '会话保留期必须是 >= 0 的整数（0 = 永不过期）')],
-      cleanupIntervalMs: [intRangeRule(0, undefined, '自动清理周期必须是 >= 0 的整数（0 = 关闭自动清理）')],
+      cleanupMaxAgeMin: [intRangeRule(0, undefined, '会话保留期必须是 >= 0 的整数（0 = 永不过期）')],
+      cleanupIntervalMin: [intRangeRule(0, undefined, '自动清理周期必须是 >= 0 的整数（0 = 关闭自动清理）')],
     },
   },
 })
@@ -197,9 +213,13 @@ function applyConfig(cfg?: ConfigSections) {
   const sa = cfg.routing?.sessionAffinity
   if (sa) {
     form.routing.sessionAffinity.enabled = sa.enabled ?? form.routing.sessionAffinity.enabled
-    form.routing.sessionAffinity.cleanupMaxAgeMs = sa.cleanupMaxAgeMs ?? form.routing.sessionAffinity.cleanupMaxAgeMs
-    form.routing.sessionAffinity.cleanupIntervalMs =
-      sa.cleanupIntervalMs ?? form.routing.sessionAffinity.cleanupIntervalMs
+    // 后端 ms → 表单分钟；字段缺省时保留当前表单值
+    if (sa.cleanupMaxAgeMs !== undefined) {
+      form.routing.sessionAffinity.cleanupMaxAgeMin = toMinutes(sa.cleanupMaxAgeMs)
+    }
+    if (sa.cleanupIntervalMs !== undefined) {
+      form.routing.sessionAffinity.cleanupIntervalMin = toMinutes(sa.cleanupIntervalMs)
+    }
   }
 }
 
@@ -247,10 +267,17 @@ async function save() {
       auth: JSON.stringify(form.auth) !== JSON.stringify(snapshot.value.auth),
       routing: JSON.stringify(form.routing) !== JSON.stringify(snapshot.value.routing),
     }
+    // routing 的清理时间字段提交前回转为后端 ms 契约（字段名保持 cleanupMaxAgeMs / cleanupIntervalMs）
     const { data } = await api.put<ConfigSaveResponse>('/config', {
       server: { ...form.server },
       auth: { ...form.auth },
-      routing: { sessionAffinity: { ...form.routing.sessionAffinity } },
+      routing: {
+        sessionAffinity: {
+          enabled: form.routing.sessionAffinity.enabled,
+          cleanupMaxAgeMs: toMs(form.routing.sessionAffinity.cleanupMaxAgeMin),
+          cleanupIntervalMs: toMs(form.routing.sessionAffinity.cleanupIntervalMin),
+        },
+      },
     })
     // 以服务端返回的最新配置刷新表单与快照（含 schema 默认值归一化结果）
     if (data?.config) {
@@ -310,5 +337,11 @@ onMounted(load)
 .pane-note {
   display: block;
   margin-bottom: 16px;
+}
+
+/* 字段级说明文字（如请求体上限的合法格式）：独占一行，贴在输入框下方 */
+.field-note {
+  display: block;
+  margin-top: 4px;
 }
 </style>

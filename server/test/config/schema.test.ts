@@ -19,7 +19,10 @@ const validConfig = {
     },
   ],
   downstreamModels: {
-    'gpt-4': [{ upstreamId: 'openai-main', model: 'gpt-4' }],
+    'gpt-4': {
+      disabled: false,
+      candidates: [{ upstreamId: 'openai-main', model: 'gpt-4' }],
+    },
   },
 }
 
@@ -36,7 +39,7 @@ describe('ConfigSchema', () => {
   it('缺省字段应用默认值（timeoutMs 30000、disabled false）', () => {
     const result = ConfigSchema.safeParse({
       upstreams: [{ id: 'a', baseUrl: 'https://x.example', apiKey: 'k' }],
-      downstreamModels: { 'm1': [{ upstreamId: 'a', model: 'm1' }] },
+      downstreamModels: { 'm1': { disabled: false, candidates: [{ upstreamId: 'a', model: 'm1', disabled: false }] } },
     })
     expect(result.success).toBe(true)
     if (!result.success) return
@@ -57,7 +60,7 @@ describe('ConfigSchema', () => {
   it('候选列表为空数组时拒绝（min(1)）', () => {
     const result = ConfigSchema.safeParse({
       ...validConfig,
-      downstreamModels: { 'gpt-4': [] },
+      downstreamModels: { 'gpt-4': { disabled: false, candidates: [] } },
     })
     expect(result.success).toBe(false)
   })
@@ -153,6 +156,25 @@ describe('UpstreamCandidateSchema.max_context_length', () => {
     expect(UpstreamCandidateSchema.safeParse({ ...base, max_context_length: 0 }).success).toBe(false)
     expect(UpstreamCandidateSchema.safeParse({ ...base, max_context_length: 1.5 }).success).toBe(false)
     expect(UpstreamCandidateSchema.safeParse({ ...base, max_context_length: '32768' }).success).toBe(false)
+  })
+})
+
+describe('UpstreamCandidateSchema 字段收敛（候选级 disabled 已移除）', () => {
+  // zod v4 默认 strip 模式，候选级 disabled 字段会被静默剔除；
+  // 此处验明「字段被剥离、不会进 data」，实际写入 llmproxy.jsonc 时归一化层不会把 disabled 放回，
+  // 见 loader.ts 的 normalizeDownstreamAliasEntry（只取 { disabled, candidates }，不会向候选塞 disabled）。
+  it('候选 schema 不暴露 disabled 字段（多余键被剥离）', () => {
+    const result = UpstreamCandidateSchema.safeParse({ upstreamId: 'a', model: 'm1' })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect((result.data as Record<string, unknown>).disabled).toBeUndefined()
+  })
+
+  it('带 disabled 键的候选也能解析，但 disabled 不会落到结果中', () => {
+    const result = UpstreamCandidateSchema.safeParse({ upstreamId: 'a', model: 'm1', disabled: true })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect((result.data as Record<string, unknown>).disabled).toBeUndefined()
   })
 })
 

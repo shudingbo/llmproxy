@@ -16,12 +16,24 @@
           <el-collapse-item v-for="alias in Object.keys(models)" :key="alias" :name="alias">
             <template #title>
               <CopyText class="alias-title" :copy-text="alias">{{ alias }}</CopyText>
+              <!-- 别名级总开关：关闭后整个别名对外不可见，保存后生效 -->
+              <el-switch
+                :model-value="!getAliasDisabled(alias)"
+                class="alias-switch alias-master-switch"
+                inline-prompt
+                active-text="启用"
+                inactive-text="已关闭"
+                @click.stop="toggleAlias(alias)"
+              />
+              <el-tag v-if="getAliasDisabled(alias)" type="info" size="small" effect="plain" class="alias-disabled-tag">
+                别名已关闭
+              </el-tag>
             </template>
 
             <!-- 候选列表：拖拽手柄排序，vuedraggable 的 :list 会在拖拽结束时原地重排 -->
             <draggable
               class="candidate-list"
-              :list="models[alias]"
+              :list="models[alias].candidates"
               :item-key="itemKey"
               handle=".drag-handle"
               animation="150"
@@ -99,6 +111,14 @@ import draggable from 'vuedraggable'
 import CopyText from '../components/CopyText.vue'
 import { api } from '../api/client'
 
+// 别名组（"别名级总开关 + 候选列表"模型）：
+// - disabled：别名级总开关（true → 整个别名对外不可见）
+// - candidates：候选列表（候选级粒度不再有开关：要禁用就关上游，或直接删除候选）
+interface AliasGroup {
+  disabled: boolean
+  candidates: Candidate[]
+}
+
 // 候选条目：上游 id + 上游侧模型名 + 最大上下文；_key 仅用于拖拽排序的稳定 Vue key，保存时剔除
 interface Candidate {
   _key: number
@@ -117,11 +137,16 @@ interface Upstream {
   disabled: boolean
 }
 
-// 别名 → 有序候选列表（按顺序尝试、失败切换下一个）
-type DownstreamModels = Record<string, Candidate[]>
+// 别名 → AliasGroup（"总开关 + 候选列表"两层结构）
+type DownstreamModels = Record<string, AliasGroup>
 
 // Ollama 风格能力选项
 const CAPABILITY_OPTIONS = ['completion', 'tools', 'vision', 'thinking', 'embedding', 'insert', 'audio']
+
+// 服务端读取时的后端裸形态：宽松装载，再归一化为 AliasGroup；候选级无 disabled 字段
+type RawAliasEntry =
+  | { disabled?: boolean; candidates: Array<Omit<Candidate, '_key'>> }
+  | Array<Omit<Candidate, '_key'>>
 
 // 候选自增序号：为每个候选生成稳定且唯一的 key
 let seq = 0
@@ -147,8 +172,8 @@ async function load() {
     upstreams.value = upRes.data as Upstream[]
     // 整体替换 reactive 映射内容（Object.assign 无法覆盖已删除的旧键）
     for (const k of Object.keys(models)) delete models[k]
-    for (const [alias, candidates] of Object.entries(modelRes.data as Record<string, Omit<Candidate, '_key'>[]>)) {
-      models[alias] = candidates.map((c) => ({ _key: ++seq, ...c }))
+    for (const [alias, rawEntry] of Object.entries(modelRes.data as Record<string, RawAliasEntry>)) {
+      models[alias] = normalizeAliasGroup(rawEntry)
     }
     // 默认展开全部别名
     activeNames.value = Object.keys(models)
@@ -156,6 +181,33 @@ async function load() {
     ElMessage.error(`加载失败：${errMsg(err)}`)
   } finally {
     loading.value = false
+  }
+}
+
+// 把后端拿到的 entry（旧裸数组 / 新 group）统一归一化为 AliasGroup，
+// 缺失字段都用 false / [] 兜底，保持前端状态结构稳定
+function normalizeAliasGroup(raw: RawAliasEntry): AliasGroup {
+  if (Array.isArray(raw)) {
+    return {
+      disabled: false,
+      candidates: raw.map((c) => buildCandidate(c)),
+    }
+  }
+  return {
+    disabled: raw.disabled === true,
+    candidates: Array.isArray(raw.candidates)
+      ? raw.candidates.map((c) => buildCandidate(c))
+      : [],
+  }
+}
+
+function buildCandidate(raw: Omit<Candidate, '_key'>): Candidate {
+  return {
+    _key: ++seq,
+    upstreamId: raw.upstreamId,
+    model: raw.model,
+    max_context_length: raw.max_context_length ?? null,
+    capabilities: raw.capabilities ?? [],
   }
 }
 
@@ -173,7 +225,7 @@ async function addAlias() {
       },
     })
     const name = value.trim()
-    models[name] = []
+    models[name] = { disabled: false, candidates: [] }
     activeNames.value.push(name)
   } catch {
     // 用户取消输入，忽略
@@ -188,7 +240,7 @@ function removeAlias(alias: string) {
 
 // 新增候选：默认选中第一个上游，名称留空待填
 function addCandidate(alias: string) {
-  models[alias].push({
+  models[alias].candidates.push({
     _key: ++seq,
     upstreamId: upstreams.value[0]?.id ?? '',
     model: '',
@@ -199,7 +251,7 @@ function addCandidate(alias: string) {
 
 // 删除候选
 function removeCandidate(alias: string, index: number) {
-  models[alias].splice(index, 1)
+  models[alias].candidates.splice(index, 1)
 }
 
 // 保存：整体替换下游模型映射（PUT），前端先校验再提交
@@ -209,12 +261,12 @@ async function save() {
     ElMessage.warning('请先新增至少一个模型别名')
     return
   }
-  for (const [alias, candidates] of entries) {
-    if (candidates.length === 0) {
+  for (const [alias, group] of entries) {
+    if (group.candidates.length === 0) {
       ElMessage.warning(`别名「${alias}」没有候选上游，请添加候选或删除该别名`)
       return
     }
-    for (const c of candidates) {
+    for (const c of group.candidates) {
       if (!c.upstreamId || c.model.trim() === '') {
         ElMessage.warning(`别名「${alias}」存在未填写完整（上游/模型名）的候选`)
         return
@@ -223,19 +275,23 @@ async function save() {
   }
   saving.value = true
   try {
-    // 剔除 _key 后提交：max_context_length 为 null / undefined 都剔除（避免无意义字段）
-    const payload: Record<string, Array<Record<string, unknown>>> = {}
-    for (const [alias, candidates] of entries) {
-      payload[alias] = candidates.map((c) => {
-        const row: Record<string, unknown> = { upstreamId: c.upstreamId, model: c.model }
-        if (typeof c.max_context_length === 'number') {
-          row.max_context_length = c.max_context_length
-        }
-        if (c.capabilities && c.capabilities.length > 0) {
-          row.capabilities = c.capabilities
-        }
-        return row
-      })
+    // payload 形态对齐后端 group 形态：{ disabled, candidates: [...] }，
+    // 字段剔除：_key（仅前端用）、max_context_length 为 null 时剔除、capabilities 空数组剔除
+    const payload: Record<string, { disabled: boolean; candidates: Array<Record<string, unknown>> }> = {}
+    for (const [alias, group] of entries) {
+      payload[alias] = {
+        disabled: group.disabled,
+        candidates: group.candidates.map((c) => {
+          const row: Record<string, unknown> = { upstreamId: c.upstreamId, model: c.model }
+          if (typeof c.max_context_length === 'number') {
+            row.max_context_length = c.max_context_length
+          }
+          if (c.capabilities && c.capabilities.length > 0) {
+            row.capabilities = c.capabilities
+          }
+          return row
+        }),
+      }
     }
     await api.put('/downstream-models', payload)
     ElMessage.success('已保存')
@@ -244,6 +300,18 @@ async function save() {
   } finally {
     saving.value = false
   }
+}
+
+// 读取别名总开关状态（后端 Router 的判定口径）
+function getAliasDisabled(alias: string): boolean {
+  return models[alias]?.disabled === true
+}
+
+// 切换别名总开关：仅翻转 group.disabled
+function toggleAlias(alias: string) {
+  const group = models[alias]
+  if (!group) return
+  group.disabled = !group.disabled
 }
 
 // 自动探测候选的 max_context_length：调 POST /candidates/probe-context（upstreamId + model）
@@ -305,6 +373,15 @@ onMounted(load)
 
 .alias-title {
   font-weight: 600;
+}
+
+/* 别名级开关：贴在折叠面板标题右侧；点击不冒泡到折叠触发 */
+.alias-switch {
+  margin: 0 8px;
+}
+
+.alias-disabled-tag {
+  margin-left: 4px;
 }
 
 /* 候选列表行：拖拽手柄 + 上游选择 + 模型名 + 删除 */

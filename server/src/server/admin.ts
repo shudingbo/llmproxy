@@ -5,8 +5,15 @@ import { readFileSync } from 'node:fs'
 import { networkInterfaces } from 'node:os'
 import type { Express, Request, Response } from 'express'
 import { z, type ZodType } from 'zod'
+import type { Config } from '../config/schema.js'
 import type { ConfigStore } from '../config/store.js'
-import { DownstreamModelSchema, UpstreamSchema, type UpstreamCandidate } from '../config/schema.js'
+import {
+  DownstreamAliasGroupSchema,
+  DownstreamModelEntrySchema,
+  UpstreamSchema,
+  type UpstreamCandidate,
+} from '../config/schema.js'
+import { normalizeDownstreamAliasEntry } from '../config/loader.js'
 import { getLogger } from '../logger/index.js'
 import { sweepLogsBefore } from '../logger/sweep.js'
 import { LogStore } from '../logstore/index.js'
@@ -196,11 +203,12 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
       return
     }
     const upstreams = config.upstreams.filter((u) => u.id !== req.params.id)
-    const downstreamModels: Record<string, UpstreamCandidate[]> = {}
-    for (const [alias, candidates] of Object.entries(config.downstreamModels)) {
-      const rest = candidates.filter((c) => c.upstreamId !== req.params.id)
+    const downstreamModels: Record<string, { disabled: boolean; candidates: UpstreamCandidate[] }> = {}
+    for (const [alias, group] of Object.entries(config.downstreamModels)) {
+      const rest = group.candidates.filter((c) => c.upstreamId !== req.params.id)
+      // 候选全部被过滤掉 → 整个别名删除（保持历史行为）
       if (rest.length > 0) {
-        downstreamModels[alias] = rest
+        downstreamModels[alias] = { disabled: group.disabled, candidates: rest }
       }
     }
     store.set({ ...config, upstreams, downstreamModels }, { source: 'admin' })
@@ -362,21 +370,39 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     }
   })
 
-  // 下游模型映射：原样返回（候选不含敏感字段）
+  // 下游模型映射：原样返回归一化后的 group 形态（{ disabled, candidates[] }）
   app.get('/admin/api/downstream-models', (_req: Request, res: Response) => {
     res.json(store.get().downstreamModels)
   })
 
-  // 整体替换下游模型映射：zod 校验（每个别名至少 1 个候选），无效返回 400
+  // 整体替换下游模型映射：接受 alias → {disabled?, candidates: [...]} 形态（向下兼容旧 alias → [...]），
+  // 先用 DownstreamModelEntrySchema 校验每条 entry，再归一化为 group 形态入库
   app.put('/admin/api/downstream-models', (req: Request, res: Response) => {
-    const parsed = z.record(z.string(), DownstreamModelSchema).safeParse(req.body)
-    if (!parsed.success) {
-      res.status(400).json({ error: 'invalid_downstream_models', issues: parsed.error.issues.map((i) => i.message) })
+    const parsedEntries = z.record(z.string(), DownstreamModelEntrySchema).safeParse(req.body)
+    if (!parsedEntries.success) {
+      res.status(400).json({
+        error: 'invalid_downstream_models',
+        issues: parsedEntries.error.issues.map((i) => i.message),
+      })
       return
     }
+    // 归一化每条 entry → group 形态：DownstreamAliasGroupSchema 对内部结构再做一次兜底校验
+    const normalized: Record<string, unknown> = {}
+    for (const [alias, entry] of Object.entries(parsedEntries.data)) {
+      const result = DownstreamAliasGroupSchema.safeParse(normalizeDownstreamAliasEntry(entry))
+      if (!result.success) {
+        res.status(400).json({
+          error: 'invalid_downstream_models',
+          alias,
+          issues: result.error.issues.map((i) => i.message),
+        })
+        return
+      }
+      normalized[alias] = result.data
+    }
     const config = store.get()
-    store.set({ ...config, downstreamModels: parsed.data }, { source: 'admin' })
-    res.json(parsed.data)
+    store.set({ ...config, downstreamModels: normalized as Config['downstreamModels'] }, { source: 'admin' })
+    res.json(normalized)
   })
 
   // 日志查询：date 必填；type 区分 app/api；按级别阈值 + 关键词过滤；

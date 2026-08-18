@@ -35,6 +35,9 @@ export const UpstreamSchema = z.object({
  * - capabilities：该候选对外宣称的能力集合（任意字符串，无枚举约束，兼容 Ollama 生态扩展）；
  *   常用约定值：completion（文本补全）/ vision（图像输入）/ embedding（向量化）/
  *   tools（工具调用）/ reasoning（推理）等；别名聚合时取各候选并集，缺省即未设置
+ *
+ * 注：「关停单个候选」语义已移除，需要暂禁某条候选时改为：上游 disabled（统一关停）
+ * 或在 Models 页面把该候选删除；候选级粒度在三层开关模型下不直观，已收敛。
  */
 export const UpstreamCandidateSchema = z.object({
   upstreamId: z.string(),
@@ -44,9 +47,32 @@ export const UpstreamCandidateSchema = z.object({
 })
 
 /**
- * 下游模型别名 → 有序候选列表（至少 1 个，按顺序尝试、失败切换下一个）
+ * 下游模型别名组：每个别名对应的"总开关 + 有序候选列表"。
+ * - disabled：别名级总开关，true → 整个别名对外不可见（不论候选是否开启）；
+ *   false / 未配置 → 走候选级过滤，候选里只要还有 1 条未关闭就可用
+ * - candidates：候选列表（至少 1 条，按顺序尝试、失败切换下一个）
+ *
+ * 配置文件中也可以写成裸数组形式（仅 candidates），loader 会归一化为本结构；
+ * 见 loader.ts 的 normalizeDownstreamModels。
  */
-export const DownstreamModelSchema = z.array(UpstreamCandidateSchema).min(1)
+export const DownstreamAliasGroupSchema = z.object({
+  disabled: z.boolean().default(false),
+  candidates: z.array(UpstreamCandidateSchema).min(1),
+})
+
+/**
+ * 下游模型映射的源形态（loader 接受两种写法，向后兼容老配置）：
+ * - 新写法（推荐）：别名 → { disabled?, candidates: [...] }
+ * - 旧写法（仍可用）：别名 → [ ...candidates ]
+ * loadConfigFromFile 会在解析前把旧写法归一化为新写法，运行时只面对新形态
+ */
+export const DownstreamModelEntrySchema = z.union([DownstreamAliasGroupSchema, z.array(UpstreamCandidateSchema).min(1)])
+
+/**
+ * 下游模型映射：别名 → 归一化后的别名组（至少 1 个别名）。
+ * 旧配置（裸数组形态）由 loader 在解析前归一化为本结构。
+ */
+export const DownstreamModelsSchema = z.record(z.string(), DownstreamAliasGroupSchema)
 
 /**
  * 进程级 server 配置（控制整个 server 进程的监听与请求体解析）：
@@ -86,13 +112,15 @@ export const RoutingSchema = z.object({
 /**
  * 完整配置：
  * - upstreams：上游列表（至少 1 个）
- * - downstreamModels：别名 → 候选列表的映射
+ * - downstreamModels：别名 → DownstreamAliasGroup 的映射（运行时归一化形态，见 loader）
  * - server：可选的进程级 server 配置（host / port / bodyLimit）；未指定时按缺省值
  * - routing：可选的路由配置（会话亲和等）；未指定时按缺省值
+ *
+ * 注意：raw 形态（未归一化）见 DownstreamModelEntrySchema，由 loader 负责在落库前归一化
  */
 export const ConfigSchema = z.object({
   upstreams: z.array(UpstreamSchema).min(1),
-  downstreamModels: z.record(z.string(), DownstreamModelSchema),
+  downstreamModels: DownstreamModelsSchema,
   server: ServerConfigSchema.optional(),
   routing: RoutingSchema.optional(),
 })
@@ -101,5 +129,9 @@ export const ConfigSchema = z.object({
 export type Config = z.infer<typeof ConfigSchema>
 export type Upstream = z.infer<typeof UpstreamSchema>
 export type UpstreamCandidate = z.infer<typeof UpstreamCandidateSchema>
+export type DownstreamAliasGroup = z.infer<typeof DownstreamAliasGroupSchema>
 export type ServerConfig = z.infer<typeof ServerConfigSchema>
 export type Routing = z.infer<typeof RoutingSchema>
+
+// 别名 → 候选列表（运行时便利类型，等价于 downstreamModels[alias].candidates）
+export type DownstreamModelCandidates = UpstreamCandidate[]

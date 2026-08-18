@@ -15,7 +15,7 @@ import { Router } from '../router/index.js'
 import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
 import { buildUpstreamSessionHeaders, extractSessionKey } from '../session/key.js'
 import type { OpenAIUpstreamClient, UpstreamChatRequest } from '../upstream/openai.js'
-import { buildAliasMetaMap } from './model-meta.js'
+import { buildAliasMetaMap, listExposedAliases } from './model-meta.js'
 import { registerOllamaShowRoute } from './ollama-show.js'
 
 // 依赖注入集合：由装配层（T19）构造后传入，形状与 openai.ts（T12）保持一致
@@ -240,7 +240,7 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
   // 通过 convertModelsList 的 metaById 注入聚合上下文（别名能聚合出 n_ctx 时条目带 meta）
   app.get('/api/tags', (_req: Request, res: Response) => {
     const config = store.get()
-    const data = Object.keys(config.downstreamModels).map((id) => ({ id }))
+    const data = listExposedAliases(config).map((id) => ({ id }))
     const converted = convertModelsList({ data }, buildAliasMetaMap(config))
     res.json(converted)
   })

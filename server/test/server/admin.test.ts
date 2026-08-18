@@ -28,6 +28,7 @@ vi.mock('../../src/upstream/context.js', async (importOriginal) => {
 })
 
 // 基础配置模板：u1 健康 / u2 暂停；gpt-4 别名引用两者，only-u2 别名仅引用 u2（用于级联删除断言）
+// group 形态：{ disabled, candidates }，已被 loader 自动归一化为该形态
 const BASE_CONFIG = {
   upstreams: [
     {
@@ -48,11 +49,17 @@ const BASE_CONFIG = {
     },
   ],
   downstreamModels: {
-    'gpt-4': [
-      { upstreamId: 'u1', model: 'gpt-4-u1' },
-      { upstreamId: 'u2', model: 'gpt-4-u2' },
-    ],
-    'only-u2': [{ upstreamId: 'u2', model: 'x' }],
+    'gpt-4': {
+      disabled: false,
+      candidates: [
+        { upstreamId: 'u1', model: 'gpt-4-u1' },
+        { upstreamId: 'u2', model: 'gpt-4-u2' },
+      ],
+    },
+    'only-u2': {
+      disabled: false,
+      candidates: [{ upstreamId: 'u2', model: 'x' }],
+    },
   },
 }
 
@@ -824,23 +831,38 @@ describe('候选上下文探测 /admin/api/candidates/probe-context', () => {
 })
 
 describe('下游模型映射 /admin/api/downstream-models', () => {
-  it('GET 原样返回映射', async () => {
+  it('GET 原样返回映射（归一化为 group 形态）', async () => {
     const res = await request(app).get('/admin/api/downstream-models')
     expect(res.status).toBe(200)
     expect(res.body).toEqual(BASE_CONFIG.downstreamModels)
   })
 
-  it('PUT 整体替换并写回存储', async () => {
+  it('PUT 整体替换并写回存储（group 形态）', async () => {
+    const res = await request(app).put('/admin/api/downstream-models').send({
+      'gpt-4': { disabled: false, candidates: [{ upstreamId: 'u1', model: 'gpt-4o' }] },
+      claude: { disabled: false, candidates: [{ upstreamId: 'u2', model: 'claude-3' }] },
+    })
+    expect(res.status).toBe(200)
+    expect(store.get().downstreamModels['claude']).toEqual({
+      disabled: false,
+      candidates: [{ upstreamId: 'u2', model: 'claude-3' }],
+    })
+  })
+
+  it('PUT 整体替换并写回存储（接受旧裸数组形态，向后兼容）', async () => {
     const res = await request(app).put('/admin/api/downstream-models').send({
       'gpt-4': [{ upstreamId: 'u1', model: 'gpt-4o' }],
       claude: [{ upstreamId: 'u2', model: 'claude-3' }],
     })
     expect(res.status).toBe(200)
-    expect(store.get().downstreamModels['claude']).toEqual([{ upstreamId: 'u2', model: 'claude-3' }])
+    expect(store.get().downstreamModels['claude']).toEqual({
+      disabled: false,
+      candidates: [{ upstreamId: 'u2', model: 'claude-3' }],
+    })
   })
 
   it('PUT 空候选列表返回 400', async () => {
-    const res = await request(app).put('/admin/api/downstream-models').send({ 'gpt-4': [] })
+    const res = await request(app).put('/admin/api/downstream-models').send({ 'gpt-4': { disabled: false, candidates: [] } })
     expect(res.status).toBe(400)
     expect(res.body.error).toBe('invalid_downstream_models')
   })

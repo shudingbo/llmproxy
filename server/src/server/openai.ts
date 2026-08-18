@@ -20,7 +20,7 @@ import type {
   UpstreamRerankRequest,
   UpstreamResponsesRequest,
 } from '../upstream/openai.js'
-import { buildAliasMetaMap } from './model-meta.js'
+import { buildAliasMetaMap, listExposedAliases } from './model-meta.js'
 
 // 依赖注入集合：由装配层（T19）构造后传入
 export interface OpenAIDeps {
@@ -569,7 +569,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
   app.get('/v1/models', (_req: Request, res: Response) => {
     const config = store.get()
     const metaMap = buildAliasMetaMap(config)
-    const data = Object.keys(config.downstreamModels).map((id) => {
+    const data = listExposedAliases(config).map((id) => {
       const entry: { id: string; object: string; owned_by: string; meta?: { n_ctx: number } } = {
         id,
         object: 'model',

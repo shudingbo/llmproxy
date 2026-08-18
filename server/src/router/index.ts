@@ -7,6 +7,11 @@ import { ModelNotFoundError } from './errors.js'
 /**
  * 路由解析器：持有完整配置（含 upstreams 与 downstreamModels），
  * 提供 resolve() 把下游模型别名映射为有序候选列表。
+ *
+ * 过滤规则（两层开关，收敛后）：
+ * - alias.disabled（别名级总开关）：true → 整个别名不可用，解析即 ModelNotFoundError
+ * - upstream.disabled（上游级）：保留原语义，仅跳过该上游对应的候选
+ * （候选级 disabled 已移除：临时禁用走 upstream.disabled；永久移除走 Models 页面删除候选）
  */
 export class Router {
   // 上游 id → 是否禁用 的预计算映射，避免每次 resolve 都线性扫描 upstreams
@@ -19,22 +24,29 @@ export class Router {
   /**
    * 解析下游模型别名：
    * - 别名不在 downstreamModels 中 → 抛 ModelNotFoundError
-   * - 过滤掉 disabled 上游对应的候选（保留配置顺序）
-   * - 若过滤后为空且原列表非空：记警告并返回原列表（全部禁用时交给上层决策）
+   * - 别名被整体禁用（alias.disabled === true）→ 抛 ModelNotFoundError（总开关关闭）
+   * - 过滤掉 disabled 上游对应的候选；若过滤后空但原列表非空：记警告并返回原列表
    */
   resolve(downstreamModel: string): UpstreamCandidate[] {
-    const candidates = this.config.downstreamModels[downstreamModel]
-    if (!candidates) {
+    const group = this.config.downstreamModels[downstreamModel]
+    if (!group) {
       throw new ModelNotFoundError(downstreamModel)
     }
-    // 仅保留未禁用上游的候选
-    const active = candidates.filter((c) => this.disabledUpstreams.get(c.upstreamId) !== true)
-    if (active.length === 0 && candidates.length > 0) {
+    // 别名级总开关：true → 整个别名对外不可见，等价于别名未注册
+    if (group.disabled === true) {
+      getLogger().debug({ downstreamModel }, '下游别名已关闭（别名级总开关），按未注册处理')
+      throw new ModelNotFoundError(downstreamModel)
+    }
+    // 上游级 disabled：仅跳过该候选，其余候选保持原顺序
+    const active = group.candidates.filter((c) => this.disabledUpstreams.get(c.upstreamId) !== true)
+    console.log("---re",this.disabledUpstreams, active)
+    
+    if (active.length === 0 && group.candidates.length > 0) {
       getLogger().warn(
         { downstreamModel },
         '下游模型的所有上游候选均被禁用，按原列表返回',
       )
-      return candidates
+      return group.candidates
     }
     return active
   }

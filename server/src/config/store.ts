@@ -40,19 +40,28 @@ const BOOTSTRAP_JSONC = `{
     }
   ],
 
-  // 下游模型别名 → 有序候选上游列表（按顺序尝试，失败自动切换下一个）
+  // 下游模型别名 → 别名组（总开关 + 有序候选上游列表，按顺序尝试，失败自动切换下一个）
+  // 也可直接写裸数组形态（自动归一化为 group），向下兼容
   "downstreamModels": {
     // 示例：别名 gpt-4 请求 openai-main 上游的 gpt-4 模型
-    "gpt-4": [
+    "gpt-4": {
+      // 别名级总开关 disabled：true 时整个别名对外不可见（不论候选是否开启）；
+      // false / 未配置 → 走候选级过滤（候选里只要还有 1 条未关闭就可用）
+      "disabled": false,
       // 候选级可选字段：max_context_length = 该上游跑该模型时的最大上下文；
       // 可经管理端「自动」按钮探测 llama.cpp/LM Studio，缺省不设；null 表示显式清空
-      // { "upstreamId": "openai-main", "model": "gpt-4", "max_context_length": 32768 }
-      { "upstreamId": "openai-main", "model": "gpt-4" }
-    ],
+      // candidate.disabled：候选级开关（独立于上游级与别名级），true 时仅跳过该候选
+      "candidates": [
+        { "upstreamId": "openai-main", "model": "gpt-4" }
+      ]
+    },
     // 示例：本地模型别名，可再添加更多候选上游实现回退
-    "llama3": [
-      { "upstreamId": "openai-main", "model": "gpt-4o-mini" }
-    ]
+    "llama3": {
+      "disabled": false,
+      "candidates": [
+        { "upstreamId": "openai-main", "model": "gpt-4o-mini" }
+      ]
+    }
   }
 }
 `

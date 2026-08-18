@@ -4,13 +4,13 @@
 import type { Express, Request, Response } from 'express'
 import type { ConfigStore } from '../config/store.js'
 import type { OllamaShowResponse } from '../converters/types.js'
-import { buildAliasMetaMap } from './model-meta.js'
+import { buildAliasMetaMap, isAliasExposed } from './model-meta.js'
 
 /**
  * 注册 Ollama 兼容的模型详情路由：
  * - 200：返回由别名配置聚合的模型详情（capabilities 并集 + 有限正整数 n_ctx）
  * - 400 { error: 'invalid_request', field: 'model' }：body.model 缺失或非字符串
- * - 404 { error: 'model_not_found' }：别名不在 downstreamModels 中
+ * - 404 { error: 'model_not_found' }：别名不在 downstreamModels 中 或 别名在两层开关下不可用
  */
 export function registerOllamaShowRoute(app: Express, deps: { store: ConfigStore }): void {
   app.post('/api/show', (req: Request, res: Response) => {
@@ -25,6 +25,11 @@ export function registerOllamaShowRoute(app: Express, deps: { store: ConfigStore
     const config = deps.store.get()
     // 别名不在 downstreamModels → 404（标准「别名 → 候选」契约，不代理上游）
     if (!Object.prototype.hasOwnProperty.call(config.downstreamModels, model)) {
+      res.status(404).json({ error: 'model_not_found' })
+      return
+    }
+    // 别名在两层开关下不可用（总开关关闭 / 候选全部关闭）→ 等价于未注册
+    if (!isAliasExposed(config, model)) {
       res.status(404).json({ error: 'model_not_found' })
       return
     }

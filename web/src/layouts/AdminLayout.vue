@@ -52,12 +52,12 @@ const menuItems = [
   { path: '/dashboard', title: 'Dashboard', icon: DataAnalysis },
   { path: '/upstreams', title: 'Upstreams', icon: Connection },
   { path: '/models', title: 'Models', icon: Files },
-  { path: '/api-keys', title: 'API Keys', icon: Key },
-  { path: '/admin-users', title: 'Admin Users', icon: User },
   { path: '/logs', title: 'Logs', icon: Document },
   { path: '/sessions', title: 'Sessions', icon: Link },
   { path: '/stats', title: 'Stats', icon: TrendCharts },
   { path: '/system-config', title: 'System Config', icon: Setting },
+  { path: '/api-keys', title: 'API Keys', icon: Key },
+  { path: '/admin-users', title: 'Admin Users', icon: User },
 ]
 
 const route = useRoute()

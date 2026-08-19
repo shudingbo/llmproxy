@@ -26,14 +26,17 @@
 
       <el-button :icon="RefreshRight" :disabled="streaming" @click="newSession">新会话</el-button>
 
-      <!-- API Key 状态：未设置 = 红色标签 + 设置入口；已设置 = 绿色标签 + 清除 -->
-      <template v-if="!apiKey">
-        <el-tag type="danger" size="small">未设置 API Key</el-tag>
-        <el-button size="small" type="primary" plain @click="openApiKeyDialog">设置 API Key</el-button>
-      </template>
-      <template v-else>
-        <el-tag type="success" size="small">已配置 Key（前缀 {{ apiKeyMeta?.prefix ?? '' }}）</el-tag>
-        <el-button size="small" type="danger" link @click="clearApiKey">清除</el-button>
+      <!-- API Key 状态：仅后端开启鉴权（auth.enabled）时才要求 Key；
+           未设置 = 红色标签 + 设置入口；已设置 = 绿色标签 + 清除；鉴权关闭时不展示任何 Key UI -->
+      <template v-if="authEnabled">
+        <template v-if="!apiKey">
+          <el-tag type="danger" size="small">未设置 API Key</el-tag>
+          <el-button size="small" type="primary" plain @click="openApiKeyDialog">设置 API Key</el-button>
+        </template>
+        <template v-else>
+          <el-tag type="success" size="small">已配置 Key（前缀 {{ apiKeyMeta?.prefix ?? '' }}）</el-tag>
+          <el-button size="small" type="danger" link @click="clearApiKey">清除</el-button>
+        </template>
       </template>
     </div>
 
@@ -251,6 +254,10 @@ const capabilityItems = computed<CapabilityItem[]>(() =>
 // - sessionId 在 onMounted 无条件重新生成（刷新页面 = 新会话，绝不复用旧值）
 // - apiKey 仅存 sessionStorage（本会话有效），关闭页面即失效
 const sessionId = ref('')
+
+// 后端鉴权开关：auth.enabled 为 true 时才要求 API Key；关闭时 /v1 旁路鉴权，无需 Key
+const authEnabled = ref(false)
+
 const apiKey = ref('')
 const apiKeyMeta = ref<{ prefix: string; source: 'session' | 'matched' } | null>(null)
 const apiKeyDialogVisible = ref(false)
@@ -451,7 +458,8 @@ async function send() {
     ElMessage.warning('请先选择模型')
     return
   }
-  if (!apiKey.value) {
+  // 仅后端开启鉴权时才强制要求 API Key；鉴权关闭时 /v1 旁路鉴权，空 Key 可正常请求
+  if (authEnabled.value && !apiKey.value) {
     ElMessage.warning('请先设置 API Key')
     return
   }
@@ -555,6 +563,19 @@ onMounted(async () => {
     if (options.length > 0) currentModel.value = options[0]
   } catch (err) {
     ElMessage.error(`加载模型列表失败：${errMsg(err)}`)
+  }
+
+  // 0) 读取后端鉴权开关：决定是否需要 API Key（auth.enabled 为 true 才要求）
+  try {
+    const { data } = await api.get<{
+      config?: { auth?: { enabled?: boolean } }
+      auth?: { enabled?: boolean }
+    }>('/config')
+    // GET /admin/api/config 实际返回裸配置对象（无 config 信封，见 admin.ts）；兼容新契约 { config } 与裸形态
+    const cfg = data.config ?? data
+    authEnabled.value = cfg?.auth?.enabled === true
+  } catch {
+    authEnabled.value = false // 读不到配置按「无需鉴权」处理，避免误拦
   }
 
   // 2) 恢复本会话缓存的 API Key，并校验其是否仍然有效

@@ -40,15 +40,9 @@ export class AdminSessionStore {
   private readonly touchStmt: Database.Statement<[number, number, string]>
 
   /**
-   * 打开（必要时创建）数据库文件：启用 WAL 日志模式，建表、建索引，并处理旧 schema 迁移。
+   * 打开（必要时创建）数据库文件：启用 WAL 日志模式，建表、建索引。
    * 期望与 ApiKeyStore / SessionStore / LogStore 共用 ~/llmproxy/llmproxy.db，WAL 多连接安全
    *
-   * 迁移策略（兼容线上旧版本 schema：PK 为 id、字段名为 last_used_at、多 ip 列）：
-   *   1. CREATE TABLE IF NOT EXISTS —— 全新安装直接按新 schema 建表；已存在的旧表原样保留
-   *   2. PRAGMA table_info 检测列；若缺 last_seen_at（旧表）→ 走迁移分支
-   *   3. 迁移分支（事务内）：RENAME 旧表 → DROP 旧索引（释放名字）→ 建新表 + 索引
-   *      → 拷贝数据（last_used_at → last_seen_at，id/ip 丢弃）→ DROP 旧表；失败 ROLLBACK 抛错
-   *   4. 已是新 schema（全新 / 已迁移）→ 仅确保索引存在（幂等）
    */
   constructor(dbPath: string) {
     this.db = new Database(dbPath)
@@ -61,12 +55,9 @@ export class AdminSessionStore {
       (col) => col.name,
     )
     if (columnNames.includes('last_seen_at')) {
-      // 3. 已是新 schema（全新安装 / 已迁移过）→ 仅确保索引存在（IF NOT EXISTS 幂等）
+      // 3. 确保索引存在（IF NOT EXISTS 幂等）
       this.db.exec(CREATE_INDEX_SQL)
       this.db.exec(CREATE_INDEX_EXPIRES_SQL)
-    } else {
-      // 4. 旧 schema → 事务内迁移（失败 ROLLBACK 抛错，旧表保持原样）
-      this.migrateFromLegacy()
     }
 
     this.insertStmt = this.db.prepare(
@@ -78,41 +69,6 @@ export class AdminSessionStore {
     this.touchStmt = this.db.prepare(
       'UPDATE admin_sessions SET last_seen_at = ?, expires_at = ? WHERE session_id = ?',
     )
-  }
-
-  /**
-   * 旧 schema（缺 last_seen_at）→ 新 schema 迁移，全程事务隔离（失败 ROLLBACK 抛错，旧表不丢）。
-   *
-   * 关键点：SQLite 的 `ALTER TABLE RENAME` **不会重命名**其上已建的用户索引——索引名仍被占用、
-   * 仅 tbl_name 指向旧表。若不先 DROP，`CREATE INDEX IF NOT EXISTS` 会因名字已存在而**静默跳过**，
-   * 导致新表缺失 idx_admin_sessions_username / idx_admin_sessions_expires。故迁移内先释放旧索引名。
-   * 数据映射：last_used_at → last_seen_at；旧表多余的 id / ip 列直接丢弃。
-   */
-  private migrateFromLegacy(): void {
-    // 按名字释放旧索引（若存在）：RENAME 后它们仍占用原名字并指向 admin_sessions_old
-    const dropIndexIf = (name: string): void => {
-      const exists = this.db
-        .prepare('SELECT 1 AS one FROM sqlite_master WHERE type = ? AND name = ?')
-        .get('index', name)
-      if (exists !== undefined) {
-        this.db.exec(`DROP INDEX ${name}`)
-      }
-    }
-    const migrate = this.db.transaction(() => {
-      this.db.exec('ALTER TABLE admin_sessions RENAME TO admin_sessions_old')
-      dropIndexIf('idx_admin_sessions_username')
-      dropIndexIf('idx_admin_sessions_expires')
-      this.db.exec(CREATE_TABLE_SQL)
-      this.db.exec(CREATE_INDEX_SQL)
-      this.db.exec(CREATE_INDEX_EXPIRES_SQL)
-      // 拷贝旧数据：last_used_at → last_seen_at（id / ip 丢弃）
-      this.db.exec(
-        'INSERT INTO admin_sessions (session_id, username, created_at, last_seen_at, expires_at) ' +
-          'SELECT session_id, username, created_at, last_used_at, expires_at FROM admin_sessions_old',
-      )
-      this.db.exec('DROP TABLE admin_sessions_old')
-    })
-    migrate()
   }
 
   // 创建会话：返回完整行；session_id 冲突时覆盖（同账号重新登录）

@@ -15,7 +15,8 @@ import type { LogEntry, LogStore } from '../logstore/index.js'
 import { initLogRetention, stopLogRetention, sweepOldLogs } from './sweep.js'
 
 // 敏感请求头：任何情况下都不允许出现在日志里（匹配时忽略大小写）
-const SENSITIVE_HEADERS = new Set(['authorization', 'x-api-key'])
+// cookie：管理端会话 sessionId 载体，泄露即等于会话劫持，一律不落文件/SQLite
+const SENSITIVE_HEADERS = new Set(['authorization', 'x-api-key', 'cookie'])
 
 // pino 兼容的级别数值映射（保持前端 Logs 视图契约不变）
 const LEVEL_NUMBERS: Record<string, number> = {

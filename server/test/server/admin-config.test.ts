@@ -5,14 +5,15 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import express, { type Express } from 'express'
-import request from 'supertest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ConfigStore } from '../../src/config/store.js'
 import { LogStore } from '../../src/logstore/index.js'
 import { SessionStore } from '../../src/session/db.js'
 import { ApiKeyStore } from '../../src/auth/db.js'
+import { AdminSessionStore } from '../../src/auth/session-store.js'
 import { StatsCounter } from '../../src/stats/counter.js'
 import { registerAdminRoutes } from '../../src/server/admin.js'
+import { adminRequest } from '../helpers/adminSession.js'
 import type { OpenAIUpstreamClient } from '../../src/upstream/openai.js'
 
 // 基础配置模板：单上游 + 单别名；刻意不含 server / routing / auth 三节（缺省形态）
@@ -33,6 +34,13 @@ const BASE_CONFIG = {
       candidates: [{ upstreamId: 'u1', model: 'gpt-4' }],
     },
   },
+  // 提供确定性 admins 节：避免 ConfigStore 构造时触发「缺 admins 自愈」而注入随机 salt/密码
+  admins: {
+    salt: 'c'.repeat(64),
+    accounts: [
+      { username: 'admin', password: 'base-pw', disabled: false, createdAt: '2020-01-01T00:00:00.000Z', lastLoginAt: null },
+    ],
+  },
 }
 
 // 落盘文件的结构化视图（store 以 JSON.stringify 写盘，可直接 JSON.parse）
@@ -42,6 +50,7 @@ interface OnDiskConfig {
   server?: { host: string; port: number; bodyLimit: string | number }
   routing?: { sessionAffinity: { enabled: boolean; cleanupMaxAgeMs: number; cleanupIntervalMs: number } }
   auth?: { enabled: boolean; keyBytes: number; cleanupRetentionDays: number }
+  admins?: { salt: string; accounts: Array<Record<string, unknown>> }
 }
 
 // 每次测试的共享状态
@@ -52,7 +61,10 @@ let stats: StatsCounter
 let sessionStore: SessionStore
 let logStore: LogStore
 let apiKeyStore: ApiKeyStore
+let adminSessionStore: AdminSessionStore
 let app: Express
+// 带有效管理会话 Cookie 的请求工厂（管理端已全局挂载 adminAuth，用例默认以「已登录」身份调用）
+let req: ReturnType<typeof adminRequest>
 
 // 构造被测应用：express.json（装配层职责）+ 管理端路由
 function buildApp(): void {
@@ -65,6 +77,7 @@ function buildApp(): void {
     sessionStore,
     logStore,
     apiKeyStore,
+    adminSessionStore,
   })
 }
 
@@ -78,7 +91,10 @@ beforeEach(() => {
   sessionStore = new SessionStore(join(tmpDir, 'sessions.db'))
   logStore = new LogStore(join(tmpDir, 'logs.db'))
   apiKeyStore = new ApiKeyStore(join(tmpDir, 'apikeys.db'))
+  adminSessionStore = new AdminSessionStore(join(tmpDir, 'admin-sessions.db'))
   buildApp()
+  // 默认以「已登录」身份调用：在会话存储中直接落一条有效会话（免 login 流程、不改配置形状）
+  req = adminRequest(app, adminSessionStore)
   // Windows 读 USERPROFILE，POSIX 读 HOME：两个都 stub 才跨平台生效
   vi.stubEnv('USERPROFILE', tmpDir)
   vi.stubEnv('HOME', tmpDir)
@@ -87,7 +103,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllEnvs()
   // 先关库再删目录：WAL 模式下文件句柄保持打开，先关连接避免删除竞态
-  for (const close of [sessionStore.close, logStore.close, apiKeyStore.close]) {
+  for (const close of [sessionStore.close, logStore.close, apiKeyStore.close, adminSessionStore.close]) {
     try {
       close()
     } catch {
@@ -99,7 +115,7 @@ afterEach(() => {
 
 describe('系统配置保存 PUT /admin/api/config', () => {
   it('只改 server 节：内存与文件均更新，restartRequired 含 server，auth 节不进列表', async () => {
-    const res = await request(app).put('/admin/api/config').send({ server: { host: '0.0.0.0', port: 8080 } })
+    const res = await req().put('/admin/api/config').send({ server: { host: '0.0.0.0', port: 8080 } })
     expect(res.status).toBe(200)
     expect(res.body.status).toBe(true)
     expect(typeof res.body.msg).toBe('string')
@@ -112,7 +128,7 @@ describe('系统配置保存 PUT /admin/api/config', () => {
   })
 
   it('只改 auth 节：restartRequired 为空（auth.enabled 每请求实时生效）', async () => {
-    const res = await request(app).put('/admin/api/config').send({ auth: { enabled: true } })
+    const res = await req().put('/admin/api/config').send({ auth: { enabled: true } })
     expect(res.status).toBe(200)
     expect(res.body.status).toBe(true)
     expect(res.body.restartRequired).toEqual([])
@@ -126,7 +142,7 @@ describe('系统配置保存 PUT /admin/api/config', () => {
   })
 
   it('只改 routing 节：restartRequired 含 routing', async () => {
-    const res = await request(app)
+    const res = await req()
       .put('/admin/api/config')
       .send({ routing: { sessionAffinity: { enabled: false } } })
     expect(res.status).toBe(200)
@@ -145,7 +161,7 @@ describe('系统配置保存 PUT /admin/api/config', () => {
   ])('非法值（%s）返回 400：msg 带字段路径，配置不被修改', async (_label, payload, expectedPath) => {
     // 请求前快照（loadConfigFromFile 时 ConfigSchema 已把 auth 节 prefault 为默认值，不能断言 undefined）
     const before = JSON.parse(JSON.stringify(store.get())) as unknown
-    const res = await request(app).put('/admin/api/config').send(payload)
+    const res = await req().put('/admin/api/config').send(payload)
     expect(res.status).toBe(400)
     expect(res.body.status).toBe(false)
     expect(res.body.error).toBe('invalid_config')
@@ -160,11 +176,11 @@ describe('系统配置保存 PUT /admin/api/config', () => {
   })
 
   it('缺省键不修改既有值：先设 server.port=8080，再 PUT 只带 auth → port 保持 8080', async () => {
-    const first = await request(app).put('/admin/api/config').send({ server: { port: 8080 } })
+    const first = await req().put('/admin/api/config').send({ server: { port: 8080 } })
     expect(first.status).toBe(200)
     expect(store.get().server?.port).toBe(8080)
 
-    const second = await request(app).put('/admin/api/config').send({ auth: { enabled: true } })
+    const second = await req().put('/admin/api/config').send({ auth: { enabled: true } })
     expect(second.status).toBe(200)
     // server 节未被 auth 请求触碰
     expect(store.get().server).toEqual({ host: '127.0.0.1', port: 8080, bodyLimit: '10mb' })
@@ -176,19 +192,19 @@ describe('系统配置保存 PUT /admin/api/config', () => {
   })
 
   it('auth 节既有值不会被缺省键覆盖（prefault 回归）：先启用 auth，再只改 server', async () => {
-    const first = await request(app).put('/admin/api/config').send({ auth: { enabled: true, keyBytes: 32 } })
+    const first = await req().put('/admin/api/config').send({ auth: { enabled: true, keyBytes: 32 } })
     expect(first.status).toBe(200)
     expect(store.get().auth).toEqual({ enabled: true, keyBytes: 32, cleanupRetentionDays: 7 })
 
     // 只改 server（不带 auth 键）：既有 auth 值必须原样保留，不能被 prefault 默认值重置
-    const second = await request(app).put('/admin/api/config').send({ server: { port: 8080 } })
+    const second = await req().put('/admin/api/config').send({ server: { port: 8080 } })
     expect(second.status).toBe(200)
     expect(store.get().auth).toEqual({ enabled: true, keyBytes: 32, cleanupRetentionDays: 7 })
     expect(store.get().server?.port).toBe(8080)
   })
 
   it('三节同时提供：restartRequired 为 [server, routing]（auth 永不列入），落盘内容完整正确', async () => {
-    const res = await request(app)
+    const res = await req()
       .put('/admin/api/config')
       .send({
         server: { port: 9000 },
@@ -206,12 +222,13 @@ describe('系统配置保存 PUT /admin/api/config', () => {
       server: { host: '127.0.0.1', port: 9000, bodyLimit: '10mb' },
       routing: { sessionAffinity: { enabled: true, cleanupMaxAgeMs: 604800000, cleanupIntervalMs: 0 } },
       auth: { enabled: true, keyBytes: 24, cleanupRetentionDays: 7 },
+      admins: BASE_CONFIG.admins,
     })
   })
 
   it('空 body 不修改任何值：200 + restartRequired 空 + 文件内容不变', async () => {
     const before = readFileSync(cfgPath, 'utf-8')
-    const res = await request(app).put('/admin/api/config').send({})
+    const res = await req().put('/admin/api/config').send({})
     expect(res.status).toBe(200)
     expect(res.body.status).toBe(true)
     expect(res.body.restartRequired).toEqual([])
@@ -221,7 +238,7 @@ describe('系统配置保存 PUT /admin/api/config', () => {
   })
 
   it('请求体中的未知顶层键被忽略（不校验、不写回）', async () => {
-    const res = await request(app)
+    const res = await req()
       .put('/admin/api/config')
       .send({ server: { port: 8080 }, upstreams: [] as unknown[] })
     expect(res.status).toBe(200)

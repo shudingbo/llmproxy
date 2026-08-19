@@ -2,14 +2,23 @@
 // 不含文件监听（T6 的 watcher 负责）与任何日志输出（T7 负责）
 import { existsSync, renameSync, writeFileSync } from 'node:fs'
 import fastDeepEqual from 'fast-deep-equal'
-import { ConfigError, loadConfigFromFile } from './loader.js'
-import { ConfigSchema, type Config } from './schema.js'
+import { getLogger } from '../logger/index.js'
+import {
+  ConfigError,
+  generateDefaultAdminAccount,
+  generateDefaultAdmins,
+  generateSalt,
+  loadConfigFromFile,
+} from './loader.js'
+import { ConfigSchema, type AdminsConfig, type Config } from './schema.js'
 
 // 配置变更来源：管理端写入 / 文件监听发现 / 启动引导
 export type WatchSource = 'admin' | 'watch' | 'bootstrap'
 
 // 首次运行（配置文件不存在）时写入的 bootstrap 示例（JSONC：注释即文档）
-const BOOTSTRAP_JSONC = `{
+// admins 节是真实值（随机 salt + 默认账号的随机初始密码），由 buildBootstrapJsonc 在构造时注入；
+// 其余节均为注释形式，取消注释即可启用
+const buildBootstrapJsonc = (admins: AdminsConfig): string => `{
   // llmproxy 配置文件（JSONC：支持注释与尾逗号）
   // 修改后由文件监听自动重载；管理端页面修改会原子写回本文件
 
@@ -62,7 +71,7 @@ const BOOTSTRAP_JSONC = `{
         { "upstreamId": "openai-main", "model": "gpt-4o-mini" }
       ]
     }
-  }
+  },
 
   // API Key 鉴权（可选）：
   // enabled = true 后所有 /v1/* 与 /api/* 请求必须携带 Authorization: Bearer <Key>，
@@ -74,6 +83,11 @@ const BOOTSTRAP_JSONC = `{
   //   "keyBytes": 24,
   //   "cleanupRetentionDays": 7
   // }
+
+  // 管理员账号（首次启动自动生成默认账号 admin + 随机初始密码，请查看启动日志）：
+  // salt：登录摘要的 MD5 盐（前端计算 MD5(salt + ts + password)），自动生成，无需手改
+  // accounts：账号列表；password 明文存储（文件权限 0600），首次登录后请立即修改
+  "admins": ${JSON.stringify(admins, null, 2)}
 }
 `
 
@@ -94,13 +108,33 @@ export class ConfigStore {
     this.path = path
     if (!existsSync(path)) {
       // 文件缺失：先写入 bootstrap 示例（临时文件 + 原子重命名），再装载为当前配置
-      this.persist(BOOTSTRAP_JSONC)
+      // 管理员节注入真实 salt + 默认账号（随机初始密码）；初始密码仅此一次打印（控制台 + warn 日志），此后不再可得
+      const { admins, password } = generateDefaultAdmins()
+      this.persist(buildBootstrapJsonc(admins))
       this.current = loadConfigFromFile(path)
+      const line = `Default admin created. username=admin password=${password} — please change immediately after first login.`
+      console.log(line)
+      getLogger().warn(line)
       // 语义上完成一次“set bootstrap”：此刻 current 与文件已一致，
       // 走 set 会在去重步骤直接返回（既不重复写盘，构造期也无订阅者可通知）
       this.set(this.current, { source: 'bootstrap' })
     } else {
       this.current = loadConfigFromFile(path)
+      // 文件存在但无可用管理员（admins 节缺失，或 accounts 为空）——旧配置升级场景：
+      // 自动补建默认 admin，避免「配置已存在却没有管理员可登录」导致管理端卡死
+      const admins = this.current.admins
+      const needsRemediation = admins === undefined || admins.accounts.length === 0
+      // 防御性：若已存在 username=admin 的账号则跳过（不覆盖既有账号），正常流程不会命中
+      const hasAdminAccount = admins?.accounts?.some((a) => a.username === 'admin') ?? false
+      if (needsRemediation && !hasAdminAccount) {
+        // 保留旧 salt（若已存在），否则新生成；账号复用 generateDefaultAdminAccount 统一构造
+        const salt = admins?.salt ?? generateSalt()
+        const { account, password } = generateDefaultAdminAccount()
+        const line = `Default admin created (no existing admins found). username=admin password=${password} — please change immediately after first login.`
+        console.log(line)
+        getLogger().warn(line)
+        this.set({ ...this.current, admins: { salt, accounts: [account] } }, { source: 'bootstrap' })
+      }
     }
   }
 

@@ -10,16 +10,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
 import express, { type Express } from 'express'
-import request from 'supertest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ConfigStore } from '../../src/config/store.js'
 import { LogStore, type LogEntry } from '../../src/logstore/index.js'
 import { SessionStore, type SessionBindInfo } from '../../src/session/db.js'
 import { ApiKeyStore } from '../../src/auth/db.js'
+import { AdminSessionStore } from '../../src/auth/session-store.js'
 import { StatsCounter } from '../../src/stats/counter.js'
 import { probeMaxContext } from '../../src/upstream/context.js'
 import type { OpenAIUpstreamClient } from '../../src/upstream/openai.js'
 import { registerAdminRoutes } from '../../src/server/admin.js'
+import { adminRequest } from '../helpers/adminSession.js'
 
 // probeMaxContext 包一层可替换的 mock：默认透传真实实现（其余用例不受影响），
 // 仅「防御分支」用例改为抛错，验证端点 try/catch → extractErrorCode 的错误代号回退
@@ -129,8 +130,11 @@ let logStore: LogStore
 let logDbPath: string
 let apiKeyStore: ApiKeyStore
 let apiKeyDbPath: string
+let adminSessionStore: AdminSessionStore
 let app: Express
 let clients: Map<string, OpenAIUpstreamClient>
+// 带有效管理会话 Cookie 的请求工厂（管理端已全局挂载 adminAuth，用例默认以「已登录」身份调用）
+let req: ReturnType<typeof adminRequest>
 
 // 构造被测应用：express.json（装配层职责）+ 管理端路由；cli 透传命令行参数（默认 undefined）
 function buildApp(cli?: { host?: string; port?: number }): void {
@@ -143,6 +147,7 @@ function buildApp(cli?: { host?: string; port?: number }): void {
     sessionStore,
     logStore,
     apiKeyStore,
+    adminSessionStore,
     cli,
   })
 }
@@ -163,8 +168,12 @@ beforeEach(() => {
   // API Key 鉴权存储：真实 ApiKeyStore + 临时 DB 文件
   apiKeyDbPath = join(tmpDir, 'apikeys.db')
   apiKeyStore = new ApiKeyStore(apiKeyDbPath)
+  // 管理员会话存储：真实 AdminSessionStore + 临时 DB 文件（registerAdminRoutes 的必填依赖）
+  adminSessionStore = new AdminSessionStore(join(tmpDir, 'admin-sessions.db'))
   clients = new Map()
   buildApp()
+  // 默认以「已登录」身份调用：在会话存储中直接落一条有效会话（免 login 流程、不改配置形状）
+  req = adminRequest(app, adminSessionStore)
   // Windows 读 USERPROFILE，POSIX 读 HOME：两个都 stub 才跨平台生效
   vi.stubEnv('USERPROFILE', tmpDir)
   vi.stubEnv('HOME', tmpDir)
@@ -188,6 +197,11 @@ afterEach(async () => {
   } catch {
     // 连接已关闭，无需处理
   }
+  try {
+    adminSessionStore.close()
+  } catch {
+    // 连接已关闭，无需处理
+  }
   for (const srv of servers) {
     if (srv.listening) {
       srv.closeAllConnections()
@@ -202,7 +216,7 @@ afterEach(async () => {
 
 describe('上游管理 /admin/api/upstreams', () => {
   it('GET 返回列表且 apiKey 全部掩码（长密钥 3 星 + 后 4 位，短密钥全星）', async () => {
-    const res = await request(app).get('/admin/api/upstreams')
+    const res = await req().get('/admin/api/upstreams')
     expect(res.status).toBe(200)
     expect(res.body).toEqual([
       {
@@ -225,7 +239,7 @@ describe('上游管理 /admin/api/upstreams', () => {
   })
 
   it('POST 新增上游：zod 补齐缺省字段，返回 201 且密钥掩码', async () => {
-    const res = await request(app)
+    const res = await req()
       .post('/admin/api/upstreams')
       .send({ id: 'u3', baseUrl: 'https://example.com/v1', apiKey: 'key12345' })
     expect(res.status).toBe(201)
@@ -251,19 +265,19 @@ describe('上游管理 /admin/api/upstreams', () => {
   })
 
   it('POST 无效载荷返回 400', async () => {
-    const res = await request(app).post('/admin/api/upstreams').send({ id: '', baseUrl: 'not-a-url', apiKey: 'k' })
+    const res = await req().post('/admin/api/upstreams').send({ id: '', baseUrl: 'not-a-url', apiKey: 'k' })
     expect(res.status).toBe(400)
     expect(res.body.error).toBe('invalid_upstream')
   })
 
   it('POST 重复 id 返回 400', async () => {
-    const res = await request(app).post('/admin/api/upstreams').send({ id: 'u1', baseUrl: 'https://x.com/v1', apiKey: 'k' })
+    const res = await req().post('/admin/api/upstreams').send({ id: 'u1', baseUrl: 'https://x.com/v1', apiKey: 'k' })
     expect(res.status).toBe(400)
     expect(res.body.error).toBe('duplicate_id')
   })
 
   it('PUT 部分更新：未提交字段保留，请求体中的 id 被忽略', async () => {
-    const res = await request(app).put('/admin/api/upstreams/u1').send({ baseUrl: 'https://new.example.com/v1' })
+    const res = await req().put('/admin/api/upstreams/u1').send({ baseUrl: 'https://new.example.com/v1' })
     expect(res.status).toBe(200)
     expect(res.body.baseUrl).toBe('https://new.example.com/v1')
     // 未提交的 apiKey 保持原值（响应掩码）
@@ -272,19 +286,19 @@ describe('上游管理 /admin/api/upstreams', () => {
     expect(store.get().upstreams[0].apiKey).toBe('sk-long-1234')
 
     // 请求体携带 id 不生效（路径为准）
-    const res2 = await request(app).put('/admin/api/upstreams/u1').send({ id: 'hacked', baseUrl: 'https://x.example.com/v1' })
+    const res2 = await req().put('/admin/api/upstreams/u1').send({ id: 'hacked', baseUrl: 'https://x.example.com/v1' })
     expect(res2.status).toBe(200)
     expect(res2.body.id).toBe('u1')
   })
 
   it('PUT 不存在的上游返回 404', async () => {
-    const res = await request(app).put('/admin/api/upstreams/nope').send({ baseUrl: 'https://x.com/v1' })
+    const res = await req().put('/admin/api/upstreams/nope').send({ baseUrl: 'https://x.com/v1' })
     expect(res.status).toBe(404)
     expect(res.body.error).toBe('upstream_not_found')
   })
 
   it('DELETE 删除上游并级联清理下游别名（候选清空的别名整体删除）', async () => {
-    const res = await request(app).delete('/admin/api/upstreams/u2')
+    const res = await req().delete('/admin/api/upstreams/u2')
     expect(res.status).toBe(200)
     const config = store.get()
     // u2 被移除
@@ -299,7 +313,7 @@ describe('上游管理 /admin/api/upstreams', () => {
     // 先把配置缩减为单上游
     const config = store.get()
     store.set({ upstreams: [config.upstreams[0]], downstreamModels: config.downstreamModels }, { source: 'admin' })
-    const res = await request(app).delete('/admin/api/upstreams/u1')
+    const res = await req().delete('/admin/api/upstreams/u1')
     expect(res.status).toBe(400)
     expect(res.body.error).toBe('last_upstream')
     // 配置未被破坏
@@ -307,7 +321,7 @@ describe('上游管理 /admin/api/upstreams', () => {
   })
 
   it('DELETE 不存在的上游返回 404', async () => {
-    const res = await request(app).delete('/admin/api/upstreams/nope')
+    const res = await req().delete('/admin/api/upstreams/nope')
     expect(res.status).toBe(404)
   })
 })
@@ -318,7 +332,7 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
       'u1',
       fakeClient(async () => [{ id: 'm1' }, { id: 'm2' }]),
     )
-    const res = await request(app).post('/admin/api/upstreams/u1/test')
+    const res = await req().post('/admin/api/upstreams/u1/test')
     expect(res.status).toBe(200)
     expect(res.body.ok).toBe(true)
     expect(res.body.status).toBe(200)
@@ -333,7 +347,7 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ data: [{ id: 'a' }, { id: 'b' }, { id: 'c' }] }))
     })
-    const res = await request(app).post('/admin/api/upstreams/u1/test').send({ baseUrl: url, apiKey: '' })
+    const res = await req().post('/admin/api/upstreams/u1/test').send({ baseUrl: url, apiKey: '' })
     expect(res.status).toBe(200)
     expect(res.body.ok).toBe(true)
     expect(res.body.modelCount).toBe(3)
@@ -341,7 +355,7 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
     expect(capturedAuth).toBe('Bearer')
 
     // 非空 apiKey 覆盖生效
-    const res2 = await request(app).post('/admin/api/upstreams/u1/test').send({ baseUrl: url, apiKey: 'sk-ovr' })
+    const res2 = await req().post('/admin/api/upstreams/u1/test').send({ baseUrl: url, apiKey: 'sk-ovr' })
     expect(res2.body.ok).toBe(true)
     expect(capturedAuth).toBe('Bearer sk-ovr')
   })
@@ -351,14 +365,14 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ data: [{ id: 'only' }] }))
     })
-    const res = await request(app).post('/admin/api/upstreams/brand-new/test').send({ baseUrl: url })
+    const res = await req().post('/admin/api/upstreams/brand-new/test').send({ baseUrl: url })
     expect(res.status).toBe(200)
     expect(res.body.ok).toBe(true)
     expect(res.body.modelCount).toBe(1)
   })
 
   it('配置模式下游不存在返回 404', async () => {
-    const res = await request(app).post('/admin/api/upstreams/nope/test')
+    const res = await req().post('/admin/api/upstreams/nope/test')
     expect(res.status).toBe(404)
     expect(res.body.error).toBe('upstream_not_found')
   })
@@ -370,7 +384,7 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
         throw errWithCode('ECONNREFUSED')
       }),
     )
-    const res = await request(app).post('/admin/api/upstreams/u1/test')
+    const res = await req().post('/admin/api/upstreams/u1/test')
     expect(res.status).toBe(200)
     expect(res.body.ok).toBe(false)
     expect(res.body.modelCount).toBe(0)
@@ -387,7 +401,7 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
         throw errWithStatus(503)
       }),
     )
-    const res = await request(app).post('/admin/api/upstreams/u1/test')
+    const res = await req().post('/admin/api/upstreams/u1/test')
     expect(res.body.ok).toBe(false)
     expect(res.body.error).toBe('503')
   })
@@ -424,7 +438,7 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
 
   it('探测原生支持：/responses 返回 200 + object: response → supportsResponses: true', async () => {
     const url = await startMock(responsesMock({}))
-    const res = await request(app).post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
+    const res = await req().post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
     expect(res.status).toBe(200)
     expect(res.body.ok).toBe(true)
     expect(res.body.modelCount).toBe(2)
@@ -433,7 +447,7 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
 
   it('探测明确不支持：/responses 返回 404 → supportsResponses: false（ok 仍为 true）', async () => {
     const url = await startMock(responsesMock({ status: 404, body: { error: 'not found' } }))
-    const res = await request(app).post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
+    const res = await req().post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
     expect(res.status).toBe(200)
     expect(res.body.ok).toBe(true)
     expect(res.body.supportsResponses).toBe(false)
@@ -441,7 +455,7 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
 
   it('探测异常：/responses 返回 500 → supportsResponses: null（ok 仍为 true）', async () => {
     const url = await startMock(responsesMock({ status: 500, body: { error: 'boom' } }))
-    const res = await request(app).post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
+    const res = await req().post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
     expect(res.status).toBe(200)
     expect(res.body.ok).toBe(true)
     expect(res.body.supportsResponses).toBe(null)
@@ -462,7 +476,7 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
       }
       res.end(JSON.stringify({ data: [] }))
     })
-    const res = await request(app).post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
+    const res = await req().post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
     expect(res.status).toBe(200)
     expect(res.body.supportsResponses).toBe(true)
     expect((JSON.parse(capturedBody) as { model?: string }).model).toBe('m1')
@@ -483,7 +497,7 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
       }
       res.end(JSON.stringify({ data: [] }))
     })
-    const res = await request(app).post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
+    const res = await req().post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
     expect(res.status).toBe(200)
     expect(res.body.ok).toBe(true)
     expect(res.body.modelCount).toBe(0)
@@ -501,7 +515,7 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
         },
       ),
     )
-    const res = await request(app).post('/admin/api/upstreams/u1/test')
+    const res = await req().post('/admin/api/upstreams/u1/test')
     expect(res.status).toBe(200)
     expect(res.body.ok).toBe(true)
     expect(res.body.supportsResponses).toBe(null)
@@ -571,14 +585,14 @@ describe('Responses API 检测 /admin/api/upstreams/:id/detect-responses', () =>
 
   it('两步都过（非流式 200 + object:response，流式标准事件）→ responsesApi: native', async () => {
     const url = await startMock(detectMock({}))
-    const res = await request(app).post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
+    const res = await req().post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ ok: true, responsesApi: 'native', evidence: { nonStream: 'ok', stream: 'ok' } })
   })
 
   it('非流式 404 → responsesApi: convert（evidence.nonStream: fail，stream: skipped）', async () => {
     const url = await startMock(detectMock({ nonStreamStatus: 404, nonStreamBody: { error: 'not found' } }))
-    const res = await request(app).post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
+    const res = await req().post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ ok: true, responsesApi: 'convert', evidence: { nonStream: 'fail', stream: 'skipped' } })
   })
@@ -611,7 +625,7 @@ describe('Responses API 检测 /admin/api/upstreams/:id/detect-responses', () =>
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ data: [] }))
     })
-    const res = await request(app).post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
+    const res = await req().post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ ok: true, responsesApi: 'convert', evidence: { nonStream: 'fail', stream: 'skipped' } })
     expect(streamProbed).toBe(false)
@@ -628,7 +642,7 @@ describe('Responses API 检测 /admin/api/upstreams/:id/detect-responses', () =>
         ],
       }),
     )
-    const res = await request(app).post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
+    const res = await req().post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
     expect(res.body).toEqual({ ok: true, responsesApi: 'convert', evidence: { nonStream: 'ok', stream: 'fail' } })
   })
 
@@ -644,25 +658,25 @@ describe('Responses API 检测 /admin/api/upstreams/:id/detect-responses', () =>
         ],
       }),
     )
-    const res = await request(app).post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
+    const res = await req().post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
     expect(res.body).toEqual({ ok: true, responsesApi: 'convert', evidence: { nonStream: 'ok', stream: 'fail' } })
   })
 
   it('覆盖 baseUrl 模式：body 传新 baseUrl → 检测走新 client；配置模式（不可达）→ ok: false', async () => {
     // 覆盖模式：配置中 u1 指向 127.0.0.1:1（不可达），仅靠 body 覆盖 baseUrl 才能检测成功
     const url = await startMock(detectMock({}))
-    const res = await request(app).post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
+    const res = await req().post('/admin/api/upstreams/u1/detect-responses').send({ baseUrl: url })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ ok: true, responsesApi: 'native', evidence: { nonStream: 'ok', stream: 'ok' } })
 
     // 配置模式：u1 配置 baseUrl 不可达 → listModels 失败 → ok: false + 错误代号
-    const res2 = await request(app).post('/admin/api/upstreams/u1/detect-responses')
+    const res2 = await req().post('/admin/api/upstreams/u1/detect-responses')
     expect(res2.body.ok).toBe(false)
     expect(res2.body.error).toBe('ECONNREFUSED')
   })
 
   it('listModels 失败（上游不可达）→ { ok: false, error: 错误代号 }', async () => {
-    const res = await request(app)
+    const res = await req()
       .post('/admin/api/upstreams/u1/detect-responses')
       .send({ baseUrl: 'http://127.0.0.1:1/v1' })
     expect(res.status).toBe(200)
@@ -670,7 +684,7 @@ describe('Responses API 检测 /admin/api/upstreams/:id/detect-responses', () =>
   })
 
   it('配置模式下上游不存在返回 404', async () => {
-    const res = await request(app).post('/admin/api/upstreams/nope/detect-responses')
+    const res = await req().post('/admin/api/upstreams/nope/detect-responses')
     expect(res.status).toBe(404)
     expect(res.body.error).toBe('upstream_not_found')
   })
@@ -689,7 +703,7 @@ describe('候选上下文探测 /admin/api/candidates/probe-context', () => {
 
   it('新增模式：upstreamId 未命中配置 + 显式 baseUrl → 用 baseUrl 探测', async () => {
     const url = await startMock(llamaCppMock(8192))
-    const res = await request(app)
+    const res = await req()
       .post('/admin/api/candidates/probe-context')
       .send({ upstreamId: 'new-u', model: 'llama3', baseUrl: url })
     expect(res.status).toBe(200)
@@ -713,7 +727,7 @@ describe('候选上下文探测 /admin/api/candidates/probe-context', () => {
       { ...config, upstreams: config.upstreams.map((u) => (u.id === 'u1' ? { ...u, baseUrl: url } : u)) },
       { source: 'admin' },
     )
-    const res = await request(app)
+    const res = await req()
       .post('/admin/api/candidates/probe-context')
       .send({ upstreamId: 'u1', model: 'm' })
     expect(res.status).toBe(200)
@@ -734,7 +748,7 @@ describe('候选上下文探测 /admin/api/candidates/probe-context', () => {
       res.end(JSON.stringify({ data: [] }))
     })
     // u1 配置指向 127.0.0.1:1（不可达），仅靠 body 覆盖 baseUrl 才能探测成功
-    const res = await request(app)
+    const res = await req()
       .post('/admin/api/candidates/probe-context')
       .send({ upstreamId: 'u1', model: 'm', baseUrl: url, apiKey: 'sk-ovr' })
     expect(res.status).toBe(200)
@@ -743,21 +757,21 @@ describe('候选上下文探测 /admin/api/candidates/probe-context', () => {
   })
 
   it('缺 upstreamId 返回 400 invalid_request + field=upstreamId', async () => {
-    const res = await request(app).post('/admin/api/candidates/probe-context').send({ model: 'm' })
+    const res = await req().post('/admin/api/candidates/probe-context').send({ model: 'm' })
     expect(res.status).toBe(400)
     expect(res.body.error).toBe('invalid_request')
     expect(res.body.field).toBe('upstreamId')
   })
 
   it('缺 model 返回 400 invalid_request + field=model', async () => {
-    const res = await request(app).post('/admin/api/candidates/probe-context').send({ upstreamId: 'u1' })
+    const res = await req().post('/admin/api/candidates/probe-context').send({ upstreamId: 'u1' })
     expect(res.status).toBe(400)
     expect(res.body.error).toBe('invalid_request')
     expect(res.body.field).toBe('model')
   })
 
   it('upstreamId 未命中 + 无 baseUrl 返回 400 invalid_request + field=baseUrl', async () => {
-    const res = await request(app)
+    const res = await req()
       .post('/admin/api/candidates/probe-context')
       .send({ upstreamId: 'nope', model: 'm' })
     expect(res.status).toBe(400)
@@ -770,7 +784,7 @@ describe('候选上下文探测 /admin/api/candidates/probe-context', () => {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ data: [] }))
     })
-    const res = await request(app)
+    const res = await req()
       .post('/admin/api/candidates/probe-context')
       .send({ upstreamId: 'new-u', model: 'm', baseUrl: url })
     expect(res.status).toBe(200)
@@ -782,7 +796,7 @@ describe('候选上下文探测 /admin/api/candidates/probe-context', () => {
       res.statusCode = 404
       res.end('not found')
     })
-    const res = await request(app)
+    const res = await req()
       .post('/admin/api/candidates/probe-context')
       .send({ upstreamId: 'new-u', model: 'm', baseUrl: url })
     expect(res.status).toBe(200)
@@ -806,7 +820,7 @@ describe('候选上下文探测 /admin/api/candidates/probe-context', () => {
       }
       res.end(JSON.stringify({ data: [] }))
     })
-    const res = await request(app)
+    const res = await req()
       .post('/admin/api/candidates/probe-context')
       .send({ upstreamId: 'new-u', model: 'b', baseUrl: urlWithLm })
     expect(res.status).toBe(200)
@@ -814,7 +828,7 @@ describe('候选上下文探测 /admin/api/candidates/probe-context', () => {
   })
 
   it('网络错误（baseUrl 指向 127.0.0.1:1）→ 探测失败呈现 context_not_found', async () => {
-    const res = await request(app)
+    const res = await req()
       .post('/admin/api/candidates/probe-context')
       .send({ upstreamId: 'new-u', model: 'm', baseUrl: 'http://127.0.0.1:1/v1' })
     expect(res.status).toBe(200)
@@ -825,7 +839,7 @@ describe('候选上下文探测 /admin/api/candidates/probe-context', () => {
 
   it('防御分支：probeMaxContext 抛网络错误 → 返回错误代号（extractErrorCode）', async () => {
     vi.mocked(probeMaxContext).mockRejectedValueOnce(errWithCode('ECONNREFUSED'))
-    const res = await request(app)
+    const res = await req()
       .post('/admin/api/candidates/probe-context')
       .send({ upstreamId: 'new-u', model: 'm', baseUrl: 'http://127.0.0.1:1/v1' })
     expect(res.status).toBe(200)
@@ -834,7 +848,7 @@ describe('候选上下文探测 /admin/api/candidates/probe-context', () => {
 
   it('防御分支：probeMaxContext 抛无代号错误 → 回退 probe_failed', async () => {
     vi.mocked(probeMaxContext).mockRejectedValueOnce(new Error('boom'))
-    const res = await request(app)
+    const res = await req()
       .post('/admin/api/candidates/probe-context')
       .send({ upstreamId: 'new-u', model: 'm', baseUrl: 'http://127.0.0.1:1/v1' })
     expect(res.status).toBe(200)
@@ -844,13 +858,13 @@ describe('候选上下文探测 /admin/api/candidates/probe-context', () => {
 
 describe('下游模型映射 /admin/api/downstream-models', () => {
   it('GET 原样返回映射（归一化为 group 形态）', async () => {
-    const res = await request(app).get('/admin/api/downstream-models')
+    const res = await req().get('/admin/api/downstream-models')
     expect(res.status).toBe(200)
     expect(res.body).toEqual(BASE_CONFIG.downstreamModels)
   })
 
   it('PUT 整体替换并写回存储（group 形态）', async () => {
-    const res = await request(app).put('/admin/api/downstream-models').send({
+    const res = await req().put('/admin/api/downstream-models').send({
       'gpt-4': { disabled: false, candidates: [{ upstreamId: 'u1', model: 'gpt-4o' }] },
       claude: { disabled: false, candidates: [{ upstreamId: 'u2', model: 'claude-3' }] },
     })
@@ -862,7 +876,7 @@ describe('下游模型映射 /admin/api/downstream-models', () => {
   })
 
   it('PUT 整体替换并写回存储（接受旧裸数组形态，向后兼容）', async () => {
-    const res = await request(app).put('/admin/api/downstream-models').send({
+    const res = await req().put('/admin/api/downstream-models').send({
       'gpt-4': [{ upstreamId: 'u1', model: 'gpt-4o' }],
       claude: [{ upstreamId: 'u2', model: 'claude-3' }],
     })
@@ -874,7 +888,7 @@ describe('下游模型映射 /admin/api/downstream-models', () => {
   })
 
   it('PUT 空候选列表返回 400', async () => {
-    const res = await request(app).put('/admin/api/downstream-models').send({ 'gpt-4': { disabled: false, candidates: [] } })
+    const res = await req().put('/admin/api/downstream-models').send({ 'gpt-4': { disabled: false, candidates: [] } })
     expect(res.status).toBe(400)
     expect(res.body.error).toBe('invalid_downstream_models')
   })
@@ -890,22 +904,22 @@ describe('日志查询 /admin/api/logs', () => {
     logStore.insert({ type: 'app', level: 50, time: dayMs('10:00:02.000'), msg: 'boom', category: 'app' })
 
     // 默认 type=app + level=info(30)：三条全部命中，time 倒序 → 50/40/30
-    const all = await request(app).get('/admin/api/logs?date=2026-08-02')
+    const all = await req().get('/admin/api/logs?date=2026-08-02')
     expect(all.status).toBe(200)
     expect(all.body.type).toBe('app')
     expect(all.body.lines.map((l: { level: number }) => l.level)).toEqual([50, 40, 30])
     expect(all.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['boom', 'upstream slow', 'downstream-ready'])
 
     // level=error(50)：只返回 50
-    const errors = await request(app).get('/admin/api/logs?date=2026-08-02&level=error')
+    const errors = await req().get('/admin/api/logs?date=2026-08-02&level=error')
     expect(errors.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['boom'])
 
     // keyword 过滤：msg 含 upstream 的只有 40
-    const byKeyword = await request(app).get('/admin/api/logs?date=2026-08-02&keyword=upstream')
+    const byKeyword = await req().get('/admin/api/logs?date=2026-08-02&keyword=upstream')
     expect(byKeyword.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['upstream slow'])
 
     // type 互不干扰：app 记录不出现在 api 查询
-    const apis = await request(app).get('/admin/api/logs?date=2026-08-02&type=api')
+    const apis = await req().get('/admin/api/logs?date=2026-08-02&type=api')
     expect(apis.body.lines).toEqual([])
   })
 
@@ -920,7 +934,7 @@ describe('日志查询 /admin/api/logs', () => {
       url: '/v1/chat/completions',
       status: 200,
     })
-    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
+    const res = await req().get('/admin/api/logs?type=api&date=2026-08-02')
     expect(res.status).toBe(200)
     expect(res.body.lines[0]).toEqual({
       level: 30,
@@ -942,7 +956,7 @@ describe('日志查询 /admin/api/logs', () => {
     logStore.insert({ type: 'api', level: 30, time: new Date('2026-08-01T10:00:00.000').getTime(), msg: 'prev-day' })
     logStore.insert({ type: 'api', level: 30, time: new Date('2026-08-03T10:00:00.000').getTime(), msg: 'next-day' })
 
-    const res = await request(app).get('/admin/api/logs?type=api&date=2026-08-02')
+    const res = await req().get('/admin/api/logs?type=api&date=2026-08-02')
     expect(res.status).toBe(200)
     expect(res.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['day-edge', 'in-day'])
   })
@@ -953,7 +967,7 @@ describe('日志查询 /admin/api/logs', () => {
     }
 
     // 第一页：最新两条 line-5/line-4，更早还有匹配 → hasMore=true；total=5（满筛选条件）
-    const page1 = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&limit=2')
+    const page1 = await req().get('/admin/api/logs?type=api&date=2026-08-02&limit=2')
     expect(page1.status).toBe(200)
     expect(page1.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-5', 'line-4'])
     expect(page1.body.hasMore).toBe(true)
@@ -961,7 +975,7 @@ describe('日志查询 /admin/api/logs', () => {
     expect(page1.body.total).toBe(5)
 
     // 第二页：offset=2 → line-3/line-2，分页参数回显；total 不随翻页改变
-    const page2 = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&offset=2&limit=2')
+    const page2 = await req().get('/admin/api/logs?type=api&date=2026-08-02&offset=2&limit=2')
     expect(page2.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-3', 'line-2'])
     expect(page2.body.hasMore).toBe(true)
     expect(page2.body.offset).toBe(2)
@@ -969,7 +983,7 @@ describe('日志查询 /admin/api/logs', () => {
     expect(page2.body.total).toBe(5)
 
     // 末页：offset=4 → 只剩 line-1，已无更早 → hasMore=false；total 仍=5
-    const last = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&offset=4&limit=2')
+    const last = await req().get('/admin/api/logs?type=api&date=2026-08-02&offset=4&limit=2')
     expect(last.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['line-1'])
     expect(last.body.hasMore).toBe(false)
     expect(last.body.total).toBe(5)
@@ -981,38 +995,38 @@ describe('日志查询 /admin/api/logs', () => {
     logStore.insert({ type: 'api', level: 50, time: dayMs('10:00:02.000'), msg: 'boom upstream' })
 
     // level=error(50) + keyword=boom → 仅 50 且 msg 含 boom
-    const both = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&level=error&keyword=boom')
+    const both = await req().get('/admin/api/logs?type=api&date=2026-08-02&level=error&keyword=boom')
     expect(both.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['boom upstream'])
 
     // keyword 命中 url 字段
-    const byUrl = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&keyword=/v1/models')
+    const byUrl = await req().get('/admin/api/logs?type=api&date=2026-08-02&keyword=/v1/models')
     expect(byUrl.body.lines.map((l: { msg: string }) => l.msg)).toEqual(['request-complete'])
 
     // keyword 空串等价于未传：三条全部返回
-    const emptyKw = await request(app).get('/admin/api/logs?type=api&date=2026-08-02&keyword=')
+    const emptyKw = await req().get('/admin/api/logs?type=api&date=2026-08-02&keyword=')
     expect(emptyKw.body.lines).toHaveLength(3)
   })
 
   it('非法参数返回 400：负 offset、limit=0、limit 超上限、非法日期', async () => {
-    const neg = await request(app).get('/admin/api/logs?date=2026-08-02&offset=-1')
+    const neg = await req().get('/admin/api/logs?date=2026-08-02&offset=-1')
     expect(neg.status).toBe(400)
     expect(neg.body.error).toBe('invalid_query')
 
-    const zero = await request(app).get('/admin/api/logs?date=2026-08-02&limit=0')
+    const zero = await req().get('/admin/api/logs?date=2026-08-02&limit=0')
     expect(zero.status).toBe(400)
     expect(zero.body.error).toBe('invalid_query')
 
-    const over = await request(app).get('/admin/api/logs?date=2026-08-02&limit=501')
+    const over = await req().get('/admin/api/logs?date=2026-08-02&limit=501')
     expect(over.status).toBe(400)
     expect(over.body.error).toBe('invalid_query')
 
-    const badDate = await request(app).get('/admin/api/logs?date=2026/08/02')
+    const badDate = await req().get('/admin/api/logs?date=2026/08/02')
     expect(badDate.status).toBe(400)
     expect(badDate.body.error).toBe('invalid_query')
   })
 
   it('空库返回空行列表、scanned=0 且 hasMore=false', async () => {
-    const res = await request(app).get('/admin/api/logs?date=2026-08-02')
+    const res = await req().get('/admin/api/logs?date=2026-08-02')
     expect(res.status).toBe(200)
     expect(res.body.lines).toEqual([])
     expect(res.body.hasMore).toBe(false)
@@ -1029,7 +1043,7 @@ describe('日志手动清理 /admin/api/logs/cleanup', () => {
     // 先确保日志目录存在（端点内 getLogDir 会创建，但 sweepLogsBefore 需目录已存在）
     mkdirSync(logDir(), { recursive: true })
     const now = Date.now()
-    const res = await request(app).post('/admin/api/logs/cleanup')
+    const res = await req().post('/admin/api/logs/cleanup')
     expect(res.status).toBe(200)
     expect(typeof res.body.deleted).toBe('number')
     expect(typeof res.body.deletedFiles).toBe('number')
@@ -1045,7 +1059,7 @@ describe('日志手动清理 /admin/api/logs/cleanup', () => {
     logStore.insert({ type: 'app', level: 30, time: 2_000, msg: 'old-2' })
     logStore.insert({ type: 'app', level: 30, time: 3_000, msg: 'keep' })
 
-    const res = await request(app).post('/admin/api/logs/cleanup').send({ before: 2_500 })
+    const res = await req().post('/admin/api/logs/cleanup').send({ before: 2_500 })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ deleted: 2, deletedFiles: 0, before: 2_500 })
     // 剩余记录验证（time 倒序最新在前）
@@ -1077,7 +1091,7 @@ describe('日志手动清理 /admin/api/logs/cleanup', () => {
     utimesSync(oldFile, oldMtime, oldMtime)
     utimesSync(freshFile, freshMtime, freshMtime)
 
-    const res = await request(app).post('/admin/api/logs/cleanup').send({ before })
+    const res = await req().post('/admin/api/logs/cleanup').send({ before })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ deleted: 0, deletedFiles: 1, before })
     expect(existsSync(oldFile)).toBe(false)
@@ -1091,7 +1105,7 @@ describe('统计 /admin/api/stats', () => {
     stats.recordAttempt({ upstreamId: 'u1', ok: true, durationMs: 100 })
     stats.recordAttempt({ upstreamId: 'u1', ok: false, durationMs: 200 })
     stats.recordAttempt({ upstreamId: 'u2', ok: true, durationMs: 50 })
-    const res = await request(app).get('/admin/api/stats')
+    const res = await req().get('/admin/api/stats')
     expect(res.status).toBe(200)
     expect(res.body.totals).toEqual({ requests: 3, errors: 1, avgLatencyMs: 350 / 3 })
     expect(res.body.perUpstream).toEqual([
@@ -1105,7 +1119,7 @@ describe('统计 /admin/api/stats', () => {
 
 describe('健康检查与配置 /admin/api/health|config', () => {
   it('health 返回存活状态、版本与各上游健康标记（disabled → paused）', async () => {
-    const res = await request(app).get('/admin/api/health')
+    const res = await req().get('/admin/api/health')
     expect(res.status).toBe(200)
     expect(res.body.status).toBe('ok')
     expect(typeof res.body.uptime).toBe('number')
@@ -1116,7 +1130,7 @@ describe('健康检查与配置 /admin/api/health|config', () => {
   })
 
   it('health 返回当前下行流的 host / port / baseUrl 与 listenSource（缺省 127.0.0.1:3000）', async () => {
-    const res = await request(app).get('/admin/api/health')
+    const res = await req().get('/admin/api/health')
     expect(res.body.host).toBe('127.0.0.1')
     expect(res.body.port).toBe(3000)
     // 通配监听下 baseUrl 用本机局域网 IP 生成（测试环境网卡 IP 不固定，只做形状断言）
@@ -1131,7 +1145,7 @@ describe('健康检查与配置 /admin/api/health|config', () => {
       { ...store.get(), server: { host: '0.0.0.0', port: 8080 } },
       { source: 'admin' },
     )
-    const res = await request(app).get('/admin/api/health')
+    const res = await req().get('/admin/api/health')
     expect(res.body.host).toBe('0.0.0.0')
     expect(res.body.port).toBe(8080)
     // 通配监听下 baseUrl 用本机局域网 IP 生成（测试环境网卡 IP 不固定，只做形状断言）
@@ -1148,7 +1162,8 @@ describe('健康检查与配置 /admin/api/health|config', () => {
       { source: 'admin' },
     )
     buildApp({ host: '0.0.0.0', port: 8080 })
-    const res = await request(app).get('/admin/api/health')
+    req = adminRequest(app, adminSessionStore)
+    const res = await req().get('/admin/api/health')
     expect(res.body.host).toBe('0.0.0.0')
     expect(res.body.port).toBe(8080)
     // 通配监听下 baseUrl 用本机局域网 IP 生成（测试环境网卡 IP 不固定，只做形状断言）
@@ -1165,14 +1180,15 @@ describe('健康检查与配置 /admin/api/health|config', () => {
       { source: 'admin' },
     )
     buildApp({ port: 8080 })
-    const res = await request(app).get('/admin/api/health')
+    req = adminRequest(app, adminSessionStore)
+    const res = await req().get('/admin/api/health')
     expect(res.body.host).toBe('0.0.0.0')
     expect(res.body.port).toBe(8080)
     expect(res.body.listenSource).toBe('cli')
   })
 
   it('config 返回完整配置且 apiKey 掩码', async () => {
-    const res = await request(app).get('/admin/api/config')
+    const res = await req().get('/admin/api/config')
     expect(res.status).toBe(200)
     expect(res.body.upstreams[0]).toEqual({
       id: 'u1',
@@ -1186,19 +1202,19 @@ describe('健康检查与配置 /admin/api/health|config', () => {
   })
 
   it('reload-error 无错误时为 null，设置后返回错误消息', async () => {
-    const res = await request(app).get('/admin/api/config/reload-error')
+    const res = await req().get('/admin/api/config/reload-error')
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ error: null })
 
     store.setRecentReloadError(new Error('watcher boom'))
-    const res2 = await request(app).get('/admin/api/config/reload-error')
+    const res2 = await req().get('/admin/api/config/reload-error')
     expect(res2.body).toEqual({ error: 'watcher boom' })
   })
 })
 
 describe('会话粘附映射 /admin/api/sessions', () => {
   it('GET 空库返回 rows=[] 且 total=0；bind 两条后倒序返回且 total 正确', async () => {
-    const empty = await request(app).get('/admin/api/sessions')
+    const empty = await req().get('/admin/api/sessions')
     expect(empty.status).toBe(200)
     expect(empty.body).toEqual({ rows: [], total: 0 })
 
@@ -1208,7 +1224,7 @@ describe('会话粘附映射 /admin/api/sessions', () => {
     setSessionUpdatedAt(sessionDbPath, 'gpt-4o::chat-1', 100)
     setSessionUpdatedAt(sessionDbPath, 'gpt-4o::chat-2', 200)
 
-    const res = await request(app).get('/admin/api/sessions')
+    const res = await req().get('/admin/api/sessions')
     expect(res.status).toBe(200)
     expect(res.body.total).toBe(2)
     expect(res.body.rows.map((r: { session_key: string }) => r.session_key)).toEqual([
@@ -1231,7 +1247,7 @@ describe('会话粘附映射 /admin/api/sessions', () => {
     setSessionUpdatedAt(sessionDbPath, 'gpt-4o::chat-3', 300)
 
     // client 精确匹配
-    const byClient = await request(app).get('/admin/api/sessions?client=open-webui')
+    const byClient = await req().get('/admin/api/sessions?client=open-webui')
     expect(byClient.body.total).toBe(2)
     expect(byClient.body.rows.map((r: { session_key: string }) => r.session_key)).toEqual([
       'gpt-4o::chat-3',
@@ -1239,37 +1255,37 @@ describe('会话粘附映射 /admin/api/sessions', () => {
     ])
 
     // keyword 命中 session_id
-    const bySession = await request(app).get('/admin/api/sessions?keyword=beta')
+    const bySession = await req().get('/admin/api/sessions?keyword=beta')
     expect(bySession.body.total).toBe(1)
     expect(bySession.body.rows[0].session_id).toBe('sess-beta')
 
     // keyword 命中 upstream_id
-    const byUpstream = await request(app).get('/admin/api/sessions?keyword=up-gamma')
+    const byUpstream = await req().get('/admin/api/sessions?keyword=up-gamma')
     expect(byUpstream.body.total).toBe(1)
     expect(byUpstream.body.rows[0].upstream_id).toBe('up-gamma')
 
     // offset/limit 分页：跳过最新两条后只剩最旧一条
-    const page = await request(app).get('/admin/api/sessions?offset=2&limit=1')
+    const page = await req().get('/admin/api/sessions?offset=2&limit=1')
     expect(page.body.rows.map((r: { session_key: string }) => r.session_key)).toEqual(['gpt-4o::chat-1'])
     expect(page.body.total).toBe(3)
   })
 
   it('GET 非法 offset/limit 返回 400', async () => {
-    const neg = await request(app).get('/admin/api/sessions?offset=-1')
+    const neg = await req().get('/admin/api/sessions?offset=-1')
     expect(neg.status).toBe(400)
     expect(neg.body.error).toBe('invalid_query')
 
-    const zero = await request(app).get('/admin/api/sessions?limit=0')
+    const zero = await req().get('/admin/api/sessions?limit=0')
     expect(zero.status).toBe(400)
     expect(zero.body.error).toBe('invalid_query')
 
-    const over = await request(app).get('/admin/api/sessions?limit=501')
+    const over = await req().get('/admin/api/sessions?limit=501')
     expect(over.status).toBe(400)
     expect(over.body.error).toBe('invalid_query')
   })
 
   it('GET session-clients 空库返回 clients=[]', async () => {
-    const res = await request(app).get('/admin/api/session-clients')
+    const res = await req().get('/admin/api/session-clients')
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ clients: [] })
   })
@@ -1281,7 +1297,7 @@ describe('会话粘附映射 /admin/api/sessions', () => {
     // 重复 client：不应在结果中重复出现
     sessionStore.bind('gpt-4o::chat-4', makeSessionInfo({ sessionId: 'sess-d', client: 'github' }))
 
-    const res = await request(app).get('/admin/api/session-clients')
+    const res = await req().get('/admin/api/session-clients')
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ clients: ['content-hash', 'github', 'open-webui'] })
   })
@@ -1289,12 +1305,12 @@ describe('会话粘附映射 /admin/api/sessions', () => {
   it('DELETE 单条：存在返回 { deleted: true } 且记录消失；不存在返回 { deleted: false }', async () => {
     sessionStore.bind('gpt-4o::chat-1', makeSessionInfo({ sessionId: 'sess-a' }))
 
-    const gone = await request(app).delete('/admin/api/sessions/gpt-4o::chat-1')
+    const gone = await req().delete('/admin/api/sessions/gpt-4o::chat-1')
     expect(gone.status).toBe(200)
     expect(gone.body).toEqual({ deleted: true })
     expect(sessionStore.get('gpt-4o::chat-1')).toBeUndefined()
 
-    const missing = await request(app).delete('/admin/api/sessions/gpt-4o::no-such')
+    const missing = await req().delete('/admin/api/sessions/gpt-4o::no-such')
     expect(missing.status).toBe(200)
     expect(missing.body).toEqual({ deleted: false })
   })
@@ -1303,11 +1319,11 @@ describe('会话粘附映射 /admin/api/sessions', () => {
     sessionStore.bind('gpt-4o::chat-a', makeSessionInfo({ sessionId: 'sess-a' }))
     sessionStore.bind('gpt-4o::chat-b', makeSessionInfo({ sessionId: 'sess-b' }))
 
-    const res = await request(app).delete('/admin/api/sessions')
+    const res = await req().delete('/admin/api/sessions')
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ deleted: 2 })
 
-    const again = await request(app).delete('/admin/api/sessions')
+    const again = await req().delete('/admin/api/sessions')
     expect(again.body).toEqual({ deleted: 0 })
   })
 
@@ -1320,7 +1336,7 @@ describe('会话粘附映射 /admin/api/sessions', () => {
     setSessionUpdatedAt(sessionDbPath, 'gpt-4o::chat-new', now - 1_000)
 
     // 缺省保留期 604800000ms（1 周）：两条都未过期 → 删 0
-    const none = await request(app).post('/admin/api/sessions/cleanup')
+    const none = await req().post('/admin/api/sessions/cleanup')
     expect(none.status).toBe(200)
     expect(none.body).toEqual({ deleted: 0 })
 
@@ -1332,7 +1348,7 @@ describe('会话粘附映射 /admin/api/sessions', () => {
       },
       { source: 'admin' },
     )
-    const res = await request(app).post('/admin/api/sessions/cleanup')
+    const res = await req().post('/admin/api/sessions/cleanup')
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ deleted: 1 })
     expect(sessionStore.get('gpt-4o::chat-old')).toBeUndefined()
@@ -1347,7 +1363,7 @@ describe('会话粘附映射 /admin/api/sessions', () => {
       { ...store.get(), routing: { sessionAffinity: { enabled: true, cleanupMaxAgeMs: 0, cleanupIntervalMs: 0 } } },
       { source: 'admin' },
     )
-    const res = await request(app).post('/admin/api/sessions/cleanup')
+    const res = await req().post('/admin/api/sessions/cleanup')
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ deleted: 0 })
     expect(sessionStore.get('gpt-4o::chat-old')).toBeDefined()

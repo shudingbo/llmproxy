@@ -8,7 +8,7 @@ dist/
 # 环境变量
 .env*
 
-
+.playwright-mcp/
 # 覆盖率与构建缓存
 coverage/
 .vite/

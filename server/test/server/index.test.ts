@@ -103,7 +103,8 @@ describe('server.bodyLimit 请求体上限', () => {
 
   it('未配置 server 节时走缺省 10mb：小体积 JSON 请求正常命中路由（200，不受 413 影响）', async () => {
     const app = buildAppWithUi()
-    const res = await request(app).post('/admin/api/sessions/cleanup').send({ padding: 'small' })
+    // 用白名单端点（无需登录会话）：本用例验证 body-parser 缺省上限放行，与具体管理端点无关
+    const res = await request(app).post('/admin/api/auth/logout').send({ padding: 'small' })
     expect(res.status).toBe(200)
   })
 })

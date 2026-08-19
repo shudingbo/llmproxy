@@ -89,8 +89,8 @@ const hashBeforeFirstAssistant = (body: Record<string, unknown>): string | undef
   })
 
   const prefix = firstAssistantIndex === -1 ? messages : messages.slice(0, firstAssistantIndex);
-  let msgT: any = [];
-  for( let m of prefix ) {
+  const msgT: unknown[] = [];
+  for( const m of prefix ) {
     // 不知道为什么 vs 的 github copilot 会在会话的第二轮里在上次第一个user前插入新的包含 IDESTATE CONTEXT，所以这里过滤掉，
     if( m.role === "user" && m?.content?.indexOf("IDESTATE CONTEXT") >= 0 ) {
       continue

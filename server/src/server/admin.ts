@@ -1,6 +1,7 @@
 // 管理端 REST 接口：/admin/api/* 全部端点
 // 职责：上游增删改查与连通性测试、下游模型映射替换、日志查询、统计、健康检查、配置查看/保存与重载错误
-// 无鉴权（由部署层防护）、无 CORS（开发期走 web/vite 代理）；apiKey 一律不落日志、响应中全部掩码
+// 全局登录鉴权（白名单：/auth/login、/auth/salt、/auth/status、/auth/logout、/health），无 CORS（开发期走 web/vite 代理）；apiKey 一律不落日志、响应中全部掩码
+import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { networkInterfaces } from 'node:os'
 import type { Express, Request, Response } from 'express'
@@ -12,6 +13,7 @@ import {
   DownstreamAliasGroupSchema,
   DownstreamModelEntrySchema,
   UpstreamSchema,
+  type AdminAccount,
   type UpstreamCandidate,
 } from '../config/schema.js'
 import { normalizeDownstreamAliasEntry } from '../config/loader.js'
@@ -25,6 +27,19 @@ import { probeMaxContext } from '../upstream/context.js'
 import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
 import { ApiKeyStore } from '../auth/db.js'
 import { extractKeyPrefix, generateApiKey, hashApiKey } from '../auth/key.js'
+import { AdminSessionStore } from '../auth/session-store.js'
+import {
+  ADMIN_SESSION_COOKIE,
+  ADMIN_SESSION_TTL_MS,
+  clearSessionCookie,
+  computePasswordHash,
+  createAdminAuthMiddleware,
+  generateSessionId,
+  isTsWithinWindow,
+  parseCookieValue,
+  safeEqualHex,
+  setSessionCookie,
+} from '../auth/admin-auth.js'
 import { DOWNSTREAM_ENDPOINTS } from './downstreams.js'
 import { resolveListen, type CliArgs } from './listen.js'
 import { maskApiKey } from './admin-helpers.js'
@@ -40,6 +55,8 @@ export interface AdminDeps {
   logStore: LogStore
   // API Key 鉴权存储：列表/CRUD 路由层不直接碰 SQLite，统一走 ApiKeyStore
   apiKeyStore: ApiKeyStore
+  // 管理端会话存储：登录/登出/改密/账号 CRUD 统一走 AdminSessionStore
+  adminSessionStore: AdminSessionStore
   // 命令行 --host/--port：透传到 /admin/api/health，保证返回值与 app.listen 实际生效值一致
   cli?: CliArgs
 }
@@ -183,7 +200,18 @@ function resolvePublicBaseUrl(listen: { host: string; port: number }): string {
  * 假定装配层已注入 express.json（10mb）与请求日志中间件。
  */
 export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
-  const { store, getUpstreamClient, stats, sessionStore, logStore, apiKeyStore, cli } = deps
+  const { store, getUpstreamClient, stats, sessionStore, logStore, apiKeyStore, adminSessionStore, cli } = deps
+
+  // 管理端会话鉴权：全局挂载到 /admin/api，白名单外的所有端点一律要求登录
+  // 白名单为相对挂载点的路径（中间件内 req.path 已剥离 /admin/api 前缀）
+  const PUBLIC_ADMIN_PATHS = new Set(['/auth/login', '/auth/salt', '/auth/status', '/auth/logout', '/health'])
+  const adminAuth = createAdminAuthMiddleware({ adminSessionStore })
+  app.use('/admin/api', (req, res, next) => {
+    if (PUBLIC_ADMIN_PATHS.has(req.path)) {
+      return next()
+    }
+    return adminAuth(req, res, next)
+  })
 
   // 上游列表：apiKey 掩码后返回（仅展示用途，绝不回传明文）
   app.get('/admin/api/upstreams', (_req: Request, res: Response) => {
@@ -728,8 +756,10 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     }
   })
 
-  // 鉴权状态：返回当前开关 + Key 数（供前端开关切换前的提示）
-  app.get('/admin/api/auth/status', (_req: Request, res: Response) => {
+  // 鉴权状态：返回当前开关 + Key 数（供前端开关切换前的提示）；
+  // 扩展管理员登录态（authenticated / username）：本路由在会话中间件白名单内（未登录也可查），
+  // 故按 Cookie 手工查会话判定，而非读 req.adminUser
+  app.get('/admin/api/auth/status', (req: Request, res: Response) => {
     const enabled = store.get().auth?.enabled === true
     let total = 0
     try {
@@ -737,7 +767,253 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     } catch (err) {
       getLogger().warn({ err }, '鉴权状态查询失败')
     }
-    res.json({ enabled, total })
+    let authenticated = false
+    let username: string | null = null
+    const sessionId = parseCookieValue(req, ADMIN_SESSION_COOKIE)
+    if (sessionId !== undefined) {
+      try {
+        const row = adminSessionStore.getBySessionId(sessionId)
+        if (row !== undefined && row.expires_at > Date.now()) {
+          authenticated = true
+          username = row.username
+        }
+      } catch (err) {
+        getLogger().warn({ err }, '管理员会话查询失败')
+      }
+    }
+    res.json({ enabled, total, authenticated, username })
+  })
+
+  // ===== 管理端登录与账号管理 =====
+  // 账号局部更新（lastLoginAt / password / disabled）：store.set 原子写盘 + deepEqual 防自环
+  const patchAdminAccount = (username: string, patch: Partial<AdminAccount>): boolean => {
+    const config = store.get()
+    const admins = config.admins
+    if (admins === undefined || admins.accounts.every((a) => a.username !== username)) {
+      return false
+    }
+    const accounts = admins.accounts.map((a) => (a.username === username ? { ...a, ...patch } : a))
+    store.set({ ...config, admins: { ...admins, accounts } }, { source: 'admin' })
+    return true
+  }
+
+  // 账号对外形状：绝不含明文 password，仅 hasPassword 标记
+  const adminItemShape = (a: AdminAccount) => ({
+    username: a.username,
+    disabled: a.disabled,
+    createdAt: a.createdAt,
+    lastLoginAt: a.lastLoginAt,
+    hasPassword: a.password.length > 0,
+  })
+
+  // 登录盐 + 服务器当前 epoch 秒（前端计算 MD5(salt + ts + password)；ts 同时充当防重放窗口）
+  app.get('/admin/api/auth/salt', (_req: Request, res: Response) => {
+    res.json({ salt: store.get().admins?.salt ?? '', ts: Math.floor(Date.now() / 1000) })
+  })
+
+  // 登录：body { username, passwordMd5, ts }；成功建会话 + 种 HttpOnly Cookie 并刷新 lastLoginAt；
+  // 「用户不存在 / 停用 / 密码错」对外同形 401（防枚举），ts 超窗单独报 timestamp_expired
+  app.post('/admin/api/auth/login', (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const username = typeof body.username === 'string' ? body.username : ''
+    const passwordMd5 = typeof body.passwordMd5 === 'string' ? body.passwordMd5 : ''
+    // ts 可选：客户端回传 /auth/salt 的 ts 可防重放并避免秒边界竞态；缺省时取服务器当前秒
+    const clientTs = typeof body.ts === 'number' && Number.isInteger(body.ts) ? body.ts : null
+    const ts = clientTs ?? Math.floor(Date.now() / 1000)
+    if (username === '' || passwordMd5 === '') {
+      res.status(400).json({ status: false, msg: '参数错误', error: 'invalid_login' })
+      return
+    }
+    const admins = store.get().admins
+    if (admins === undefined) {
+      res.status(401).json({ status: false, msg: '用户名或密码错误', error: 'invalid_credentials' })
+      return
+    }
+    if (clientTs !== null && !isTsWithinWindow(clientTs)) {
+      res.status(401).json({ status: false, msg: '时间戳已失效', error: 'timestamp_expired' })
+      return
+    }
+    const account = admins.accounts.find((a) => a.username === username)
+    if (account === undefined || account.disabled === true) {
+      res.status(401).json({ status: false, msg: '用户名或密码错误', error: 'invalid_credentials' })
+      return
+    }
+    // 服务端用配置明文密码重算同式摘要，恒时比较（防时序攻击）
+    if (!safeEqualHex(computePasswordHash(admins.salt, ts, account.password), passwordMd5)) {
+      res.status(401).json({ status: false, msg: '用户名或密码错误', error: 'invalid_credentials' })
+      return
+    }
+    try {
+      const sessionId = generateSessionId()
+      adminSessionStore.create({ sessionId, username, ttlMs: ADMIN_SESSION_TTL_MS })
+      setSessionCookie(res, sessionId)
+    } catch (err) {
+      getLogger().warn({ err, username }, '创建管理员会话失败')
+      res.status(500).json({ status: false, msg: '登录失败', error: 'session_create_failed' })
+      return
+    }
+    // lastLoginAt 写回失败不影响登录结果
+    try {
+      patchAdminAccount(username, { lastLoginAt: new Date().toISOString() })
+    } catch (err) {
+      getLogger().warn({ err, username }, '更新 lastLoginAt 失败')
+    }
+    res.json({ status: true, msg: 'ok', username })
+  })
+
+  // 登出：幂等（无会话也清 Cookie 返回 ok）
+  app.post('/admin/api/auth/logout', (req: Request, res: Response) => {
+    const sessionId = parseCookieValue(req, ADMIN_SESSION_COOKIE)
+    if (sessionId !== undefined) {
+      try {
+        adminSessionStore.delete(sessionId)
+      } catch (err) {
+        getLogger().warn({ err }, '登出删除会话失败')
+      }
+    }
+    clearSessionCookie(res)
+    res.json({ status: true, msg: 'ok' })
+  })
+
+  // 修改密码（需登录）：旧密码摘要校验（与登录同一算法），通过后替换为新密码
+  app.post('/admin/api/auth/change-password', (req: Request, res: Response) => {
+    const username = req.adminUser?.username
+    if (username === undefined) {
+      res.status(401).json({ status: false, msg: '未登录', error: 'unauthenticated' })
+      return
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const oldPasswordMd5 = typeof body.oldPasswordMd5 === 'string' ? body.oldPasswordMd5 : ''
+    const newPassword = typeof body.newPassword === 'string' ? body.newPassword : ''
+    // ts 缺省取服务器当前秒（客户端一般用 /auth/salt 返回的 ts，两者相差秒级）
+    const ts = typeof body.ts === 'number' && Number.isInteger(body.ts) ? body.ts : Math.floor(Date.now() / 1000)
+    if (oldPasswordMd5 === '' || newPassword === '') {
+      res.status(400).json({ status: false, msg: '参数错误', error: 'invalid_change_password' })
+      return
+    }
+    const admins = store.get().admins
+    const account = admins?.accounts.find((a) => a.username === username)
+    if (admins === undefined || account === undefined) {
+      res.status(401).json({ status: false, msg: '未登录', error: 'unauthenticated' })
+      return
+    }
+    if (!safeEqualHex(computePasswordHash(admins.salt, ts, account.password), oldPasswordMd5)) {
+      res.status(400).json({ status: false, msg: '旧密码错误', error: 'wrong_old_password' })
+      return
+    }
+    try {
+      patchAdminAccount(username, { password: newPassword })
+    } catch (err) {
+      getLogger().warn({ err, username }, '修改密码失败')
+      res.status(500).json({ status: false, msg: '修改密码失败', error: 'change_password_failed' })
+      return
+    }
+    res.json({ status: true, msg: '密码已修改' })
+  })
+
+  // 管理员账号列表（不含密码，需登录）
+  app.get('/admin/api/admins', (_req: Request, res: Response) => {
+    res.json((store.get().admins?.accounts ?? []).map(adminItemShape))
+  })
+
+  // 新增管理员账号（需登录）：重名 / 空密码 400；旧配置无 admins 节（无 salt）时顺带生成新 salt
+  app.post('/admin/api/admins', (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const username = typeof body.username === 'string' ? body.username.trim() : ''
+    const password = typeof body.password === 'string' ? body.password : ''
+    const disabled = typeof body.disabled === 'boolean' ? body.disabled : false
+    if (username === '' || password === '') {
+      res.status(400).json({ status: false, msg: 'username / password 不能为空', error: 'invalid_admin' })
+      return
+    }
+    const config = store.get()
+    const admins = config.admins
+    const accounts = admins?.accounts ?? []
+    if (accounts.some((a) => a.username === username)) {
+      res.status(400).json({ status: false, msg: '用户名已存在', error: 'duplicate_username' })
+      return
+    }
+    const now = new Date().toISOString()
+    const newAccount: AdminAccount = { username, password, disabled, createdAt: now, lastLoginAt: null }
+    const salt = admins?.salt ?? randomBytes(32).toString('hex')
+    try {
+      store.set({ ...config, admins: { salt, accounts: [...accounts, newAccount] } }, { source: 'admin' })
+    } catch (err) {
+      getLogger().warn({ err, username }, '创建管理员账号失败')
+      res.status(500).json({ status: false, msg: '创建管理员账号失败', error: 'admin_create_failed' })
+      return
+    }
+    res.status(201).json(adminItemShape(newAccount))
+  })
+
+  // 更新管理员账号（需登录）：password / disabled 任意子集；password 空串 = 保持原值
+  app.patch('/admin/api/admins/:username', (req: Request, res: Response) => {
+    const username = req.params.username
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const hasPassword = 'password' in body
+    const hasDisabled = 'disabled' in body
+    if (!hasPassword && !hasDisabled) {
+      res.status(400).json({ status: false, msg: '至少提供 password / disabled 之一', error: 'invalid_admin' })
+      return
+    }
+    const config = store.get()
+    const admins = config.admins
+    const current = admins?.accounts.find((a) => a.username === username)
+    if (current === undefined) {
+      res.status(404).json({ status: false, msg: '管理员不存在', error: 'admin_not_found' })
+      return
+    }
+    const updated: AdminAccount = { ...current }
+    if (hasPassword) {
+      const password = typeof body.password === 'string' ? body.password : ''
+      if (password !== '') {
+        updated.password = password
+      }
+    }
+    if (hasDisabled && typeof body.disabled === 'boolean') {
+      updated.disabled = body.disabled
+    }
+    const accounts = (admins?.accounts ?? []).map((a) => (a.username === username ? updated : a))
+    const salt = admins?.salt ?? randomBytes(32).toString('hex')
+    try {
+      store.set({ ...config, admins: { salt, accounts } }, { source: 'admin' })
+    } catch (err) {
+      getLogger().warn({ err, username }, '更新管理员账号失败')
+      res.status(500).json({ status: false, msg: '更新管理员账号失败', error: 'admin_update_failed' })
+      return
+    }
+    res.json(adminItemShape(updated))
+  })
+
+  // 删除管理员账号（需登录）：禁止删自己（cannot_delete_self）；禁止删最后一个启用中的账号（last_admin）
+  app.delete('/admin/api/admins/:username', (req: Request, res: Response) => {
+    const username = req.params.username
+    const config = store.get()
+    const admins = config.admins
+    const target = admins?.accounts.find((a) => a.username === username)
+    if (target === undefined) {
+      res.status(404).json({ status: false, msg: '管理员不存在', error: 'admin_not_found' })
+      return
+    }
+    if (req.adminUser?.username === username) {
+      res.status(400).json({ status: false, msg: '不能删除当前登录的管理员', error: 'cannot_delete_self' })
+      return
+    }
+    const enabledCount = (admins?.accounts ?? []).filter((a) => a.disabled === false).length
+    if (target.disabled === false && enabledCount <= 1) {
+      res.status(400).json({ status: false, msg: '不能删除最后一个启用中的管理员', error: 'last_admin' })
+      return
+    }
+    const accounts = (admins?.accounts ?? []).filter((a) => a.username !== username)
+    const salt = admins?.salt ?? ''
+    try {
+      store.set({ ...config, admins: { salt, accounts } }, { source: 'admin' })
+    } catch (err) {
+      getLogger().warn({ err, username }, '删除管理员账号失败')
+      res.status(500).json({ status: false, msg: '删除管理员账号失败', error: 'admin_delete_failed' })
+      return
+    }
+    res.json({ status: true, msg: 'ok' })
   })
 
   // 健康检查：进程存活 + 版本 + 各上游健康状态（disabled → paused）

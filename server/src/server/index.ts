@@ -14,6 +14,7 @@ import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
 import { StatsCounter } from '../stats/counter.js'
 import { ApiKeyStore } from '../auth/db.js'
 import { createAuthMiddleware } from '../auth/middleware.js'
+import { AdminSessionStore } from '../auth/session-store.js'
 import { getConfigPath, getDataDir, getLogDir } from '../paths.js'
 import { getLogger, initLogRetention, requestLogger, configureLogging, setLogStore } from '../logger/index.js'
 import { RETENTION_DAYS } from '../logger/sweep.js'
@@ -79,6 +80,8 @@ export function createApp(deps: AppDeps): Express {
   const logStore = new LogStore(join(getDataDir(), 'llmproxy.db'))
   // API Key 鉴权存储：与 SessionStore / LogStore 共用 ~/llmproxy/llmproxy.db
   const apiKeyStore = new ApiKeyStore(join(getDataDir(), 'llmproxy.db'))
+  // 管理端会话存储：与 ApiKeyStore 共用 ~/llmproxy/llmproxy.db（WAL 多连接安全）
+  const adminSessionStore = new AdminSessionStore(join(getDataDir(), 'llmproxy.db'))
   // 双写：所有 getLogger().info/warn/... 在写文件的同时写 SQLite
   setLogStore(logStore)
   // 会话亲和总开关：routing.sessionAffinity.enabled 缺省为 true（schema 已给默认值），
@@ -139,6 +142,20 @@ export function createApp(deps: AppDeps): Express {
   cleanupApiKeys() // 启动执行一次
   setInterval(cleanupApiKeys, 24 * 60 * 60 * 1000).unref()
 
+  // 管理端会话过期清理（24h 滑动过期）：启动执行一次 + 每 6 小时
+  const cleanupAdminSessions = (): void => {
+    try {
+      const deleted = adminSessionStore.cleanup()
+      if (deleted > 0) {
+        getLogger().info(`管理员会话清理完成，删除 ${deleted} 条`, 'admin-session-cleanup')
+      }
+    } catch (err) {
+      getLogger().warn('管理员会话清理失败', err)
+    }
+  }
+  cleanupAdminSessions() // 启动执行一次
+  setInterval(cleanupAdminSessions, 6 * 60 * 60 * 1000).unref()
+
   // 每次上游尝试的统计钩子：直接计入计数器（status 字段被忽略，AttemptInfo 不需它）
   const onAttempt = (info: { upstreamId: string; ok: boolean; durationMs: number; status?: number }): void => {
     stats.recordAttempt(info)
@@ -159,8 +176,10 @@ export function createApp(deps: AppDeps): Express {
   // API Key 鉴权中间件：仅作用于 /v1/* 与 /api/*；管理端 /admin/api 无鉴权（由部署层防护）。
   // 鉴权开关关闭时中间件旁路，开关读取每次请求走 store.get() 支持热更新
   const authMiddleware = createAuthMiddleware({ store, apiKeyStore })
+  // 管理端会话鉴权：在 registerAdminRoutes 内全局挂载到 /admin/api，除白名单
+  // （/auth/login、/auth/salt、/auth/status、/auth/logout、/health）外所有端点一律要求登录
   // 三组 API 路由：管理端 / OpenAI 兼容 / Ollama 兼容
-  registerAdminRoutes(app, { store, getUpstreamClient, stats, sessionStore, logStore, apiKeyStore, cli })
+  registerAdminRoutes(app, { store, getUpstreamClient, stats, sessionStore, logStore, apiKeyStore, adminSessionStore, cli })
   registerOpenAIRoutes(app, {
     store,
     getUpstreamClient,

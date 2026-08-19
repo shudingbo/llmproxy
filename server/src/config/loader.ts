@@ -1,11 +1,13 @@
 // 配置文件加载器：读取 JSONC（支持注释与尾逗号）并校验为 Config
+import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { parse, printParseErrorCode, type ParseError } from 'jsonc-parser'
 import {
   ConfigSchema,
-  DownstreamModelEntrySchema,
+  type AdminAccount,
   type Config,
   type DownstreamAliasGroup,
+  type AdminsConfig,
 } from './schema.js'
 
 /**
@@ -120,4 +122,50 @@ export function normalizeDownstreamAliasEntry(
     }
   }
   return { disabled: false, candidates: [] }
+}
+
+// base32 字母表（RFC 4648，无填充）：用于生成人类可读的初始密码
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+
+// 生成随机初始密码（16 位 base32 字符，CSPRNG 驱动；仅首次启动使用，登录后应立即修改）
+function generateInitialPassword(length = 16): string {
+  const bytes = randomBytes(length)
+  let out = ''
+  for (let i = 0; i < length; i++) {
+    out += BASE32_ALPHABET[bytes[i] % BASE32_ALPHABET.length]
+  }
+  return out
+}
+
+// 生成登录 salt（32 字节随机 hex，64 字符）：前端用它计算登录摘要 MD5(salt + ts + password)
+export function generateSalt(): string {
+  return randomBytes(32).toString('hex')
+}
+
+/**
+ * 生成单个默认管理员账号（username=admin + 随机初始密码，16 位 base32）：
+ * - 只负责账号与密码的生成，不涉及 salt（salt 由调用方决定「保留旧值」或「新生成」）
+ * - 返回密码明文，仅调用方（store）负责在启动时打印到控制台与日志，此后不再可得
+ */
+export function generateDefaultAdminAccount(): { account: AdminAccount; password: string } {
+  const password = generateInitialPassword()
+  const account: AdminAccount = {
+    username: 'admin',
+    password,
+    disabled: false,
+    createdAt: new Date().toISOString(),
+    lastLoginAt: null,
+  }
+  return { account, password }
+}
+
+/**
+ * 首次启动（bootstrap）注入的默认管理员：
+ * - salt：32 字节随机 hex（64 字符）
+ * - accounts[0]：username=admin + 随机初始密码（16 位 base32）
+ * 返回密码明文，仅调用方（store）负责在启动时打印到控制台与日志，此后不再可得
+ */
+export function generateDefaultAdmins(): { admins: AdminsConfig; password: string } {
+  const { account, password } = generateDefaultAdminAccount()
+  return { admins: { salt: generateSalt(), accounts: [account] }, password }
 }

@@ -16,6 +16,17 @@
       :title="`配置热重载失败，当前运行的仍是旧配置：${reloadError}`"
     />
 
+    <!-- 管理员账号入口：跳转 /admin-users 管理登录账号 -->
+    <el-card class="admin-entry-card" shadow="never">
+      <div class="admin-entry">
+        <div class="admin-entry-text">
+          <div class="admin-entry-title">管理员账号</div>
+          <div class="admin-entry-desc">管理可登录管理后台的用户名与密码</div>
+        </div>
+        <el-button type="primary" link @click="goAdminUsers">前往管理 →</el-button>
+      </div>
+    </el-card>
+
     <div v-loading="loading" class="config-body">
       <!-- 三节配置用 el-tabs 组织；tab-pane 默认立即渲染（非 lazy），三个表单 ref 始终可用 -->
       <el-tabs class="config-tabs">
@@ -77,8 +88,16 @@
 
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { api } from '../api/client'
+
+const router = useRouter()
+
+// 跳转管理员账号管理页
+function goAdminUsers(): void {
+  router.push('/admin-users')
+}
 
 // 表单结构：server / auth 与 llmproxy.jsonc 一一对应；
 // routing 的清理时间字段前端以「分钟」为单位（cleanupMaxAgeMin / cleanupIntervalMin），
@@ -331,6 +350,30 @@ onMounted(load)
 
 .reload-error-alert {
   margin-bottom: 16px;
+}
+
+/* 管理员账号入口卡片：标题 + 描述居左，按钮居右 */
+.admin-entry-card {
+  margin-bottom: 16px;
+}
+
+.admin-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.admin-entry-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+}
+
+.admin-entry-desc {
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
 }
 
 /* 每个 tab 内 pane 顶部的生效方式标注：独占一行，与表单留出间距 */

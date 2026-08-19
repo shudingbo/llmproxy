@@ -43,7 +43,7 @@
 | `routing.sessionAffinity.cleanupMaxAgeMs` | number | 否 | `604800000`（1 周） | 会话保留期（毫秒）；`0` = 永不过期 |
 | `routing.sessionAffinity.cleanupIntervalMs` | number | 否 | `3600000`（1 小时） | 自动清理周期（毫秒）；`0` = 关闭自动清理调度 |
 | `auth` | object | 否 | — | API Key 鉴权配置（整节可缺省，缺省即关闭） |
-| `auth.enabled` | boolean | 否 | `false` | 鉴权总开关；开启后 `/v1/*` 与 `/api/*` 请求必须携带 `Authorization: Bearer sk-llmproxy-...`，否则 401；管理端 `/admin/api` 无鉴权 |
+| `auth.enabled` | boolean | 否 | `false` | API Key 鉴权总开关（仅作用于下行 `/v1/*` 与 `/api/*`）；开启后这些请求必须携带 `Authorization: Bearer sk-llmproxy-...`，否则 401。管理端 `/admin/api` 走独立的登录会话鉴权（不受本开关影响；白名单 `/auth/salt` / `/auth/login` / `/auth/status` / `/auth/logout` / `/health` 外均需登录会话） |
 | `auth.keyBytes` | number | 否 | `24` | 生成 API Key 的随机字节数（8–64）；⚠️ 预留字段，当前版本生成 API Key 时未消费（生成固定走默认 24） |
 | `auth.cleanupRetentionDays` | number | 否 | `7` | 过期 API Key 在 SQLite 中的保留天数（0–3650）；`0` = 过期即清理；启动时读取，下次每日清理周期生效 |
 
@@ -119,7 +119,8 @@
 
   // ---- auth：API Key 鉴权（可选；整节可缺省，缺省即关闭）----
   // 开启后 /v1/* 与 /api/* 请求必须携带 Authorization: Bearer sk-llmproxy-...，否则 401；
-  // 管理端 /admin/api 无鉴权；Key 通过管理端「API Keys」页面管理（存 SQLite，不在本文件）
+  // 管理端 /admin/api 走独立的登录会话鉴权（不受本开关影响；白名单 /auth/salt、/auth/login、/auth/status、/auth/logout、/health 外均需登录会话）；
+  // Key 通过管理端「API Keys」页面管理（存 SQLite，不在本文件）
   // 修改保存后实时生效（enabled 每请求读取），无需重启
   "auth": {
     "enabled": false,                // 鉴权总开关，默认 false
@@ -158,7 +159,7 @@
 
 ### server（监听，可选）
 
-- **`host`** / **`port`**：控制整个进程对外暴露的地址与端口。节内缺省 `127.0.0.1:3000`（schema 缺省值）；整节省略时进程缺省监听 `0.0.0.0:3000`（`listen.ts` 的 `DEFAULT_HOST` / `DEFAULT_PORT`）。`host` 设为 `0.0.0.0` 表示监听所有网卡，可被外部访问；生产部署时注意防火墙与鉴权（管理端 `/admin/api` 无内置鉴权，请在可信网络内使用）。
+- **`host`** / **`port`**：控制整个进程对外暴露的地址与端口。节内缺省 `127.0.0.1:3000`（schema 缺省值）；整节省略时进程缺省监听 `0.0.0.0:3000`（`listen.ts` 的 `DEFAULT_HOST` / `DEFAULT_PORT`）。`host` 设为 `0.0.0.0` 表示监听所有网卡，可被外部访问；生产部署时注意防火墙与鉴权（管理端 `/admin/api` 已内置登录会话鉴权——白名单 `/auth/salt` / `/auth/login` / `/auth/status` / `/auth/logout` / `/health` 外均需登录会话；下行 `/v1/*` 与 `/api/*` 可另用 `auth.enabled` API Key 开关防护）。
 - **`bodyLimit`**：JSON 请求体上限，缺省 `'10mb'`。支持 `'10mb'` 这类 `bytes` 单位字符串（`'1kb'` / `'1mb'` / `'1gb'` 等），也支持直接写数字字节数（正整数，如 `10485760`）。全局生效——所有接口（`/v1/*`、`/api/*`、`/admin/api/*` 与 `/rerank`）共用该上限；请求体超限返回 `413`。该值在 `createApp` 装配时读入 `express.json({ limit })`，**非法值（如 `'abc'`）zod 虽能通过（非空字符串），但会在启动装配 body-parser 时抛错导致启动失败**，因此请确保填写合法值。进程级配置，**改后需重启**（见下条）。
 - **监听优先级**：命令行 `--host` / `--port` > `server` 节 > 缺省值。命令行参数最高优先级，host/port 相互独立可选，未指定的一侧回落下一优先级；也支持 `--host=0.0.0.0` / `--port=8080` 等号形式。**不再支持环境变量 `HOST` / `PORT` 覆盖监听地址**（0.2.0 起移除）。
 - **需要重启**：socket 在进程启动时绑定、bodyLimit 在 `createApp` 装配时读取，**修改本节或命令行参数的变更不会通过文件监听即时应用**（避免端口漂移 / 重复绑定），必须重启进程。例如 `pnpm start -- --host 0.0.0.0 --port 8080` 或 `node scripts/start.js --host 0.0.0.0 --port 8080`。
@@ -176,7 +177,7 @@
 
 ### auth（鉴权，可选）
 
-- **`enabled`**：鉴权总开关，缺省 `false`。开启后所有下行流调用（`/v1/*` 与 `/api/*`）必须携带 `Authorization: Bearer sk-llmproxy-...`（API Key 前缀固定 `sk-llmproxy-`），缺失或无效返回 `401`（OpenAI 风格 `{ error: { code: 'invalid_api_key' } }`，所有失败同形避免枚举 Key 状态）；管理端 `/admin/api` 无鉴权。**实时生效**：中间件每请求读取 `store.get().auth.enabled`，保存后立即生效，无需重启。
+- **`enabled`**：鉴权总开关，缺省 `false`。开启后所有下行流调用（`/v1/*` 与 `/api/*`）必须携带 `Authorization: Bearer sk-llmproxy-...`（API Key 前缀固定 `sk-llmproxy-`），缺失或无效返回 `401`（OpenAI 风格 `{ error: { code: 'invalid_api_key' } }`，所有失败同形避免枚举 Key 状态）。注意：本开关仅作用于下行 `/v1/*` 与 `/api/*`；管理端 `/admin/api` 走独立的登录会话鉴权（白名单 `/auth/salt` / `/auth/login` / `/auth/status` / `/auth/logout` / `/health` 外均需登录会话，未登录统一 `401 unauthenticated`）。**实时生效**：中间件每请求读取 `store.get().auth.enabled`，保存后立即生效，无需重启。
 - **`keyBytes`**：生成 API Key 的随机字节数（8–64），缺省 `24`（对应 32 字符 hex）。⚠️ **预留字段**：当前版本该字段定义于 schema 但生成 API Key 时未消费（`admin.ts` 生成走 `generateApiKey()` 默认 24），修改后不会改变新生成 Key 的长度，文档如实注明。
 - **`cleanupRetentionDays`**：过期 API Key 在 SQLite 中的保留天数（0–3650），缺省 `7`；`0` = 过期即立即清理。保留期用于审计回溯，防止过期即丢。**启动时读取一次**，修改后在下一次每日清理周期生效。
 - **保存方式**：编辑 `llmproxy.jsonc` 热重载，或管理端「System Config」页面（`PUT /admin/api/config`）。API Key 本身存 SQLite（SHA-256 hash + 前缀），**不在配置文件中保存**；本节只描述开关与策略。

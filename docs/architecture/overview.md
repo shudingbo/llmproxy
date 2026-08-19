@@ -90,7 +90,7 @@ flowchart TB
 - `openai.ts`：OpenAI 兼容下游，`/v1/chat/completions` 请求体原样透传；`/v1/responses` **按上游配置分流**——`responsesApi: 'native'` 时原生透传：请求体（除 `model` 改写为上游侧模型名、`stream` 按分支强制外）原样打给 `POST {baseUrl}/responses`，响应 JSON 与流式 SSE 事件原样回转（透传分支 404 视为可回退）；`responsesApi: 'convert'`（缺省）时在网关边界做 Responses ↔ Chat 互转（`converters/responses-*.ts`）。运行时探测已移除（responses-probe / registry 不再存在），改为管理端添加上游时用「检测」按钮确认该上游应配哪个值；非流式 / 流式（SSE）+ 顺序回退，每次尝试计数。
 - `ollama.ts`：Ollama 兼容下游，通过 `converters/openai-to-ollama-*.ts` 把 OpenAI 上游的请求 / 响应 / SSE 流转成 Ollama 形状（`/api/show`、`/api/generate` 等明确不实现）。
 - `converters/responses-*.ts`：Responses ↔ Chat Completions 边界转换（`responses-types` 类型、`responses-request` 请求、`responses-response` 非流式响应、`responses-stream` SSE 事件流），**convert 模式下使用**——`responsesApi: 'convert'`（缺省）时供 `openai.ts` 的 `/v1/responses` 使用。
-- `admin.ts`：管理端全部端点（无鉴权，由部署层防护；无 CORS，开发期走 web/vite 代理）。
+- `admin.ts`：管理端全部端点（全局登录会话鉴权——白名单 `/auth/salt` / `/auth/login` / `/auth/status` / `/auth/logout` / `/health` 外的所有端点均需有效会话，未登录统一 `401 unauthenticated`；无 CORS，开发期走 web/vite 代理）。
 - `downstreams.ts`：`DOWNSTREAM_ENDPOINTS` 单一真相源——启动日志与 `/admin/api/health` 共用，前端 Dashboard 自动跟随。
 - `index.ts`：装配层（见下）。
 

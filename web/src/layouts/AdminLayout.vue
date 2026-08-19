@@ -1,5 +1,5 @@
 <template>
-  <!-- 管理端整体布局：左侧导航菜单 + 右侧主内容区（跨页面保持） -->
+  <!-- 管理端整体布局：左侧导航菜单 + 右侧（顶栏 + 主内容区，跨页面保持） -->
   <el-container class="admin-layout">
     <!-- 侧边栏 -->
     <el-aside width="220px" class="admin-aside">
@@ -14,26 +14,38 @@
       </el-menu>
     </el-aside>
 
-    <!-- 主内容区：渲染当前路由页面 -->
-    <el-main class="admin-main">
-      <router-view />
-    </el-main>
+    <!-- 右侧：顶部用户栏 + 主内容区 -->
+    <el-container class="admin-body" direction="vertical">
+      <el-header class="admin-header" height="56px">
+        <div class="header-right">
+          <span class="welcome">欢迎，{{ auth.user?.username }}</span>
+          <el-button type="primary" link @click="logout">退出</el-button>
+        </div>
+      </el-header>
+
+      <!-- 主内容区：渲染当前路由页面 -->
+      <el-main class="admin-main">
+        <router-view />
+      </el-main>
+    </el-container>
   </el-container>
 </template>
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
   DataAnalysis,
   Connection,
   Files,
   Key,
+  User,
   Document,
   Link,
   TrendCharts,
   Setting,
 } from '@element-plus/icons-vue'
+import { useAuthStore } from '../stores/auth'
 
 // 菜单配置：路径与图标一一对应（与路由表保持一致）
 const menuItems = [
@@ -41,20 +53,34 @@ const menuItems = [
   { path: '/upstreams', title: 'Upstreams', icon: Connection },
   { path: '/models', title: 'Models', icon: Files },
   { path: '/api-keys', title: 'API Keys', icon: Key },
+  { path: '/admin-users', title: 'Admin Users', icon: User },
   { path: '/logs', title: 'Logs', icon: Document },
   { path: '/sessions', title: 'Sessions', icon: Link },
   { path: '/stats', title: 'Stats', icon: TrendCharts },
   { path: '/system-config', title: 'System Config', icon: Setting },
 ]
 
-// 当前激活菜单项：跟随路由路径高亮
 const route = useRoute()
+const router = useRouter()
+const auth = useAuthStore()
+
+// 当前激活菜单项：跟随路由路径高亮
 const activeMenu = computed(() => route.path)
+
+// 退出登录：清会话 + 本地态，跳登录页
+async function logout(): Promise<void> {
+  await auth.logout()
+  router.push('/login')
+}
 </script>
 
 <style scoped>
 .admin-layout {
   height: 100vh;
+}
+
+.admin-body {
+  min-width: 0;
 }
 
 .admin-aside {
@@ -72,5 +98,25 @@ const activeMenu = computed(() => route.path)
 
 .admin-menu {
   border-right: none;
+}
+
+/* 顶栏：右侧对齐（用户名 + 退出），左留白 */
+.admin-header {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--el-border-color-light);
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.welcome {
+  font-size: 13px;
+  color: var(--el-text-color-regular);
 }
 </style>

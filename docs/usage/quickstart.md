@@ -109,7 +109,7 @@ node scripts/start.js --host 0.0.0.0 --port 8080
 | `http://<host>:3000/` | 管理界面（左侧导航 6 个页面） |
 | `http://<host>:3000/v1` | OpenAI 兼容接口（`/v1/models`、`/v1/chat/completions`、`/v1/responses`） |
 | `http://<host>:3000/api` | Ollama 兼容接口（`/api/tags`、`/api/chat`、`/api/version`） |
-| `http://<host>:3000/admin/api` | 管理 REST 接口（无鉴权，请在可信网络内使用） |
+| `http://<host>:3000/admin/api` | 管理 REST 接口（全局登录会话鉴权——白名单 `/auth/salt` / `/auth/login` / `/auth/status` / `/auth/logout` / `/health` 外均需登录会话，未登录 `401`） |
 
 **监听地址**（`server/src/server/listen.ts`）按优先级取：
 

@@ -405,7 +405,7 @@ curl -N http://127.0.0.1:3000/api/chat \
 
 ### 管理 API 快速参考 Admin API Reference
 
-所有管理端点位于 `/admin/api`，返回 JSON；无鉴权（由部署层防护），请在可信网络内使用。
+所有管理端点位于 `/admin/api`，返回 JSON。**管理端登录鉴权**：除登录链路白名单（`/auth/salt`、`/auth/login`、`/auth/status`、`/auth/logout`）与 `/health` 外，所有端点均要求已登录（HttpOnly 会话 Cookie `llmproxy_admin_sid`），未登录 / 会话过期统一返回 `401 { status: false, msg: '未登录或会话已过期', error: 'unauthenticated' }`。登录流程：`GET /admin/api/auth/salt` 取 `{ salt, ts }` → `POST /admin/api/auth/login`（`{ username, passwordMd5: MD5(salt + ts + password), ts }`）→ 200 + `Set-Cookie`；`POST /admin/api/auth/logout` 登出。
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |

@@ -129,12 +129,43 @@ export const AuthConfigSchema = z
   .prefault({})
 
 /**
+ * 管理员账号（admins 节的单个条目）：
+ * - username：唯一用户名
+ * - password：明文密码（配置文件 0600 权限存储；登录链路上传的是 MD5(salt+ts+password) 摘要，明文不落日志）
+ * - disabled：停用开关，缺省 false；停用后无法登录（既有 session 仍有效至过期）
+ * - createdAt：创建时间（ISO 8601），缺省取当前时间
+ * - lastLoginAt：最近登录时间（ISO 8601），null 表示从未登录
+ */
+export const AdminAccountSchema = z.object({
+  username: z.string().min(1),
+  password: z.string().min(1),
+  disabled: z.boolean().default(false),
+  createdAt: z.string().default(() => new Date().toISOString()),
+  lastLoginAt: z.string().nullable().default(null),
+})
+
+/**
+ * 管理员配置节（admins）：
+ * - salt：32 字节随机 hex salt（64 字符）；前端用它计算登录摘要 MD5(salt + ts + password)
+ * - accounts：管理员账号列表（可空）
+ *
+ * 注：本节整体在 ConfigSchema 中 optional——缺省时 parse 输出不含 admins 键（保持与
+ *     routing/server 的 optional 语义一致，避免给旧配置静默注入键）；
+ *     首次启动（bootstrap）由 store 注入真实 salt + 默认账号后落盘，此后该键恒存在
+ */
+export const AdminsConfigSchema = z.object({
+  salt: z.string().min(1),
+  accounts: z.array(AdminAccountSchema).default([]),
+})
+
+/**
  * 完整配置：
  * - upstreams：上游列表（至少 1 个）
  * - downstreamModels：别名 → DownstreamAliasGroup 的映射（运行时归一化形态，见 loader）
  * - server：可选的进程级 server 配置（host / port / bodyLimit）；未指定时按缺省值
  * - routing：可选的路由配置（会话亲和等）；未指定时按缺省值
  * - auth：可选的鉴权配置（开关 + Key 长度）；未指定时按缺省值（disabled）
+ * - admins：可选的管理员配置（salt + 账号列表）；首次启动由 bootstrap 注入，旧配置可缺省
  *
  * 注意：raw 形态（未归一化）见 DownstreamModelEntrySchema，由 loader 负责在落库前归一化
  */
@@ -144,6 +175,7 @@ export const ConfigSchema = z.object({
   server: ServerConfigSchema.optional(),
   routing: RoutingSchema.optional(),
   auth: AuthConfigSchema.optional(),
+  admins: AdminsConfigSchema.optional(),
 })
 
 // 导出的推断类型：全项目统一使用该类型表示一份配置
@@ -154,6 +186,8 @@ export type DownstreamAliasGroup = z.infer<typeof DownstreamAliasGroupSchema>
 export type ServerConfig = z.infer<typeof ServerConfigSchema>
 export type Routing = z.infer<typeof RoutingSchema>
 export type AuthConfig = z.infer<typeof AuthConfigSchema>
+export type AdminAccount = z.infer<typeof AdminAccountSchema>
+export type AdminsConfig = z.infer<typeof AdminsConfigSchema>
 
 // 别名 → 候选列表（运行时便利类型，等价于 downstreamModels[alias].candidates）
 export type DownstreamModelCandidates = UpstreamCandidate[]

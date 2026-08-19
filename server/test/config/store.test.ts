@@ -166,4 +166,84 @@ describe('ConfigStore', () => {
     const result = ConfigSchema.safeParse(store.get())
     expect(result.success).toBe(true)
   })
+
+  // 「文件已存在」场景的合法配置（downstreamModels 用 group 形态，避免触发 set 校验失败）
+  const baseConfig = (): Config => ({
+    upstreams: [
+      {
+        id: 'openai-main',
+        baseUrl: 'https://api.openai.com/v1',
+        apiKey: 'sk-test',
+        timeoutMs: 30000,
+        disabled: false,
+        responsesApi: 'convert',
+      },
+    ],
+    downstreamModels: {
+      'gpt-4': { disabled: false, candidates: [{ upstreamId: 'openai-main', model: 'gpt-4' }] },
+    },
+  })
+
+  describe('默认管理员自愈（配置文件已存在但无可用管理员）', () => {
+    it('admins 节缺失 → 触发补救：admin 账号 + 16 位 base32 密码 + 新生成 salt', () => {
+      writeFileSync(path, JSON.stringify(baseConfig()), 'utf-8')
+      const store = new ConfigStore(path)
+      expect(store.get().admins?.accounts).toHaveLength(1)
+      const acc = store.get().admins?.accounts[0]
+      expect(acc?.username).toBe('admin')
+      expect(acc?.password).toHaveLength(16)
+      expect(acc?.disabled).toBe(false)
+      // createdAt 为 ISO 8601 字符串
+      expect(acc?.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
+      // admins 原本缺失 → 生成新 salt（64 位 hex）
+      expect(store.get().admins?.salt).toMatch(/^[0-9a-f]{64}$/)
+    })
+
+    it('admins.accounts 为空 → 触发补救，且保留既有 salt', () => {
+      const oldSalt = 'a'.repeat(64)
+      writeFileSync(path, JSON.stringify({ ...baseConfig(), admins: { salt: oldSalt, accounts: [] } }), 'utf-8')
+      const store = new ConfigStore(path)
+      expect(store.get().admins?.accounts).toHaveLength(1)
+      expect(store.get().admins?.accounts[0]?.username).toBe('admin')
+      expect(store.get().admins?.accounts[0]?.password).toHaveLength(16)
+      expect(store.get().admins?.accounts[0]?.disabled).toBe(false)
+      // 保留旧 salt，而非重新生成
+      expect(store.get().admins?.salt).toBe(oldSalt)
+    })
+
+    it('admins.accounts 已有账号 → 不触发补救，账号与 salt 均保持不变', () => {
+      const oldSalt = 'b'.repeat(64)
+      const existing = {
+        username: 'admin',
+        password: 'keep-me',
+        disabled: false,
+        createdAt: '2020-01-01T00:00:00.000Z',
+        lastLoginAt: null,
+      }
+      writeFileSync(path, JSON.stringify({ ...baseConfig(), admins: { salt: oldSalt, accounts: [existing] } }), 'utf-8')
+      const store = new ConfigStore(path)
+      expect(store.get().admins?.accounts).toHaveLength(1)
+      expect(store.get().admins?.accounts[0]).toEqual(existing)
+      expect(store.get().admins?.salt).toBe(oldSalt)
+    })
+
+    it('补救时把初始密码打印到 console（与首次启动同形，含「no existing admins found」前缀）', () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+      try {
+        writeFileSync(path, JSON.stringify(baseConfig()), 'utf-8')
+        const store = new ConfigStore(path)
+        const password = store.get().admins?.accounts[0]?.password
+        expect(password).toHaveLength(16)
+        expect(logSpy).toHaveBeenCalledWith(
+          expect.stringMatching(
+            new RegExp(
+              `Default admin created \\(no existing admins found\\)\\. username=admin password=${password} — please change immediately after first login\\.`,
+            ),
+          ),
+        )
+      } finally {
+        logSpy.mockRestore()
+      }
+    })
+  })
 })

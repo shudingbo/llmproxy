@@ -35,6 +35,7 @@
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
+  ChatDotRound,
   DataAnalysis,
   Connection,
   Files,
@@ -58,6 +59,7 @@ const menuItems = [
   { path: '/system-config', title: 'System Config', icon: Setting },
   { path: '/api-keys', title: 'API Keys', icon: Key },
   { path: '/admin-users', title: 'Admin Users', icon: User },
+  { path: '/chat', title: 'Chat', icon: ChatDotRound },
 ]
 
 const route = useRoute()

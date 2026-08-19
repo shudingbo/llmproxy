@@ -9,12 +9,14 @@
     <!-- 管理员账号列表 -->
     <el-table v-loading="loading" :data="rows" border stripe>
       <el-table-column prop="username" label="用户名" min-width="140" />
-      <el-table-column label="状态" width="120">
+      <el-table-column label="禁用" width="120">
         <template #default="{ row }">
           <!-- 开关直接切换 disabled；改完立即 PATCH，失败回滚 -->
           <el-switch
             v-model="row.disabled"
-            :title="row.disabled ? '已停用' : '启用中'"
+            inline-prompt
+            active-text="禁用"
+            inactive-text="启用"
             @change="(val: string | number | boolean) => toggleDisabled(row as AdminAccount, val as boolean)"
           />
         </template>
@@ -159,11 +161,12 @@ function formatTime(v: string | null): string {
 }
 
 // 拉取管理员列表（GET /admins，需登录态）
+// 后端直接返回数组（与 POST/PATCH/DELETE 一致，未做 { rows } 包装）
 async function fetchAdmins(): Promise<void> {
   loading.value = true
   try {
-    const { data } = await api.get<{ rows: AdminAccount[] }>('/admins')
-    rows.value = data.rows ?? []
+    const { data } = await api.get<AdminAccount[]>('/admins')
+    rows.value = Array.isArray(data) ? data : []
   } catch (err: unknown) {
     const e = err as { response?: { data?: { msg?: string; error?: string } }; message?: string }
     ElMessage.error(`加载管理员列表失败：${e.response?.data?.msg ?? e.response?.data?.error ?? e.message}`)

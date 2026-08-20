@@ -2,6 +2,12 @@
 packages:
   - 'server'
   - 'web'
+
+# 覆盖传递依赖版本（pnpm 10+ 不再读取 package.json 中的 pnpm.overrides）
+overrides:
+  vite: '^6.4.3'
+
+# 允许执行原生构建脚本的依赖（pnpm 10+ 取代 pnpm.onlyBuiltDependencies）
 allowBuilds:
   better-sqlite3: false
   esbuild: false

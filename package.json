@@ -23,12 +23,6 @@
     "server",
     "web"
   ],
-  "pnpm": {
-    "overrides": {
-      "vite": "^6.4.3"
-    },
-    "onlyBuiltDependencies": []
-  },
   "devDependencies": {
     "concurrently": "^10.0.4"
   }

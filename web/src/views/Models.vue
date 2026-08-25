@@ -3,7 +3,10 @@
     <!-- 顶部操作区：新增别名 -->
     <div class="page-header">
       <h2>下游模型别名</h2>
-      <el-button type="primary" :icon="Plus" @click="addAlias">新增别名</el-button>
+      <el-space>
+        <el-button type="primary" :loading="saving" @click="save">保存</el-button>
+        <el-button type="primary" :icon="Plus" @click="addAlias">新增别名</el-button>        
+      </el-space>
     </div>
 
     <div v-loading="loading" class="models-body">
@@ -12,27 +15,20 @@
 
       <template v-else>
         <!-- 每个别名一个折叠面板 -->
-        <el-collapse v-model="activeNames">
+        <el-collapse v-model="activeNames" expand-icon-position="left">
           <el-collapse-item v-for="alias in Object.keys(models)" :key="alias" :name="alias">
             <template #title>
-              <CopyText class="alias-title" :copy-text="alias">{{ alias }}</CopyText>
-              <!-- 别名级总开关：关闭后整个别名对外不可见，保存后生效 -->
-              <el-switch
-                :model-value="!getAliasDisabled(alias)"
-                class="alias-switch alias-master-switch"
-                inline-prompt
-                active-text="启用"
-                inactive-text="已关闭"
-                @click.stop="toggleAlias(alias)"
-              />
-              <el-tag v-if="getAliasDisabled(alias)" type="info" size="small" effect="plain" class="alias-disabled-tag">
-                别名已关闭
-              </el-tag>
+              <div class="alias-title-container">
+                <CopyText class="alias-title" :copy-text="alias">{{ alias }}</CopyText>
+                <div class="alias-actions">
+                  <el-button size="small" type="primary" :icon="Plus" @click="addCandidate(alias)" title="新增候选" circle/>
+                  <el-button size="small" type="danger" :icon="Delete" @click="removeAlias(alias)" title="删除别名" circle />                
+                </div>
+              </div>
             </template>
 
             <!-- 候选列表：拖拽手柄排序，vuedraggable 的 :list 会在拖拽结束时原地重排 -->
             <draggable
-              class="candidate-list"
               :list="models[alias].candidates"
               :item-key="itemKey"
               handle=".drag-handle"
@@ -88,15 +84,14 @@
 
             <!-- 别名内操作：新增候选 / 删除别名 -->
             <div class="alias-actions">
-              <el-button size="small" :icon="Plus" @click="addCandidate(alias)">新增候选</el-button>
-              <el-button size="small" text type="danger" @click="removeAlias(alias)">删除别名</el-button>
+              
             </div>
           </el-collapse-item>
         </el-collapse>
 
         <!-- 底部保存：显式提交，不随编辑自动保存 -->
         <div class="page-footer">
-          <el-button type="primary" :loading="saving" @click="save">保存</el-button>
+          
         </div>
       </template>
     </div>
@@ -371,9 +366,7 @@ onMounted(load)
   font-size: 18px;
 }
 
-.alias-title {
-  font-weight: 600;
-}
+
 
 /* 别名级开关：贴在折叠面板标题右侧；点击不冒泡到折叠触发 */
 .alias-switch {
@@ -382,6 +375,22 @@ onMounted(load)
 
 .alias-disabled-tag {
   margin-left: 4px;
+}
+
+.alias-title-container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+
+  .alias-title {
+    font-weight: 600;
+  }
+
+  .alias-actions {
+    display: flex;
+    gap: 8px;
+  }
 }
 
 /* 候选列表行：拖拽手柄 + 上游选择 + 模型名 + 删除 */

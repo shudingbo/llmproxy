@@ -19,8 +19,21 @@
           <el-collapse-item v-for="alias in Object.keys(models)" :key="alias" :name="alias">
             <template #title>
               <div class="alias-title-container">
-                <CopyText class="alias-title" :copy-text="alias">{{ alias }}</CopyText>
+                <div class="alias-title">
+                  <CopyText class="alias-title" :copy-text="alias">{{ alias }}</CopyText>
+                  <!-- 别名级总开关：关闭后整个别名对外不可见，保存后生效 -->
+                  <el-switch
+                    :model-value="!getAliasDisabled(alias)"
+                    class="alias-switch alias-master-switch"
+                    inline-prompt
+                    active-text="启用"
+                    inactive-text="已关闭"
+                    @click.stop="toggleAlias(alias)"
+                  />
+                </div>
+                
                 <div class="alias-actions">
+                  
                   <el-button size="small" type="primary" :icon="Plus" @click="addCandidate(alias)" title="新增候选" circle/>
                   <el-button size="small" type="danger" :icon="Delete" @click="removeAlias(alias)" title="删除别名" circle />                
                 </div>
@@ -386,10 +399,9 @@ onMounted(load)
   .alias-title {
     font-weight: 600;
   }
-
   .alias-actions {
     display: flex;
-    gap: 8px;
+    gap: 0px;
   }
 }
 

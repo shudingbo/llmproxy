@@ -14,6 +14,7 @@ import { executeWithFallback, isFallbackableAxiosError } from '../router/fallbac
 import { Router } from '../router/index.js'
 import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
 import { buildUpstreamSessionHeaders, extractSessionKey } from '../session/key.js'
+import type { SessionMonitor } from '../monitor/index.js'
 import type { OpenAIUpstreamClient, UpstreamChatRequest } from '../upstream/openai.js'
 import { buildAliasMetaMap, listExposedAliases } from './model-meta.js'
 import { registerOllamaShowRoute } from './ollama-show.js'
@@ -29,6 +30,8 @@ export interface OllamaDeps {
   onAttempt: (info: { upstreamId: string; ok: boolean; durationMs: number; status?: number }) => void
   // 可选：会话亲和存储，用于请求回退成功后把会话粘附改绑到实际成功上游；未注入则跳过改绑
   sessionStore?: SessionStoreLike
+  // 可选：会话消息监控（探测抽屉数据源）：请求侧消息去重落库 + 回答流式实时推送；未注入则跳过记录
+  monitor?: SessionMonitor
   // 鉴权中间件：装配层注入，挂到所有 /api/* 路由前置；未注入则跳过（向后兼容）
   authMiddleware?: (req: Request, res: Response, next: () => void) => void
 }
@@ -46,7 +49,7 @@ interface StreamSuccess {
  * - POST /api/show：模型详情（由别名配置聚合，见 ollama-show.ts）
  */
 export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
-  const { store, getUpstreamClient, loadBalancer, onAttempt } = deps
+  const { store, getUpstreamClient, loadBalancer, onAttempt, monitor } = deps
 
   // 鉴权中间件优先于所有 /api/* 路由注册；未注入则跳过（向后兼容旧装配层）
   if (deps.authMiddleware !== undefined) {
@@ -73,6 +76,22 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
       info.status = status
     }
     onAttempt(info)
+  }
+
+  // 监控 tap：把上游 chat SSE 流挂接 assistant 流式记录器（delta 实时旁路推送，不落库；
+  // 流正常结束整条落库，主动 abort 时落已收到的部分并标记 truncated）。
+  // finish 幂等：'end'（正常）先于 'close' 触发；abort 路径只有 'close'
+  const attachAssistantRecorder = (
+    stream: Readable,
+    sessionKey: string | undefined,
+  ): void => {
+    const handle = monitor?.createAssistantRecorder(sessionKey, 'chat')
+    if (handle === undefined) {
+      return
+    }
+    stream.on('data', (chunk: Buffer) => handle.feed(chunk))
+    stream.on('end', () => handle.finish(false))
+    stream.on('close', () => handle.finish(true))
   }
 
   // 从错误中提取 HTTP 状态码（axios 响应错误 / 直接挂 status 的错误），无则 undefined
@@ -105,6 +124,8 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
       sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
       client: session?.client,
     }
+    // 监控 tap：请求侧消息（转换为实际发给上游的 OpenAI 形状；模型名不影响消息内容）去重落库
+    monitor?.recordRequest(ctx.sessionKey, convertChatRequest({ ...body, model }).messages)
     const result = await executeWithFallback<OllamaChatResponse>(
       candidates,
       loadBalancer,
@@ -142,6 +163,8 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
       },
     )
     if (result.ok && result.value) {
+      // 监控 tap：非流式 assistant 回答整条落库 + 推送
+      monitor?.recordAssistant(ctx.sessionKey, result.value.message?.content ?? '')
       res.status(200).json(result.value)
       return
     }
@@ -169,6 +192,8 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
       sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
       client: session?.client,
     }
+    // 监控 tap：请求侧消息（转换为实际发给上游的 OpenAI 形状；模型名不影响消息内容）去重落库
+    monitor?.recordRequest(ctx.sessionKey, convertChatRequest({ ...body, model }).messages)
     const result = await executeWithFallback<StreamSuccess>(
       candidates,
       loadBalancer,
@@ -197,6 +222,8 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
             reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(connectErr))
             return { ok: false, error: connectErr, fallbackable: isFallbackableAxiosError(connectErr) }
           }
+          // 监控 tap：assistant 流式记录（挂接原始 chat SSE 流；NDJSON 转换流不含可复用的 delta 形状）
+          attachAssistantRecorder(stream, ctx.sessionKey)
           // 转换器只负责挂接上游错误监听；必须由调用方显式 pipe，否则读取侧永不结束
           const ollamaStream = createOpenAIToOllamaStream(stream, model)
           stream.pipe(ollamaStream as unknown as Writable)

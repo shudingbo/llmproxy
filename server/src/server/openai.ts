@@ -13,6 +13,7 @@ import { executeWithFallback, isFallbackableAxiosError } from '../router/fallbac
 import { Router } from '../router/index.js'
 import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
 import { buildUpstreamSessionHeaders, extractSessionKey } from '../session/key.js'
+import type { SessionMonitor } from '../monitor/index.js'
 import type {
   OpenAIUpstreamClient,
   UpstreamChatRequest,
@@ -33,6 +34,8 @@ export interface OpenAIDeps {
   onAttempt: (info: { upstreamId: string; ok: boolean; durationMs: number; status?: number }) => void
   // 可选：会话亲和存储，用于请求回退成功后把会话粘附改绑到实际成功上游；未注入则跳过改绑
   sessionStore?: SessionStoreLike
+  // 可选：会话消息监控（探测抽屉数据源）：请求侧消息去重落库 + 回答流式实时推送；未注入则跳过记录
+  monitor?: SessionMonitor
   // 鉴权中间件：装配层注入，挂到所有 /v1/* 路由前置；未注入则跳过（向后兼容）
   authMiddleware?: (req: Request, res: Response, next: () => void) => void
 }
@@ -59,7 +62,7 @@ interface StreamSuccess {
  *   可回退；/v1/rerank 为 /rerank 的同义路径，两路径共享同一 handler）
  */
 export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
-  const { store, getUpstreamClient, loadBalancer, onAttempt } = deps
+  const { store, getUpstreamClient, loadBalancer, onAttempt, monitor } = deps
 
   // 鉴权中间件优先于所有 /v1/* 路由注册；未注入则跳过（向后兼容旧装配层）
   if (deps.authMiddleware !== undefined) {
@@ -86,6 +89,23 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       info.status = status
     }
     onAttempt(info)
+  }
+
+  // 监控 tap：把上游 SSE 流挂接 assistant 流式记录器（delta 实时旁路推送，不落库；
+  // 流正常结束整条落库，主动 abort 时落已收到的部分并标记 truncated）。
+  // finish 幂等：'end'（正常）先于 'close' 触发；abort 路径只有 'close'
+  const attachAssistantRecorder = (
+    stream: Readable,
+    sessionKey: string | undefined,
+    kind: 'chat' | 'responses',
+  ): void => {
+    const handle = monitor?.createAssistantRecorder(sessionKey, kind)
+    if (handle === undefined) {
+      return
+    }
+    stream.on('data', (chunk: Buffer) => handle.feed(chunk))
+    stream.on('end', () => handle.finish(false))
+    stream.on('close', () => handle.finish(true))
   }
 
   // 从错误中提取 HTTP 状态码（axios 响应错误 / 直接挂 status 的错误），无则 undefined
@@ -118,6 +138,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
       client: session?.client,
     }
+    // 监控 tap：请求侧消息去重落库（在模型名改写前取原始 body；无会话键时 no-op）
+    monitor?.recordRequest(ctx.sessionKey, body.messages)
     const result = await executeWithFallback<ChatSuccess>(
       candidates,
       loadBalancer,
@@ -150,6 +172,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       },
     )
     if (result.ok && result.value) {
+      // 监控 tap：非流式 assistant 回答整条落库 + 推送
+      monitor?.recordChatResponse(ctx.sessionKey, result.value.data)
       res.status(result.value.status).json(result.value.data)
       return
     }
@@ -177,6 +201,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
       client: session?.client,
     }
+    // 监控 tap：请求侧消息去重落库（在模型名改写前取原始 body；无会话键时 no-op）
+    monitor?.recordRequest(ctx.sessionKey, body.messages)
     const result = await executeWithFallback<StreamSuccess>(
       candidates,
       loadBalancer,
@@ -227,6 +253,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       return
     }
     const { stream, abort } = result.value
+    // 监控 tap：assistant 流式记录（delta 实时推送，流结束 / 中断后整条落库）
+    attachAssistantRecorder(stream, ctx.sessionKey, 'chat')
     // SSE 响应头必须在首字节之前设置
     res.setHeader('Content-Type', 'text/event-stream')
     res.setHeader('Cache-Control', 'no-cache')
@@ -273,6 +301,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       sessionKey: session !== undefined ? `${model}::${session.raw}` : undefined,
       client: session?.client,
     }
+    // 监控 tap：请求侧消息（归一化 chat 形状，与会话键提取同一口径）去重落库
+    monitor?.recordRequest(ctx.sessionKey, responsesToChatMessages(body as ResponsesRequest))
 
     // ---------- 流式分支：chat SSE → responses SSE 事件流 ----------
     if (body.stream === true) {
@@ -367,6 +397,9 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
         return
       }
       const { stream, abort } = result.value
+      // 监控 tap：assistant 流式记录——原生透传流与转换流（createResponsesStream）同为
+      // Responses SSE 事件流，统一用 'responses' 口径解析 output_text.delta
+      attachAssistantRecorder(stream, ctx.sessionKey, 'responses')
       // SSE 响应头必须在首字节之前设置（原生透传流与转换流共用同一输出管道，直接 pipe）
       res.setHeader('Content-Type', 'text/event-stream')
       res.setHeader('Cache-Control', 'no-cache')
@@ -446,6 +479,14 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       },
     )
     if (result.ok && result.value) {
+      // 监控 tap：非流式 assistant 回答整条落库——按形状分流：
+      // responses 对象（object: 'response'，原生透传）vs chat 响应（convert 路径）
+      const data = result.value.data
+      if (data !== null && typeof data === 'object' && (data as Record<string, unknown>).object === 'response') {
+        monitor?.recordResponsesResponse(ctx.sessionKey, data)
+      } else {
+        monitor?.recordChatResponse(ctx.sessionKey, data)
+      }
       res.status(result.value.status).json(result.value.data)
       return
     }

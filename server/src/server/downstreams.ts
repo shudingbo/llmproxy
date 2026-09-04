@@ -37,6 +37,7 @@ export const DOWNSTREAM_ENDPOINTS: ReadonlyArray<DownstreamEndpoint> = [
   { type: 'admin', method: 'GET', path: '/admin/api/downstream-models', summary: '下游模型别名映射' },
   { type: 'admin', method: 'PUT', path: '/admin/api/downstream-models', summary: '整体替换下游模型映射' },
   { type: 'admin', method: 'GET', path: '/admin/api/logs', summary: '按日期 / 级别 / 关键词查询日志' },
+  { type: 'admin', method: 'GET', path: '/admin/api/sessions/:sessionKey/messages', summary: '会话消息监控（SSE：历史回放 + 实时增量）' },
   { type: 'admin', method: 'GET', path: '/admin/api/stats', summary: '请求统计（进程启动起算）' },
   { type: 'admin', method: 'GET', path: '/admin/api/config', summary: '当前生效配置（apiKey 已掩码）' },
   { type: 'admin', method: 'GET', path: '/admin/api/config/reload-error', summary: '最近一次外部重载错误' },

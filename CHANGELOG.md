@@ -2,6 +2,20 @@
 
 本项目所有值得记录的变更都会汇总到本文件。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.7.0] - Unreleased
+
+### 新增
+
+- **会话探测（会话消息监控）**：Sessions 页操作栏新增「探测」按钮，点击弹出 `el-drawer` 实时展示该会话与 LLM 交互的全部消息（历史 + 实时 + 流式增量）。**被动监控**：不发起任何探测请求，仅旁路记录并推送既有业务流量（`/v1/chat/completions`、`/v1/responses`（convert / native 两模式）、`/api/chat`）
+  - **存储策略**：新增 `session_messages` 表（SQLite，与 sessions / logs 同库 `~/llmproxy/llmproxy.db`，WAL 多连接安全），字段 `id / session_key / role / content / content_hash / created_at`。请求侧消息按 `(session_key, content_hash)` **去重写入**（多轮对话每轮重发的历史只落库一次，会话日志不膨胀）；响应侧 assistant 回答**每次整条写入**（相同回答也留痕）。**SSE delta 绝不逐 token 入库**——只在内存累积、流结束 / 中断后落库一条（中断则存已收到的部分并标记 `truncated`），写库频率 ≈ 每请求一次，与 token 数无关
+  - **实时推送**：进程内订阅总线（`Map<sessionKey, Set<listener>>`）。流式回答的 SSE delta 经总线以 `assistant_delta` 事件 **token 级**实时推送（抽屉内逐字增长、markdown-it 增量重渲染）；流结束推 `assistant_done`（携带完整文本，订阅晚于首 delta 的中途打开者可补块）；请求侧新写入 / 非流式回答推 `message` 事件。DB 写失败 try-catch 隔离仅告警一次，绝不影响业务请求；订阅者异常自动摘除
+  - **SSE 端点**：`GET /admin/api/sessions/:sessionKey/messages`（管理端登录鉴权；`?limit=` 可选，缺省回放最新 1000 条，上限 5000）——先回放历史（`meta` 事件：`total` / `truncated`，随后 `message` 事件升序），再实时推送；30s 心跳注释行防中间代理掐断；客户端断开（抽屉关闭 abort fetch）→ 服务端 `res 'close'` 时自动退订 + 停心跳，连接即停止。会话不存在 `404 session_not_found`；监控未装配 `503 monitor_unavailable`
+  - **生命周期**：随会话解绑（`DELETE /admin/api/sessions/:sessionKey`）/ 清空（`DELETE /admin/api/sessions`）/ 过期清理（`POST /admin/api/sessions/cleanup`）**级联删除**监控消息（孤儿清扫 `session_key NOT IN (SELECT session_key FROM sessions)`，三处手动路由 + 启动 / 周期清理调度均触发）；另有 **5 天保留期兜底**（与日志同节奏：启动一次 + 每 6 小时清扫）。响应新增附加字段 `deletedMessages`（级联删除条数）
+  - **消息粒度**：每个 chat 路径的 tap 点统一取「实际发给上游的消息」——OpenAI chat 取 `body.messages`（模型名改写前）；Ollama 取 `convertChatRequest` 转换后的 OpenAI 形状；Responses 取 `responsesToChatMessages` 归一化形状（与会话键提取同口径）。多模态 content 数组归一化为 JSON 字符串；assistant `tool_calls`（无 content 时）以 JSON 留痕
+  - **传输方式**：选用 SSE（fetch 流）而非 WebSocket——复用既有 `parseSseEvent` 模式、无需新增 ws 依赖与 vite 代理 / upgrade 处理、管理端 Cookie 鉴权天然生效；「关闭抽屉停止连接」由 abort fetch 实现
+  - **前端**：`web/src/components/SessionMonitorDrawer.vue`（消息**倒序**展示、最新在上；每块显示类型标签（user / assistant / system / tool / 其它）、内容（markdown-it 渲染，html 关闭防 XSS）、块下方时间（流式中为开始时间、结束后为完成时间）；流式块「生成中…」/「已中断」状态；页面渲染上限 500 块防 DOM 膨胀）+ `web/src/api/session-monitor.ts`（fetch SSE 助手，401 时清登录态跳登录页，与 axios 拦截器同语义）。Sessions 页操作列加宽至 150 容纳「探测 / 解绑」
+  - **测试**：`test/monitor/`（38 例：去重写入 / 列表 / 级联 / 孤儿 / 保留期 / 重开持久化、chat / responses 两种 SSE 口径解析 / 跨 chunk 行切分 / 非 JSON 容错 / finish 幂等、门面事件推送 / 订阅摘除）+ `test/server/session-monitor.test.ts`（5 例端到端：非流式 / 流式落库、SSE 历史回放、实时推送、未知会话 404、解绑级联 404）
+
 ## [0.6.0] - 2026-08-19
 
 ### 新增

@@ -10,6 +10,7 @@ import { Router } from '../router/index.js'
 import { RoundRobinLoadBalancer, SessionAffinityLoadBalancer } from '../router/load-balancer.js'
 import { SessionStore } from '../session/db.js'
 import { LogStore } from '../logstore/index.js'
+import { SessionMonitor } from '../monitor/index.js'
 import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
 import { StatsCounter } from '../stats/counter.js'
 import { ApiKeyStore } from '../auth/db.js'
@@ -82,6 +83,9 @@ export function createApp(deps: AppDeps): Express {
   const apiKeyStore = new ApiKeyStore(join(getDataDir(), 'llmproxy.db'))
   // 管理端会话存储：与 ApiKeyStore 共用 ~/llmproxy/llmproxy.db（WAL 多连接安全）
   const adminSessionStore = new AdminSessionStore(join(getDataDir(), 'llmproxy.db'))
+  // 会话消息监控存储：与 SessionStore / LogStore 共用 ~/llmproxy/llmproxy.db（WAL 多连接安全）；
+  // 持久化各会话与 LLM 交互的消息，实时推送给管理端"探测"抽屉（SSE）
+  const monitor = new SessionMonitor(join(getDataDir(), 'llmproxy.db'))
   // 双写：所有 getLogger().info/warn/... 在写文件的同时写 SQLite
   setLogStore(logStore)
   // 会话亲和总开关：routing.sessionAffinity.enabled 缺省为 true（schema 已给默认值），
@@ -100,6 +104,9 @@ export function createApp(deps: AppDeps): Express {
     try {
       const deleted = sessionStore.cleanup(cleanupMaxAge)
       if (deleted > 0) getLogger().info(`会话清理完成，删除 ${deleted} 条`, 'session-cleanup')
+      // 级联：会话映射已删除的会话键，其监控消息一并清理（孤儿清扫）
+      const orphaned = monitor.deleteOrphaned()
+      if (orphaned > 0) getLogger().info(`会话消息孤儿清理完成，删除 ${orphaned} 条`, 'session-message-cleanup')
     } catch (err) {
       getLogger().warn('会话清理失败', err)
     }
@@ -115,6 +122,9 @@ export function createApp(deps: AppDeps): Express {
     try {
       const deleted = logStore.cleanup(RETENTION_DAYS * 24 * 60 * 60 * 1000)
       if (deleted > 0) getLogger().info(`日志 DB 清理完成，删除 ${deleted} 条`, 'log-cleanup')
+      // 会话消息保留期兜底清扫：与日志同保留期（RETENTION_DAYS 天），孤儿清扫之外的时间维度保险
+      const expired = monitor.deleteExpired(RETENTION_DAYS * 24 * 60 * 60 * 1000)
+      if (expired > 0) getLogger().info(`会话消息过期清理完成，删除 ${expired} 条`, 'session-message-cleanup')
     } catch (err) {
       getLogger().warn('日志 DB 清理失败', err)
     }
@@ -179,7 +189,7 @@ export function createApp(deps: AppDeps): Express {
   // 管理端会话鉴权：在 registerAdminRoutes 内全局挂载到 /admin/api，除白名单
   // （/auth/login、/auth/salt、/auth/status、/auth/logout、/health）外所有端点一律要求登录
   // 三组 API 路由：管理端 / OpenAI 兼容 / Ollama 兼容
-  registerAdminRoutes(app, { store, getUpstreamClient, stats, sessionStore, logStore, apiKeyStore, adminSessionStore, cli })
+  registerAdminRoutes(app, { store, getUpstreamClient, stats, sessionStore, logStore, apiKeyStore, adminSessionStore, monitor, cli })
   registerOpenAIRoutes(app, {
     store,
     getUpstreamClient,
@@ -187,6 +197,7 @@ export function createApp(deps: AppDeps): Express {
     loadBalancer,
     onAttempt,
     sessionStore,
+    monitor,
     authMiddleware,
   })
   registerOllamaRoutes(app, {
@@ -196,6 +207,7 @@ export function createApp(deps: AppDeps): Express {
     loadBalancer,
     onAttempt,
     sessionStore,
+    monitor,
     authMiddleware,
   })
 

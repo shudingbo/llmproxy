@@ -1321,10 +1321,11 @@ describe('会话粘附映射 /admin/api/sessions', () => {
 
     const res = await req().delete('/admin/api/sessions')
     expect(res.status).toBe(200)
-    expect(res.body).toEqual({ deleted: 2 })
+    // 未注入 monitor 时级联计数为 0（契约含 deletedMessages 附加字段）
+    expect(res.body).toEqual({ deleted: 2, deletedMessages: 0 })
 
     const again = await req().delete('/admin/api/sessions')
-    expect(again.body).toEqual({ deleted: 0 })
+    expect(again.body).toEqual({ deleted: 0, deletedMessages: 0 })
   })
 
   it('POST cleanup 只删过期记录并返回删除数（保留期取配置缺省 1 周）', async () => {
@@ -1338,7 +1339,8 @@ describe('会话粘附映射 /admin/api/sessions', () => {
     // 缺省保留期 604800000ms（1 周）：两条都未过期 → 删 0
     const none = await req().post('/admin/api/sessions/cleanup')
     expect(none.status).toBe(200)
-    expect(none.body).toEqual({ deleted: 0 })
+    // 未注入 monitor 时级联计数为 0（契约含 deletedMessages 附加字段）
+    expect(none.body).toEqual({ deleted: 0, deletedMessages: 0 })
 
     // 配置把保留期缩短为 5 万 ms：旧记录过期被删，新记录保留
     store.set(
@@ -1350,7 +1352,7 @@ describe('会话粘附映射 /admin/api/sessions', () => {
     )
     const res = await req().post('/admin/api/sessions/cleanup')
     expect(res.status).toBe(200)
-    expect(res.body).toEqual({ deleted: 1 })
+    expect(res.body).toEqual({ deleted: 1, deletedMessages: 0 })
     expect(sessionStore.get('gpt-4o::chat-old')).toBeUndefined()
     expect(sessionStore.get('gpt-4o::chat-new')).toBeDefined()
   })

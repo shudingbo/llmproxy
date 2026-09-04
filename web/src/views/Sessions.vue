@@ -61,12 +61,16 @@
         <el-table-column label="更新时间" width="170">
           <template #default="{ row }">{{ formatTime(row.updated_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="100" fixed="right">
+        <el-table-column label="操作" width="150" fixed="right">
           <template #default="{ row }">
+            <el-button size="small" type="primary" plain @click="openMonitor(row as SessionRow)">探测</el-button>
             <el-button size="small" type="danger" @click="removeOne(row as SessionRow)">解绑</el-button>
           </template>
         </el-table-column>
       </el-table>
+
+      <!-- 探测抽屉：订阅该会话与 LLM 交互的消息（SSE），实时展示 + 流式渲染；关闭即断开连接 -->
+      <SessionMonitorDrawer v-model="monitorOpen" :session="monitorSession" />
 
       <!-- 服务端分页：total 来自响应，page 变化重置 offset 重新请求 -->
       <div class="pager">
@@ -91,6 +95,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Brush, Delete, Search } from '@element-plus/icons-vue'
 import { api } from '../api/client'
+import SessionMonitorDrawer from '../components/SessionMonitorDrawer.vue'
 
 // 会话粘附映射行（后端 SQLite 持久化）
 interface SessionRow {
@@ -129,6 +134,16 @@ const keyword = ref('') // 关键字（session_id / upstream_id）
 const page = ref(1)
 const limit = ref(20)
 const offset = ref(0)
+
+// 探测抽屉状态：monitorSession 为被探测的会话行（null = 未选择）
+const monitorOpen = ref(false)
+const monitorSession = ref<SessionRow | null>(null)
+
+// 打开探测抽屉（抽屉组件在打开时建立 SSE 订阅、关闭时自动断开）
+function openMonitor(row: SessionRow): void {
+  monitorSession.value = row
+  monitorOpen.value = true
+}
 
 // 客户端类型 → el-tag 颜色：open-webui=蓝、x-session-id=深蓝、ywnrs=紫、content-hash=绿、unknown/github=橙，其余=灰
 function clientTag(c: string): 'primary' | 'success' | 'info' | 'warning' | 'danger' {

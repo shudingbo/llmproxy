@@ -23,6 +23,7 @@ import { LogStore } from '../logstore/index.js'
 import { getLogDir } from '../paths.js'
 import type { StatsCounter } from '../stats/counter.js'
 import { SessionStore } from '../session/db.js'
+import type { SessionMonitor } from '../monitor/index.js'
 import { probeMaxContext } from '../upstream/context.js'
 import { openaiClient, OpenAIUpstreamClient } from '../upstream/openai.js'
 import { ApiKeyStore } from '../auth/db.js'
@@ -57,6 +58,8 @@ export interface AdminDeps {
   apiKeyStore: ApiKeyStore
   // 管理端会话存储：登录/登出/改密/账号 CRUD 统一走 AdminSessionStore
   adminSessionStore: AdminSessionStore
+  // 会话消息监控（探测抽屉）：SSE 订阅端点 + 会话删除时的消息级联清理；未注入则端点 503、跳过级联
+  monitor?: SessionMonitor
   // 命令行 --host/--port：透传到 /admin/api/health，保证返回值与 app.listen 实际生效值一致
   cli?: CliArgs
 }
@@ -200,7 +203,7 @@ function resolvePublicBaseUrl(listen: { host: string; port: number }): string {
  * 假定装配层已注入 express.json（10mb）与请求日志中间件。
  */
 export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
-  const { store, getUpstreamClient, stats, sessionStore, logStore, apiKeyStore, adminSessionStore, cli } = deps
+  const { store, getUpstreamClient, stats, sessionStore, logStore, apiKeyStore, adminSessionStore, monitor, cli } = deps
 
   // 管理端会话鉴权：全局挂载到 /admin/api，白名单外的所有端点一律要求登录
   // 白名单为相对挂载点的路径（中间件内 req.path 已剥离 /admin/api 前缀）
@@ -587,21 +590,28 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     }
   })
 
-  // 删除单条会话粘附（解绑）：下次请求重新选上游；幂等，不存在也返回 200 { deleted: false }
+  // 删除单条会话粘附（解绑）：下次请求重新选上游；幂等，不存在也返回 200 { deleted: false }；
+  // 级联删除该会话的监控消息（探测抽屉历史随之清除）
   app.delete('/admin/api/sessions/:sessionKey', (req: Request, res: Response) => {
     const sessionKey = String(req.params.sessionKey)
     try {
-      res.json({ deleted: sessionStore.delete(sessionKey) })
+      const deleted = sessionStore.delete(sessionKey)
+      if (deleted && monitor !== undefined) {
+        monitor.deleteBySession(sessionKey)
+      }
+      res.json({ deleted })
     } catch (err) {
       getLogger().warn({ err, sessionKey }, '会话粘附删除失败')
       res.status(500).json({ error: 'session_delete_failed' })
     }
   })
 
-  // 清空全部会话粘附：返回删除条数
+  // 清空全部会话粘附：返回删除条数；级联清空全部监控消息
   app.delete('/admin/api/sessions', (_req: Request, res: Response) => {
     try {
-      res.json({ deleted: sessionStore.clear() })
+      const deleted = sessionStore.clear()
+      const deletedMessages = monitor?.deleteAll() ?? 0
+      res.json({ deleted, deletedMessages })
     } catch (err) {
       getLogger().warn({ err }, '会话粘附清空失败')
       res.status(500).json({ error: 'session_clear_failed' })
@@ -617,11 +627,87 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
       return
     }
     try {
-      res.json({ deleted: sessionStore.cleanup(maxAgeMs) })
+      const deleted = sessionStore.cleanup(maxAgeMs)
+      // 级联：被清理的会话键，其监控消息一并删除（孤儿清扫）
+      const orphaned = monitor?.deleteOrphaned() ?? 0
+      res.json({ deleted, deletedMessages: orphaned })
     } catch (err) {
       getLogger().warn({ err, maxAgeMs }, '会话粘附过期清理失败')
       res.status(500).json({ error: 'session_cleanup_failed' })
     }
+  })
+
+  // 会话消息监控（SSE，管理端"探测"抽屉数据源）：
+  //   ① 先回放历史：meta 事件（total / truncated）+ 消息事件（id 升序，默认最新 1000 条，?limit= 可调，上限 5000）
+  //   ② 再实时推送：新请求消息 / 流式 delta（token 级）/ 流式结束（assistant_done）
+  // 客户端断开（res 'close'，如抽屉关闭 abort fetch）→ 退订并停止心跳；服务端不主动结束连接
+  app.get('/admin/api/sessions/:sessionKey/messages', (req: Request, res: Response) => {
+    const sessionKey = String(req.params.sessionKey)
+    if (monitor === undefined) {
+      res.status(503).json({ error: 'monitor_unavailable' })
+      return
+    }
+    // 会话不存在 → 404（解绑后历史已级联删除，不再可查）
+    let sessionExists: boolean
+    try {
+      sessionExists = sessionStore.get(sessionKey) !== undefined
+    } catch (err) {
+      getLogger().warn({ err, sessionKey }, '会话存在性查询失败')
+      res.status(500).json({ error: 'session_query_failed' })
+      return
+    }
+    if (!sessionExists) {
+      res.status(404).json({ error: 'session_not_found', sessionKey })
+      return
+    }
+    // 历史条数上限：limit 非法 / 缺省 → 1000（最新 N 条）；上限 5000 防超大回放
+    let limit = 1000
+    const rawLimit = req.query.limit
+    if (typeof rawLimit === 'string' && rawLimit !== '') {
+      const n = Number(rawLimit)
+      if (Number.isInteger(n) && n > 0) {
+        limit = Math.min(n, 5000)
+      }
+    }
+    let rows: Array<{ id: number; role: string; content: string; created_at: number }>
+    let total = 0
+    try {
+      rows = monitor.list(sessionKey, limit)
+      total = monitor.count(sessionKey)
+    } catch (err) {
+      getLogger().warn({ err, sessionKey }, '会话消息查询失败')
+      res.status(500).json({ error: 'session_messages_failed' })
+      return
+    }
+    // SSE 响应头（与下游流式端点一致；X-Accel-Buffering 关闭中间层缓冲）
+    res.setHeader('Content-Type', 'text/event-stream')
+    res.setHeader('Cache-Control', 'no-cache')
+    res.setHeader('Connection', 'keep-alive')
+    res.setHeader('X-Accel-Buffering', 'no')
+    res.flushHeaders()
+    // ① 历史回放：meta（总数 / 是否截断）→ 消息事件（升序，前端自行倒序展示）
+    res.write(`data: ${JSON.stringify({ type: 'meta', total, truncated: total > rows.length, sessionKey })}\n\n`)
+    for (const row of rows) {
+      res.write(`data: ${JSON.stringify({ type: 'message', id: row.id, role: row.role, content: row.content, at: row.created_at })}\n\n`)
+    }
+    // ② 实时订阅：新消息 / 流式 delta / 流式结束（事件形状见 monitor/index.ts 的 MonitorEvent）
+    const unsubscribe = monitor.subscribe(sessionKey, (event) => {
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify(event)}\n\n`)
+      }
+    })
+    // 心跳注释行（SSE 协议内以 : 开头的行）：30s 一次，防中间代理按空闲掐断长连接
+    const ping = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(': ping\n\n')
+      }
+    }, 30000)
+    ping.unref()
+    // 客户端断开（抽屉关闭 → abort fetch）→ 退订 + 停心跳，连接即"停止"
+    res.on('close', () => {
+      clearInterval(ping)
+      unsubscribe()
+    })
   })
 
   // API Key 列表：keyword 模糊匹配 name/key_prefix；includeDisabled=true 同时返回停用记录；

@@ -2,6 +2,7 @@
      实时展示该会话与 LLM 交互的消息（历史回放 + 实时推送 + 流式增量渲染）。
      消息倒序（最新在上），每块显示类型标签（user/assistant/...）、内容（md 渲染）与时间；
      推理模型的思考内容（reasoning_content）在 assistant 块内以独立"思考"子区块展示（md 渲染、流式增量）；
+     user / system / tool 消息内容区限高（240px，超出内部滚动），长内容不撑开列表；
      关闭抽屉即 abort fetch，服务端在连接断开时自动退订 -->
 <template>
   <el-drawer
@@ -391,6 +392,16 @@ onBeforeUnmount(() => {
 
 .role-other {
   border-left: 3px solid var(--el-border-color);
+}
+
+/* user / system / tool 消息常超长（系统提示词 / 工具调用结果 / 长指令等）：
+   内容区限制最大高度、超出内部滚动，避免单条消息把整个列表撑开；
+   assistant 正文不限高（流式期间需实时增长可见） */
+.role-user .md-body,
+.role-system .md-body,
+.role-tool .md-body {
+  max-height: 240px;
+  overflow-y: auto;
 }
 
 .msg-head {

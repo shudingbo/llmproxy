@@ -27,7 +27,7 @@
         stripe
         size="small"
       >
-        <el-table-column label="会话 ID" min-width="100">
+        <el-table-column label="会话 ID" min-width="70">
           <template #default="{ row }">
             <span class="session-id" :title="row.session_id">{{ row.session_id.substring(0, 10) }}</span>
           </template>
@@ -55,10 +55,10 @@
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="创建时间" width="170">
+        <el-table-column label="创建时间" width="120">
           <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="更新时间" width="170">
+        <el-table-column label="更新时间" width="120">
           <template #default="{ row }">{{ formatTime(row.updated_at) }}</template>
         </el-table-column>
         <el-table-column label="操作" width="150" fixed="right">

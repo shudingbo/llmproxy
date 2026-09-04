@@ -391,6 +391,11 @@ onBeforeUnmount(() => {
   margin: 0 0 8px;
 }
 
+.md-body :deep(:is(h1, h2,h3,h4)) {
+  font-size: 14px;
+  font-weight: bold;
+}
+
 .md-body :deep(p:last-child) {
   margin-bottom: 0;
 }

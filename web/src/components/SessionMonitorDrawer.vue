@@ -1,6 +1,7 @@
 <!-- 会话探测抽屉：订阅 /admin/api/sessions/:sessionKey/messages（SSE），
      实时展示该会话与 LLM 交互的消息（历史回放 + 实时推送 + 流式增量渲染）。
      消息倒序（最新在上），每块显示类型标签（user/assistant/...）、内容（md 渲染）与时间；
+     推理模型的思考内容（reasoning_content）在 assistant 块内以独立"思考"子区块展示（md 渲染、流式增量）；
      关闭抽屉即 abort fetch，服务端在连接断开时自动退订 -->
 <template>
   <el-drawer
@@ -43,8 +44,15 @@
             <el-tag v-else-if="m.truncated" type="danger" size="small" effect="plain">已中断</el-tag>
             <span class="msg-key">#{{ m.key }}</span>
           </div>
-          <!-- 内容：markdown-it 渲染（html 选项关闭，防 XSS）；流式期间随 delta 增量重渲染 -->
-          <div class="md-body" v-html="renderMd(m.content)"></div>
+          <!-- 思考子区块（推理模型的 reasoning_content）：md 渲染，流式期间随 think delta 增量重渲染 -->
+          <div v-if="m.reasoning !== ''" class="think-section">
+            <div class="think-head">
+              <el-tag type="warning" size="small" effect="plain">思考</el-tag>
+            </div>
+            <div class="md-body md-body-think" v-html="renderMd(m.reasoning)"></div>
+          </div>
+          <!-- 正文：markdown-it 渲染（html 选项关闭，防 XSS）；流式期间随 delta 增量重渲染 -->
+          <div class="md-body" v-if="m.content !== ''" v-html="renderMd(m.content)"></div>
           <!-- 块下方：时间（流式中为开始时间，结束后为完成时间） -->
           <div class="msg-time">{{ formatTime(m.at) }}</div>
         </div>
@@ -74,6 +82,7 @@ interface MsgBlock {
   key: string
   role: string
   content: string
+  reasoning: string // 思考内容（推理模型 reasoning_content）：无则空串，块内独立子区块展示
   at: number // 时间戳：流式块为首个 delta 时刻，完成后更新为完成时刻
   streaming: boolean
   truncated: boolean
@@ -222,12 +231,19 @@ function handleEvent(ev: MonitorEvent): void {
       meta.value = { total: ev.total, truncated: ev.truncated }
       break
     case 'message': {
-      // 历史回放 / 实时新写入：一行一块；已存在则跳过（正常不会重复，防御性去重）
-      if (messages.value.some((m) => m.key === String(ev.id))) break
+      // 历史回放 / 实时新写入：一行一块；已存在则防御性去重（仅回填缺失的思考内容）
+      const existing = messages.value.find((m) => m.key === String(ev.id))
+      if (existing !== undefined) {
+        if (existing.reasoning === '' && ev.reasoning !== '') {
+          existing.reasoning = ev.reasoning
+        }
+        break
+      }
       prepend({
         key: String(ev.id),
         role: ev.role,
         content: ev.content,
+        reasoning: ev.reasoning ?? '',
         at: ev.at,
         streaming: false,
         truncated: false,
@@ -236,22 +252,36 @@ function handleEvent(ev: MonitorEvent): void {
     }
     case 'assistant_delta': {
       // 流式增量：首个 delta 建块置顶，后续就地追加（v-html 原位更新，无闪烁）
+      // channel：'think' = 思考过程（reasoning_content，先于正文到达）/ 'content' = 正文
       let block = messages.value.find((m) => m.key === ev.id)
       if (block === undefined) {
-        block = { key: ev.id, role: 'assistant', content: '', at: Date.now(), streaming: true, truncated: false }
+        block = {
+          key: ev.id,
+          role: 'assistant',
+          content: '',
+          reasoning: '',
+          at: Date.now(),
+          streaming: true,
+          truncated: false,
+        }
         prepend(block)
       }
-      block.content += ev.content
+      if (ev.channel === 'think') {
+        block.reasoning += ev.content
+      } else {
+        block.content += ev.content
+      }
       break
     }
     case 'assistant_done': {
-      // 流式结束：块存在 → 定稿（时间 / 截断标记）；不存在（订阅晚于首个 delta）→ 凭完整文本补块
+      // 流式结束：块存在 → 定稿（时间 / 截断标记 / 完整思考文本）；不存在（订阅晚于首个 delta）→ 凭完整文本补块
       let block = messages.value.find((m) => m.key === ev.id)
-      if (block === undefined && ev.content !== '') {
+      if (block === undefined && (ev.content !== '' || ev.reasoning !== '')) {
         block = {
           key: ev.id,
           role: 'assistant',
           content: ev.content,
+          reasoning: ev.reasoning ?? '',
           at: ev.at,
           streaming: false,
           truncated: ev.truncated,
@@ -262,6 +292,10 @@ function handleEvent(ev: MonitorEvent): void {
         block.streaming = false
         block.at = ev.at
         block.truncated = ev.truncated
+        // done 携带完整思考文本为权威值（中途订阅者可能漏收开头思考 delta）
+        if (ev.reasoning !== '') {
+          block.reasoning = ev.reasoning
+        }
       }
       break
     }
@@ -378,6 +412,23 @@ onBeforeUnmount(() => {
   font-size: 11px;
   color: var(--el-text-color-placeholder);
   text-align: right;
+}
+
+/* 思考子区块（推理模型 reasoning_content）：assistant 块内的浅底次级区域，与正文视觉区分 */
+.think-section {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  background: var(--el-fill-color-light);
+  border-radius: 6px;
+}
+
+.think-head {
+  margin-bottom: 4px;
+}
+
+/* 思考正文弱化色调（基础排版仍走 .md-body 的 :deep 规则） */
+.md-body-think {
+  color: var(--el-text-color-secondary);
 }
 
 /* markdown 渲染内容（v-html 产物在 scoped 之外，用 :deep 穿透；样式与 Chat 页一致） */

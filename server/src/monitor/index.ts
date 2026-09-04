@@ -13,16 +13,16 @@
 import { randomBytes } from 'node:crypto'
 import { getLogger } from '../logger/index.js'
 import { SessionMessageStore, type SessionMessageRow } from './db.js'
-import { AssistantStreamRecorder, type RecorderKind } from './stream-recorder.js'
+import { AssistantStreamRecorder, type DeltaChannel, type RecorderKind } from './stream-recorder.js'
 
 // 推送事件（管理端 SSE 端点原样序列化为 data: 行）：
-// - message：一条完整消息（历史回放 / 请求侧新写入 / 非流式 assistant）
-// - assistant_delta：流式增量（token 级，不落库；id 为该轮流式块的临时键）
-// - assistant_done：流式结束（content 为完整文本：中途订阅者可凭此补块；finalId 为落库行 id，空内容时为 null）
+// - message：一条完整消息（历史回放 / 请求侧新写入 / 非流式 assistant）；reasoning 为思考内容（无则空串）
+// - assistant_delta：流式增量（token 级，不落库；id 为该轮流式块的临时键；channel 区分思考 / 正文）
+// - assistant_done：流式结束（content / reasoning 为完整文本：中途订阅者可凭此补块；finalId 为落库行 id，空内容时为 null）
 export type MonitorEvent =
-  | { type: 'message'; id: number; role: string; content: string; at: number }
-  | { type: 'assistant_delta'; id: string; content: string }
-  | { type: 'assistant_done'; id: string; finalId: number | null; content: string; at: number; truncated: boolean }
+  | { type: 'message'; id: number; role: string; content: string; reasoning: string; at: number }
+  | { type: 'assistant_delta'; id: string; channel: DeltaChannel; content: string }
+  | { type: 'assistant_done'; id: string; finalId: number | null; content: string; reasoning: string; at: number; truncated: boolean }
 
 export type MonitorEventListener = (event: MonitorEvent) => void
 
@@ -35,10 +35,11 @@ export interface AssistantStreamHandle {
 // 无会话键 / 未注入监控时的零开销空实现
 const NOOP_HANDLE: AssistantStreamHandle = { feed: () => {}, finish: () => {} }
 
-// 单条消息归一化：提取 [role, content]（与 session/key.ts 的 serializeMessage 同口径）——
+// 单条消息归一化：提取 [role, content, reasoning]（与 session/key.ts 的 serializeMessage 同口径）——
 // role 缺失 → 空串；content 字符串原样、缺失 → 空串；null / 对象 / 多模态数组 → JSON.stringify
+// reasoning 取 reasoning_content（推理模型客户端回显的历史思考；多数客户端不回显，通常为空串）
 // role 与 content 均为空 → null（空消息跳过）
-const normalizeMessage = (m: unknown): { role: string; content: string } | null => {
+const normalizeMessage = (m: unknown): { role: string; content: string; reasoning: string } | null => {
   const msg = (m ?? {}) as Record<string, unknown>
   const role = typeof msg.role === 'string' ? msg.role : ''
   const content =
@@ -47,10 +48,11 @@ const normalizeMessage = (m: unknown): { role: string; content: string } | null 
       : msg.content === undefined
         ? ''
         : JSON.stringify(msg.content)
+  const reasoning = typeof msg.reasoning_content === 'string' ? msg.reasoning_content : ''
   if (role === '' && content === '') {
     return null
   }
-  return { role, content }
+  return { role, content, reasoning }
 }
 
 export class SessionMonitor {
@@ -75,9 +77,16 @@ export class SessionMonitor {
         continue
       }
       try {
-        const row = this.store.insertDedup(sessionKey, msg.role, msg.content)
+        const row = this.store.insertDedup(sessionKey, msg.role, msg.content, msg.reasoning)
         if (row !== null) {
-          this.emit(sessionKey, { type: 'message', id: row.id, role: row.role, content: row.content, at: row.created_at })
+          this.emit(sessionKey, {
+            type: 'message',
+            id: row.id,
+            role: row.role,
+            content: row.content,
+            reasoning: row.reasoning,
+            at: row.created_at,
+          })
         }
       } catch (err) {
         this.reportWriteError(err, '请求消息记录失败')
@@ -94,8 +103,8 @@ export class SessionMonitor {
     }
     const nonce = `a${randomBytes(6).toString('hex')}`
     let finished = false
-    const recorder = new AssistantStreamRecorder(kind, (delta) => {
-      this.emit(sessionKey, { type: 'assistant_delta', id: nonce, content: delta })
+    const recorder = new AssistantStreamRecorder(kind, (channel, delta) => {
+      this.emit(sessionKey, { type: 'assistant_delta', id: nonce, channel, content: delta })
     })
     return {
       feed: (chunk: Buffer | string) => {
@@ -108,10 +117,11 @@ export class SessionMonitor {
         finished = true
         recorder.finish()
         const content = recorder.getContent()
+        const reasoning = recorder.getReasoning()
         let finalId: number | null = null
-        if (content !== '') {
+        if (content !== '' || reasoning !== '') {
           try {
-            const row = this.store.insert(sessionKey, 'assistant', content)
+            const row = this.store.insert(sessionKey, 'assistant', content, reasoning)
             finalId = row.id
           } catch (err) {
             this.reportWriteError(err, 'assistant 消息记录失败')
@@ -122,6 +132,7 @@ export class SessionMonitor {
           id: nonce,
           finalId,
           content,
+          reasoning,
           at: Date.now(),
           truncated: aborted,
         })
@@ -129,22 +140,32 @@ export class SessionMonitor {
     }
   }
 
-  // 非流式 assistant 回答直接记录（空内容 no-op）：整条落库 + 推送 message 事件
-  recordAssistant(sessionKey: string | undefined, content: string): void {
-    if (sessionKey === undefined || content === '') {
+  // 非流式 assistant 回答直接记录（正文与思考均为空 no-op）：整条落库 + 推送 message 事件
+  recordAssistant(sessionKey: string | undefined, content: string, reasoning = ''): void {
+    if (sessionKey === undefined || (content === '' && reasoning === '')) {
       return
     }
     try {
-      const row = this.store.insert(sessionKey, 'assistant', content)
-      this.emit(sessionKey, { type: 'message', id: row.id, role: 'assistant', content: row.content, at: row.created_at })
+      const row = this.store.insert(sessionKey, 'assistant', content, reasoning)
+      this.emit(sessionKey, {
+        type: 'message',
+        id: row.id,
+        role: 'assistant',
+        content: row.content,
+        reasoning: row.reasoning,
+        at: row.created_at,
+      })
     } catch (err) {
       this.reportWriteError(err, 'assistant 消息记录失败')
     }
   }
 
   // chat 非流式响应记录：逐 choice 提取 message 内容（content 缺失时回退 tool_calls JSON）
+  // + reasoning_content（推理模型思考过程；缺失为空串）
   recordChatResponse(sessionKey: string | undefined, data: unknown): void {
-    const body = data as { choices?: Array<{ message?: { content?: unknown; tool_calls?: unknown } }> } | null
+    const body = data as {
+      choices?: Array<{ message?: { content?: unknown; tool_calls?: unknown; reasoning_content?: unknown } }>
+    } | null
     if (sessionKey === undefined || body === null || typeof body !== 'object' || !Array.isArray(body.choices)) {
       return
     }
@@ -159,27 +180,46 @@ export class SessionMonitor {
           : message.tool_calls !== undefined && message.tool_calls !== null
             ? JSON.stringify(message.tool_calls)
             : ''
-      this.recordAssistant(sessionKey, content)
+      const reasoning = typeof message.reasoning_content === 'string' ? message.reasoning_content : ''
+      this.recordAssistant(sessionKey, content, reasoning)
     }
   }
 
-  // Responses 非流式响应记录：提取 output 中 type=message 项的文本（多 content part 按序拼接）
+  // Responses 非流式响应记录：提取 output 中 type=message 项的文本（多 content part 按序拼接），
+  // 前序 type=reasoning 项的 summary 文本归并到紧随其后的 message 项（思考属于该轮回答）
   recordResponsesResponse(sessionKey: string | undefined, data: unknown): void {
     const body = data as {
-      output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>
+      output?: Array<{
+        type?: string
+        content?: Array<{ type?: string; text?: string }>
+        summary?: Array<{ type?: string; text?: string }>
+      }>
     } | null
     if (sessionKey === undefined || body === null || typeof body !== 'object' || !Array.isArray(body.output)) {
       return
     }
+    let pendingReasoning = ''
     for (const item of body.output) {
-      if (item?.type !== 'message' || !Array.isArray(item.content)) {
+      if (item === null || typeof item !== 'object') {
+        continue
+      }
+      if (item.type === 'reasoning' && Array.isArray(item.summary)) {
+        // reasoning 项的思考文本：summary parts 按序拼接（与 message 的 content parts 同口径）
+        pendingReasoning += item.summary
+          .filter((part) => part !== null && typeof part === 'object' && typeof part.text === 'string')
+          .map((part) => (part as { text: string }).text)
+          .join('')
+        continue
+      }
+      if (item.type !== 'message' || !Array.isArray(item.content)) {
         continue
       }
       const text = item.content
         .filter((part) => part !== null && typeof part === 'object' && typeof part.text === 'string')
         .map((part) => (part as { text: string }).text)
         .join('')
-      this.recordAssistant(sessionKey, text)
+      this.recordAssistant(sessionKey, text, pendingReasoning)
+      pendingReasoning = ''
     }
   }
 

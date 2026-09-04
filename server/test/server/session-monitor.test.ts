@@ -50,7 +50,8 @@ function readBody(req: IncomingMessage): Promise<unknown> {
   })
 }
 
-// 模拟上游（单端口组合）：请求体 stream=true → SSE 流（delta 拼出 'hello'）；否则非流式 JSON（回答 'hi'）
+// 模拟上游（单端口组合）：请求体 stream=true → SSE 流（reasoning_content 思考片段 '想一下' 先于正文 'hello'）；
+// 否则非流式 JSON（回答 'hi' + 思考 '想一下'）
 function startMockUpstream(): Promise<{ baseUrl: string; server: Server }> {
   const srv = createServer((req, res) => {
     readBody(req)
@@ -58,6 +59,8 @@ function startMockUpstream(): Promise<{ baseUrl: string; server: Server }> {
         if (body !== null && typeof body === 'object' && (body as { stream?: unknown }).stream === true) {
           res.setHeader('Content-Type', 'text/event-stream')
           res.write('data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n')
+          res.write('data: {"choices":[{"delta":{"reasoning_content":"想"}}]}\n\n')
+          res.write('data: {"choices":[{"delta":{"reasoning_content":"一下"}}]}\n\n')
           res.write('data: {"choices":[{"delta":{"content":"he"}}]}\n\n')
           res.write('data: {"choices":[{"delta":{"content":"llo"}}]}\n\n')
           res.write('data: [DONE]\n\n')
@@ -69,7 +72,13 @@ function startMockUpstream(): Promise<{ baseUrl: string; server: Server }> {
           JSON.stringify({
             id: 'chatcmpl-1',
             object: 'chat.completion',
-            choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+            choices: [
+              {
+                index: 0,
+                message: { role: 'assistant', content: 'hi', reasoning_content: '想一下' },
+                finish_reason: 'stop',
+              },
+            ],
             usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
           }),
         )
@@ -142,12 +151,20 @@ async function consumeSse(
   }
 }
 
-const messageEvents = (events: unknown[]): Array<{ id: number; role: string; content: string }> =>
+const messageEvents = (events: unknown[]): Array<{ id: number; role: string; content: string; reasoning: string }> =>
   events
     .filter((e) => typeof e === 'object' && e !== null && (e as { type?: string }).type === 'message')
     .map((e) => {
-      const m = e as { id: number; role: string; content: string }
-      return { id: m.id, role: m.role, content: m.content }
+      const m = e as { id: number; role: string; content: string; reasoning?: string }
+      return { id: m.id, role: m.role, content: m.content, reasoning: m.reasoning ?? '' }
+    })
+
+const deltaEvents = (events: unknown[]): Array<[channel: string, content: string]> =>
+  events
+    .filter((e) => typeof e === 'object' && e !== null && (e as { type?: string }).type === 'assistant_delta')
+    .map((e) => {
+      const d = e as { channel: string; content: string }
+      return [d.channel, d.content]
     })
 
 describe('会话消息监控（tap + SSE 端点）', () => {
@@ -292,9 +309,11 @@ describe('会话消息监控（tap + SSE 端点）', () => {
       [ 'user', '你好' ],
       [ 'assistant', 'hi' ],
     ])
+    // 非流式 assistant：reasoning_content 思考内容随消息回放
+    expect(messageEvents(events).find((m) => m.role === 'assistant')?.reasoning).toBe('想一下')
   })
 
-  it('流式请求：assistant 流式结束后整条落库（delta 不逐条入库）', async () => {
+  it('流式请求：assistant 流式结束后整条落库（delta 不逐条入库），思考内容同条携带', async () => {
     bindSession('gpt-4::sess-b')
     expect(await chatStream('sess-b', 'stream?')).toBe(200)
 
@@ -308,6 +327,8 @@ describe('会话消息监控（tap + SSE 端点）', () => {
       [ 'user', 'stream?' ],
       [ 'assistant', 'hello' ],
     ])
+    // 流式 assistant 行：思考内容整条携带（delta 不逐条入库）
+    expect(messageEvents(events).find((m) => m.role === 'assistant')?.reasoning).toBe('想一下')
   })
 
   it('实时推送：抽屉订阅期间新请求的 user/assistant 消息经 SSE 实时到达', async () => {
@@ -329,6 +350,39 @@ describe('会话消息监控（tap + SSE 端点）', () => {
       [ 'user', 'live-用户' ],
       [ 'assistant', 'hi' ],
     ])
+  })
+
+  it('实时推送：流式回答的思考 delta（channel=think）先于正文到达，assistant_done 携带完整思考', async () => {
+    bindSession('gpt-4::sess-e')
+    // 先建立 SSE 订阅（此时无历史）
+    const promise = consumeSse(
+      `${baseUrl}/admin/api/sessions/gpt-4%3A%3Asess-e/messages`,
+      cookie,
+      (evts) => evts.some((e) => (e as { type?: string }).type === 'assistant_done'),
+    )
+    // 稍等订阅就绪后发起流式请求
+    await new Promise((r) => setTimeout(r, 100))
+    expect(await chatStream('sess-e', 'live-think')).toBe(200)
+
+    const { ok, events } = await promise
+    expect(ok).toBe(true)
+    // 思考片段（think 通道）先于正文（content 通道）逐 token 到达
+    expect(deltaEvents(events)).toEqual([
+      [ 'think', '想' ],
+      [ 'think', '一下' ],
+      [ 'content', 'he' ],
+      [ 'content', 'llo' ],
+    ])
+    const done = events.find((e) => (e as { type?: string }).type === 'assistant_done') as {
+      type: string
+      content: string
+      reasoning: string
+      truncated: boolean
+    }
+    expect(done.type).toBe('assistant_done')
+    expect(done.content).toBe('hello')
+    expect(done.reasoning).toBe('想一下')
+    expect(done.truncated).toBe(false)
   })
 
   it('未知会话：SSE 端点 404', async () => {

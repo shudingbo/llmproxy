@@ -75,6 +75,22 @@ describe('SessionMonitor', () => {
       expect(monitor.count('k')).toBe(0)
     })
 
+    it('reasoning_content：请求侧思考内容随行落库，message 事件携带 reasoning', () => {
+      const key = 'gpt-4::s3'
+      const { events, unsubscribe } = messages(key, monitor)
+      monitor.recordRequest(key, [
+        { role: 'assistant', content: '历史回答', reasoning_content: '历史思考' },
+        { role: 'user', content: '新问题' },
+      ])
+      unsubscribe()
+      const rows = monitor.list(key)
+      expect(rows[0].reasoning).toBe('历史思考')
+      expect(rows[1].reasoning).toBe('')
+      const pushed = events.filter((e) => e.type === 'message')
+      expect(pushed[0]).toMatchObject({ role: 'assistant', content: '历史回答', reasoning: '历史思考' })
+      expect(pushed[1]).toMatchObject({ role: 'user', content: '新问题', reasoning: '' })
+    })
+
     it('多模态 content 数组 / 缺失 content：归一化为 JSON 字符串 / 空串', () => {
       const key = 'gpt-4::s2'
       monitor.recordRequest(key, [
@@ -115,6 +131,45 @@ describe('SessionMonitor', () => {
       // 落库一条 assistant（delta 不单独落库）
       expect(monitor.count(key)).toBe(1)
       expect(monitor.list(key)[0].role).toBe('assistant')
+    })
+
+    it('思考通道：reasoning_content delta 以 channel=think 推送，done 与落库均携带完整思考', () => {
+      const key = 'gpt-4::s5'
+      const { events, unsubscribe } = messages(key, monitor)
+      const handle = monitor.createAssistantRecorder(key, 'chat')
+      handle.feed('data: {"choices":[{"delta":{"reasoning_content":"想"}}]}\n\n')
+      handle.feed('data: {"choices":[{"delta":{"reasoning_content":"了"}}]}\n\n')
+      handle.feed('data: {"choices":[{"delta":{"content":"答"}}]}\n\n')
+      handle.finish(false)
+      unsubscribe()
+
+      const deltas = events.filter((e) => e.type === 'assistant_delta')
+      expect(
+        deltas.map((e) => (e.type === 'assistant_delta' ? [e.channel, e.content] : null)),
+      ).toEqual([
+        ['think', '想'],
+        ['think', '了'],
+        ['content', '答'],
+      ])
+
+      const done = events.find((e) => e.type === 'assistant_done')
+      expect(done).toBeDefined()
+      if (done !== undefined && done.type === 'assistant_done') {
+        expect(done.content).toBe('答')
+        expect(done.reasoning).toBe('想了')
+        expect(done.finalId).toBeTypeOf('number')
+      }
+      const row = monitor.list(key)[0]
+      expect(row).toMatchObject({ role: 'assistant', content: '答', reasoning: '想了' })
+    })
+
+    it('仅思考无正文（思考中被中断）：reasoning 非空也落库', () => {
+      const key = 'gpt-4::s6'
+      const handle = monitor.createAssistantRecorder(key, 'chat')
+      handle.feed('data: {"choices":[{"delta":{"reasoning_content":"半"}}]}\n\n')
+      handle.finish(true)
+      expect(monitor.list(key)).toHaveLength(1)
+      expect(monitor.list(key)[0]).toMatchObject({ content: '', reasoning: '半' })
     })
 
     it('finish(aborted=true)：已收到的部分落库并标记 truncated', () => {
@@ -193,6 +248,27 @@ describe('SessionMonitor', () => {
       ])
     })
 
+    it('recordChatResponse：reasoning_content 思考内容随回答落库', () => {
+      const key = 'gpt-4::s3'
+      const { events, unsubscribe } = messages(key, monitor)
+      monitor.recordChatResponse(key, {
+        choices: [{ message: { role: 'assistant', content: '回答', reasoning_content: '推理过程' } }],
+      })
+      unsubscribe()
+      expect(monitor.list(key)).toHaveLength(1)
+      expect(monitor.list(key)[0]).toMatchObject({ content: '回答', reasoning: '推理过程' })
+      expect(events.some((e) => e.type === 'message' && e.reasoning === '推理过程')).toBe(true)
+    })
+
+    it('recordAssistant：正文空但思考非空 → 落库（思考留痕）', () => {
+      const key = 'gpt-4::s7'
+      monitor.recordAssistant(key, '')
+      expect(monitor.count(key)).toBe(0)
+      monitor.recordAssistant(key, '', '只有思考')
+      expect(monitor.list(key)).toHaveLength(1)
+      expect(monitor.list(key)[0]).toMatchObject({ content: '', reasoning: '只有思考' })
+    })
+
     it('recordChatResponse：形状不符（null / 非对象 / 无 choices）no-op', () => {
       const key = 'gpt-4::s2'
       monitor.recordChatResponse(key, null)
@@ -201,17 +277,33 @@ describe('SessionMonitor', () => {
       expect(monitor.count(key)).toBe(0)
     })
 
-    it('recordResponsesResponse：提取 message 项文本；非 message 项跳过', () => {
+    it('recordResponsesResponse：提取 message 项文本；前序 reasoning 项 summary 归并到该 message；非 message 项跳过', () => {
       const key = 'gpt-4::s1'
       monitor.recordResponsesResponse(key, {
         object: 'response',
         output: [
-          { type: 'reasoning', id: 'r1' },
+          { type: 'reasoning', id: 'r1', summary: [{ type: 'summary_text', text: '思考一' }, { type: 'summary_text', text: '思考二' }] },
           { type: 'message', id: 'm1', content: [{ type: 'output_text', text: '第一部分' }, { type: 'output_text', text: '第二部分' }] },
           { type: 'function_call', id: 'f1' },
         ],
       })
-      expect(monitor.list(key).map((r) => r.content)).toEqual(['第一部分第二部分'])
+      const rows = monitor.list(key)
+      expect(rows).toHaveLength(1)
+      expect(rows[0].content).toBe('第一部分第二部分')
+      expect(rows[0].reasoning).toBe('思考一思考二')
+    })
+
+    it('recordResponsesResponse：reasoning 项无 summary / summary 空数组：不产生思考文本', () => {
+      const key = 'gpt-4::s2'
+      monitor.recordResponsesResponse(key, {
+        object: 'response',
+        output: [
+          { type: 'reasoning', id: 'r1' },
+          { type: 'message', id: 'm1', content: [{ type: 'output_text', text: '回答' }] },
+        ],
+      })
+      expect(monitor.list(key)).toHaveLength(1)
+      expect(monitor.list(key)[0].reasoning).toBe('')
     })
   })
 

@@ -3,20 +3,28 @@
 //
 // 事件形状（契约在服务端，见 server/src/monitor/index.ts 的 MonitorEvent + admin.ts 的 meta 事件）：
 //   { type: 'meta', total, truncated, sessionKey }                    历史回放元信息（首事件）
-//   { type: 'message', id, role, content, at }                        一条完整消息（历史 / 请求侧新写入 / 非流式回答）
-//   { type: 'assistant_delta', id, content }                          流式增量（token 级，不落库）
-//   { type: 'assistant_done', id, finalId, content, at, truncated }   流式结束（content 为完整文本，供中途订阅者补块）
+//   { type: 'message', id, role, content, reasoning, at }             一条完整消息（历史 / 请求侧新写入 / 非流式回答；reasoning 为思考内容，无则空串）
+//   { type: 'assistant_delta', id, channel, content }                 流式增量（token 级，不落库；channel: 'think' 思考 / 'content' 正文）
+//   { type: 'assistant_done', id, finalId, content, reasoning, at, truncated }
+//       流式结束（content / reasoning 为完整文本，供中途订阅者补块）
 //
 // 调用方负责 abort：关闭抽屉时 abort fetch，服务端在 res 'close' 时自动退订（连接即"停止"）
 
 // meta 事件：历史总数与是否截断（服务端默认回放最新 1000 条）
 export type MonitorMetaEvent = { type: 'meta'; total: number; truncated: boolean; sessionKey: string }
 
-// 完整消息事件
-export type MonitorMessageEvent = { type: 'message'; id: number; role: string; content: string; at: number }
+// 完整消息事件（reasoning：推理模型的思考内容，无则空串）
+export type MonitorMessageEvent = {
+  type: 'message'
+  id: number
+  role: string
+  content: string
+  reasoning: string
+  at: number
+}
 
-// 流式增量事件（id 为该轮流式块的临时键）
-export type MonitorDeltaEvent = { type: 'assistant_delta'; id: string; content: string }
+// 流式增量事件（id 为该轮流式块的临时键；channel 区分思考 / 正文两个通道）
+export type MonitorDeltaEvent = { type: 'assistant_delta'; id: string; channel: 'think' | 'content'; content: string }
 
 // 流式结束事件（finalId 为落库行 id，空回答时为 null；truncated 表示流被中断）
 export type MonitorDoneEvent = {
@@ -24,6 +32,7 @@ export type MonitorDoneEvent = {
   id: string
   finalId: number | null
   content: string
+  reasoning: string
   at: number
   truncated: boolean
 }

@@ -47,6 +47,16 @@ interface ChatSuccess {
   data: unknown
 }
 
+// /v1/responses 非流式成功结果：data 为对外的 responses 对象（原生透传 / 转换产物），
+// rawChat 为 convert 路径的原始 chat 响应——转换器以简单可靠为准会丢弃 reasoning_content 等附加字段，
+// 监控 tap 凭它保留思考内容（原生路径无此字段）
+interface ResponsesNonStreamSuccess {
+  status: number
+  headers: Record<string, string>
+  data: unknown
+  rawChat?: unknown
+}
+
 // 流式成功结果：上游 SSE 流 + 拆线函数
 interface StreamSuccess {
   stream: Readable
@@ -422,7 +432,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     }
 
     // ---------- 非流式分支：chat 响应 → responses 响应对象 ----------
-    const result = await executeWithFallback<ChatSuccess>(
+    const result = await executeWithFallback<ResponsesNonStreamSuccess>(
       candidates,
       loadBalancer,
       ctx,
@@ -465,7 +475,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
           // chat 响应 → responses 响应对象（model 用下游别名，与 /v1/chat/completions 一致）
           const responsesBody = chatResponseToResponses(data, model)
           reportAttempt(candidate.upstreamId, true, attemptStart, 200)
-          return { ok: true, value: { status: 200, headers: {}, data: responsesBody } }
+          // rawChat：保留原始 chat 响应供监控 tap 提取 reasoning_content（转换产物不含思考）
+          return { ok: true, value: { status: 200, headers: {}, data: responsesBody, rawChat: data } }
         } catch (err) {
           reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
           return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
@@ -479,10 +490,12 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       },
     )
     if (result.ok && result.value) {
-      // 监控 tap：非流式 assistant 回答整条落库——按形状分流：
-      // responses 对象（object: 'response'，原生透传）vs chat 响应（convert 路径）
+      // 监控 tap：非流式 assistant 回答整条落库——convert 路径优先用原始 chat 响应（含 reasoning_content，
+      // 转换产物已丢弃思考）；否则按形状分流：responses 对象（object: 'response'，原生透传）vs chat 响应
       const data = result.value.data
-      if (data !== null && typeof data === 'object' && (data as Record<string, unknown>).object === 'response') {
+      if (result.value.rawChat !== undefined) {
+        monitor?.recordChatResponse(ctx.sessionKey, result.value.rawChat)
+      } else if (data !== null && typeof data === 'object' && (data as Record<string, unknown>).object === 'response') {
         monitor?.recordResponsesResponse(ctx.sessionKey, data)
       } else {
         monitor?.recordChatResponse(ctx.sessionKey, data)

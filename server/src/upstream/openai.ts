@@ -52,7 +52,8 @@ export interface UpstreamChatResponse {
   model?: string
   choices: Array<{
     index?: number
-    message?: { role: string; content?: string }
+    // message.reasoning_content：推理模型（DeepSeek 等）的思考过程（非标准 OpenAI 字段，多数上游缺失）
+    message?: { role: string; content?: string; reasoning_content?: string }
     delta?: { role?: string; content?: string }
     finish_reason?: string | null
   }>

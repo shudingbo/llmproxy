@@ -15,7 +15,7 @@ import { Router } from '../router/index.js'
 import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
 import { buildUpstreamSessionHeaders, extractSessionKey } from '../session/key.js'
 import type { SessionMonitor } from '../monitor/index.js'
-import type { OpenAIUpstreamClient, UpstreamChatRequest } from '../upstream/openai.js'
+import type { OpenAIUpstreamClient, UpstreamChatRequest, UpstreamChatResponse } from '../upstream/openai.js'
 import { buildAliasMetaMap, listExposedAliases } from './model-meta.js'
 import { registerOllamaShowRoute } from './ollama-show.js'
 
@@ -40,6 +40,13 @@ export interface OllamaDeps {
 interface StreamSuccess {
   ollamaStream: Readable
   abort: () => void
+}
+
+// 非流式成功结果：Ollama 形状响应 + 原始 OpenAI 响应
+// （raw 保留 message.reasoning_content 供监控 tap 提取思考内容；Ollama 形状转换后不含该字段）
+interface NonStreamSuccess {
+  resp: OllamaChatResponse
+  raw: UpstreamChatResponse
 }
 
 /**
@@ -126,7 +133,7 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
     }
     // 监控 tap：请求侧消息（转换为实际发给上游的 OpenAI 形状；模型名不影响消息内容）去重落库
     monitor?.recordRequest(ctx.sessionKey, convertChatRequest({ ...body, model }).messages)
-    const result = await executeWithFallback<OllamaChatResponse>(
+    const result = await executeWithFallback<NonStreamSuccess>(
       candidates,
       loadBalancer,
       ctx,
@@ -149,7 +156,7 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
           // OpenAI 响应 → Ollama 非流式响应（model 字段回填下游别名）
           const ollamaResp = convertChatResponse(openaiResp, model)
           reportAttempt(candidate.upstreamId, true, attemptStart, 200)
-          return { ok: true, value: ollamaResp }
+          return { ok: true, value: { resp: ollamaResp, raw: openaiResp } }
         } catch (err) {
           reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
           return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
@@ -163,9 +170,13 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
       },
     )
     if (result.ok && result.value) {
-      // 监控 tap：非流式 assistant 回答整条落库 + 推送
-      monitor?.recordAssistant(ctx.sessionKey, result.value.message?.content ?? '')
-      res.status(200).json(result.value)
+      // 监控 tap：非流式 assistant 回答整条落库 + 推送（思考取自原始 OpenAI 响应，Ollama 形状不含该字段）
+      const rawReasoning =
+        typeof result.value.raw.choices?.[0]?.message?.reasoning_content === 'string'
+          ? result.value.raw.choices[0].message.reasoning_content
+          : ''
+      monitor?.recordAssistant(ctx.sessionKey, result.value.resp.message?.content ?? '', rawReasoning)
+      res.status(200).json(result.value.resp)
       return
     }
     // 全部候选失败：502，附带最后一次尝试的错误代号（若有）

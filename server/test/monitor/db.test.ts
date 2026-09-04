@@ -172,4 +172,67 @@ describe('SessionMessageStore', () => {
       reopened.close()
     }
   })
+
+  it('insert：reasoning 随行落库（返回行与 list 均含）', () => {
+    const row = store.insert('gpt-4::s1', 'assistant', '正文', '思考过程')
+    expect(row.reasoning).toBe('思考过程')
+    expect(store.list('gpt-4::s1')[0]).toMatchObject({ role: 'assistant', content: '正文', reasoning: '思考过程' })
+  })
+
+  it('insertDedup：reasoning 参与写入但不参与去重哈希；重复写入返回 null', () => {
+    const row1 = store.insertDedup('gpt-4::s1', 'assistant', '你好', '思考A')
+    expect(row1).not.toBeNull()
+    expect(row1?.reasoning).toBe('思考A')
+    // 同 (role, content) 不带 reasoning 的重复 → 去重命中，返回 null
+    expect(store.insertDedup('gpt-4::s1', 'assistant', '你好')).toBeNull()
+    expect(store.count('gpt-4::s1')).toBe(1)
+  })
+
+  it('insertDedup：去重命中且旧行 reasoning 为空、新值非空 → 回填旧行', () => {
+    const row1 = store.insertDedup('gpt-4::s1', 'assistant', '你好')
+    expect(row1).not.toBeNull()
+    expect(row1?.reasoning).toBe('')
+    expect(store.insertDedup('gpt-4::s1', 'assistant', '你好', '后补思考')).toBeNull()
+    expect(store.list('gpt-4::s1')[0].reasoning).toBe('后补思考')
+    // 已非空的 reasoning 不被空值覆盖
+    expect(store.insertDedup('gpt-4::s1', 'assistant', '你好', '')).toBeNull()
+    expect(store.list('gpt-4::s1')[0].reasoning).toBe('后补思考')
+  })
+
+  it('迁移：旧表（无 reasoning 列）打开时自动补列，既有行取空串默认值', () => {
+    // 独立路径构造"旧版 schema"场景（0.7.0 早期构建形态），不影响主 store 的 dbPath
+    const legacyPath = makeTempDbPath()
+    try {
+      const raw = new Database(legacyPath)
+      raw.exec(
+        `CREATE TABLE session_messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_key TEXT NOT NULL,
+          role TEXT NOT NULL,
+          content TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );`,
+      )
+      raw
+        .prepare('INSERT INTO session_messages (session_key, role, content, content_hash, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run('gpt-4::legacy', 'user', '旧行', 'h1', Date.now())
+      raw.close()
+
+      const migrated = new SessionMessageStore(legacyPath)
+      try {
+        // 旧行保留、reasoning 取默认空串；新写入 reasoning 正常
+        const rows = migrated.list('gpt-4::legacy')
+        expect(rows).toHaveLength(1)
+        expect(rows[0].reasoning).toBe('')
+        const inserted = migrated.insert('gpt-4::legacy', 'assistant', '新行', '新思考')
+        expect(inserted.reasoning).toBe('新思考')
+        expect(migrated.count('gpt-4::legacy')).toBe(2)
+      } finally {
+        migrated.close()
+      }
+    } finally {
+      removeDbFiles(legacyPath)
+    }
+  })
 })

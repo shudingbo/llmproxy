@@ -669,7 +669,7 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
         limit = Math.min(n, 5000)
       }
     }
-    let rows: Array<{ id: number; role: string; content: string; created_at: number }>
+    let rows: Array<{ id: number; role: string; content: string; reasoning: string; created_at: number }>
     let total = 0
     try {
       rows = monitor.list(sessionKey, limit)
@@ -688,7 +688,9 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     // ① 历史回放：meta（总数 / 是否截断）→ 消息事件（升序，前端自行倒序展示）
     res.write(`data: ${JSON.stringify({ type: 'meta', total, truncated: total > rows.length, sessionKey })}\n\n`)
     for (const row of rows) {
-      res.write(`data: ${JSON.stringify({ type: 'message', id: row.id, role: row.role, content: row.content, at: row.created_at })}\n\n`)
+      res.write(
+        `data: ${JSON.stringify({ type: 'message', id: row.id, role: row.role, content: row.content, reasoning: row.reasoning, at: row.created_at })}\n\n`,
+      )
     }
     // ② 实时订阅：新消息 / 流式 delta / 流式结束（事件形状见 monitor/index.ts 的 MonitorEvent）
     const unsubscribe = monitor.subscribe(sessionKey, (event) => {

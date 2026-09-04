@@ -1,8 +1,13 @@
 // assistant 流式记录器：解析上游 SSE 流，实时回调 delta 事件并累积完整文本
 // 两种解析口径（与网关对接的上游流格式一一对应）：
-//   - 'chat'      OpenAI chat completions SSE：data: {choices: [{delta: {content}}]}（/ [DONE]）
+//   - 'chat'      OpenAI chat completions SSE：data: {choices: [{delta: {content, reasoning_content}}]}（/ [DONE]）
 //   - 'responses' OpenAI Responses SSE：data: {type: 'response.output_text.delta', delta}
 //                 （含网关 convert 路径 createResponsesStream 产出的同形事件流）
+//
+// 双通道（think / content）：推理模型（DeepSeek 等）先流式输出思考过程、再输出正文：
+//   - 'chat'      思考 = delta.reasoning_content（与 content 同一 choice，先于正文到达）
+//   - 'responses' 思考 = response.reasoning_text.delta / response.reasoning_summary_text.delta
+//                 （原生透传流；convert 路径的转换流不含思考事件——转换器以简单可靠为准，不携带）
 //
 // 本模块只负责"解析 + 累积 + 回调"，绝不落库、不碰订阅总线（那是 SessionMonitor 门面的职责）；
 // delta 按 token 级频率回调，纯内存操作，成本可忽略。
@@ -14,12 +19,15 @@
 //   - [DONE] 哨兵终止语义由上游流的 end/close 事件表达，本模块不特判
 export type RecorderKind = 'chat' | 'responses'
 
-// 最小 chat SSE chunk 结构（只取首 choice 的 delta.content，其余字段忽略）
+// delta 通道：think = 思考/推理过程（reasoning_content），content = 正文
+export type DeltaChannel = 'think' | 'content'
+
+// 最小 chat SSE chunk 结构（只取首 choice 的 delta.content / delta.reasoning_content，其余字段忽略）
 interface ChatSseChunk {
-  choices?: Array<{ delta?: { content?: unknown } }>
+  choices?: Array<{ delta?: { content?: unknown; reasoning_content?: unknown } }>
 }
 
-// 最小 Responses SSE 事件结构（只关心 output_text.delta / output_text.done）
+// 最小 Responses SSE 事件结构（只关心 output_text / reasoning_text / reasoning_summary_text 的 delta / done）
 interface ResponsesSseEvent {
   type?: string
   delta?: unknown
@@ -28,16 +36,19 @@ interface ResponsesSseEvent {
 
 export class AssistantStreamRecorder {
   private readonly kind: RecorderKind
-  private readonly onDelta: (content: string) => void
+  private readonly onDelta: (channel: DeltaChannel, content: string) => void
   // 跨 chunk 累积未换行的字节（单条 SSE 行可能跨多个 chunk）
   private buffer = ''
-  // delta 累加的完整文本
+  // 正文 delta 累加的完整文本
   private content = ''
-  // responses 口径兜底：上游未发 delta 只发 output_text.done（带全文）时的完整文本
+  // 思考 delta 累加的完整文本
+  private reasoning = ''
+  // responses 口径兜底：上游未发 delta 只发 done（带全文）时的完整文本
   private fallbackText = ''
+  private fallbackReasoning = ''
   private finished = false
 
-  constructor(kind: RecorderKind, onDelta: (content: string) => void) {
+  constructor(kind: RecorderKind, onDelta: (channel: DeltaChannel, content: string) => void) {
     this.kind = kind
     this.onDelta = onDelta
   }
@@ -62,12 +73,20 @@ export class AssistantStreamRecorder {
     this.finished = true
   }
 
-  // 累积的完整文本：delta 累加优先，空时回退 responses 的 done 全文
+  // 累积的完整正文：delta 累加优先，空时回退 responses 的 done 全文
   getContent(): string {
     if (this.content !== '') {
       return this.content
     }
     return this.fallbackText
+  }
+
+  // 累积的完整思考文本（无思考内容时为空串；同上 done 全文兜底）
+  getReasoning(): string {
+    if (this.reasoning !== '') {
+      return this.reasoning
+    }
+    return this.fallbackReasoning
   }
 
   isFinished(): boolean {
@@ -98,10 +117,14 @@ export class AssistantStreamRecorder {
   }
 
   private consumeChatChunk(evt: Record<string, unknown>): void {
-    const delta = extractChatDelta(evt)
-    if (delta !== '') {
-      this.content += delta
-      this.onDelta(delta)
+    const { content, reasoning } = extractChatDelta(evt)
+    if (reasoning !== '') {
+      this.reasoning += reasoning
+      this.onDelta('think', reasoning)
+    }
+    if (content !== '') {
+      this.content += content
+      this.onDelta('content', content)
     }
   }
 
@@ -110,20 +133,36 @@ export class AssistantStreamRecorder {
     if (event.type === 'response.output_text.delta') {
       if (typeof event.delta === 'string' && event.delta !== '') {
         this.content += event.delta
-        this.onDelta(event.delta)
+        this.onDelta('content', event.delta)
       }
     } else if (event.type === 'response.output_text.done') {
       // 兜底：仅当未收到任何 delta 时采用 done 的全文（正常上游两者一致，以 delta 累加为准）
       if (this.content === '' && typeof event.text === 'string' && event.text !== '') {
         this.fallbackText = event.text
       }
+    } else if (event.type === 'response.reasoning_text.delta' || event.type === 'response.reasoning_summary_text.delta') {
+      if (typeof event.delta === 'string' && event.delta !== '') {
+        this.reasoning += event.delta
+        this.onDelta('think', event.delta)
+      }
+    } else if (event.type === 'response.reasoning_text.done' || event.type === 'response.reasoning_summary_text.done') {
+      // 思考全文兜底：同 output_text.done 语义（仅未收到任何思考 delta 时采用）
+      if (this.reasoning === '' && typeof event.text === 'string' && event.text !== '') {
+        this.fallbackReasoning = event.text
+      }
     }
   }
 }
 
-// 从 chat SSE chunk 提取首 choice 的增量文本；结构缺失 / 类型不符返回空串（调用方跳过）
-function extractChatDelta(chunk: ChatSseChunk): string {
-  const choice = chunk.choices?.[0]
-  const content = choice?.delta?.content
-  return typeof content === 'string' ? content : ''
+// 从 chat SSE chunk 提取首 choice 的增量正文 / 思考文本；结构缺失 / 类型不符返回空串（调用方跳过）
+// 推理模型（DeepSeek 等）的 reasoning_content 与 content 位于同一 choice，思考片段先于正文到达
+function extractChatDelta(chunk: ChatSseChunk): { content: string; reasoning: string } {
+  const delta = chunk.choices?.[0]?.delta
+  if (delta === undefined || delta === null) {
+    return { content: '', reasoning: '' }
+  }
+  return {
+    content: typeof delta.content === 'string' ? delta.content : '',
+    reasoning: typeof delta.reasoning_content === 'string' ? delta.reasoning_content : '',
+  }
 }

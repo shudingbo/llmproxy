@@ -16,6 +16,9 @@ export interface SessionMessageRow {
   session_key: string
   role: string
   content: string
+  // 推理/思考内容（DeepSeek 等推理模型的 reasoning_content）：assistant 行为模型思考过程，
+  // 请求侧行为客户端回显的历史思考（多数客户端不回显，通常为空串）
+  reasoning: string
   content_hash: string
   created_at: number
 }
@@ -26,6 +29,7 @@ const CREATE_TABLE_SQL = `CREATE TABLE IF NOT EXISTS session_messages (
   session_key  TEXT NOT NULL,
   role         TEXT NOT NULL,
   content      TEXT NOT NULL,
+  reasoning    TEXT NOT NULL DEFAULT '',
   content_hash TEXT NOT NULL,
   created_at   INTEGER NOT NULL
 );`
@@ -43,8 +47,13 @@ export class SessionMessageStore {
   private readonly db: Database.Database
 
   // 预编译语句：better-sqlite3 为同步 API，不使用 async/await
-  private readonly insertDedupStmt: Database.Statement<[string, string, string, string, number, string, string]>
-  private readonly insertStmt: Database.Statement<[string, string, string, string, number]>
+  private readonly insertDedupStmt: Database.Statement<
+    [string, string, string, string, string, number, string, string]
+  >
+  private readonly insertStmt: Database.Statement<[string, string, string, string, string, number]>
+  // 去重回填：同 (session_key, content_hash) 已存在但旧行 reasoning 为空时补写
+  // （客户端多轮对话中后一次才回显 reasoning_content 的场景）
+  private readonly backfillReasoningStmt: Database.Statement<[string, string, string]>
   private readonly listAscStmt: Database.Statement<[string], SessionMessageRow>
   private readonly listDescStmt: Database.Statement<[string, number], SessionMessageRow>
   private readonly countStmt: Database.Statement<[string], { total: number }>
@@ -62,6 +71,11 @@ export class SessionMessageStore {
     // WAL：与 SessionStore / LogStore 等其它连接共用同一 db 文件时读写互不阻塞
     this.db.pragma('journal_mode = WAL')
     this.db.exec(CREATE_TABLE_SQL)
+    // 旧表迁移（0.7.0 早期构建已建表、无 reasoning 列）：缺列时补列，既有行取默认空串
+    const columns = this.db.prepare("PRAGMA table_info('session_messages')").all() as Array<{ name: string }>
+    if (!columns.some((c) => c.name === 'reasoning')) {
+      this.db.exec("ALTER TABLE session_messages ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''")
+    }
     this.db.exec(CREATE_INDEX_KEY_SQL)
     this.db.exec(CREATE_INDEX_DEDUP_SQL)
     this.db.exec(CREATE_INDEX_TIME_SQL)
@@ -69,14 +83,17 @@ export class SessionMessageStore {
     // 去重写入：仅当 (session_key, content_hash) 不存在时插入；
     // INSERT ... SELECT 单语句完成"判定 + 插入"，避免读-写竞态（单进程同步 API 下本就无并发写）
     this.insertDedupStmt = this.db.prepare(
-      `INSERT INTO session_messages (session_key, role, content, content_hash, created_at)
-       SELECT ?, ?, ?, ?, ?
+      `INSERT INTO session_messages (session_key, role, content, reasoning, content_hash, created_at)
+       SELECT ?, ?, ?, ?, ?, ?
        WHERE NOT EXISTS (
          SELECT 1 FROM session_messages WHERE session_key = ? AND content_hash = ?
        )`,
     )
     this.insertStmt = this.db.prepare(
-      'INSERT INTO session_messages (session_key, role, content, content_hash, created_at) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO session_messages (session_key, role, content, reasoning, content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    )
+    this.backfillReasoningStmt = this.db.prepare(
+      "UPDATE session_messages SET reasoning = ? WHERE session_key = ? AND content_hash = ? AND (reasoning IS NULL OR reasoning = '')",
     )
     this.listAscStmt = this.db.prepare(
       'SELECT * FROM session_messages WHERE session_key = ? ORDER BY id ASC',
@@ -94,12 +111,17 @@ export class SessionMessageStore {
     this.selectByIdStmt = this.db.prepare('SELECT * FROM session_messages WHERE id = ?')
   }
 
-  // 去重写入：同会话内同 (role, content) 已存在 → 返回 null（不写不重复）；否则插入并返回新行
-  insertDedup(sessionKey: string, role: string, content: string): SessionMessageRow | null {
+  // 去重写入：同会话内同 (role, content) 已存在 → 返回 null（不写不重复）；否则插入并返回新行。
+  // reasoning 不参与内容哈希（同一逻辑消息有的请求回显思考、有的不回显，不应产生重复行）；
+  // 去重命中但旧行 reasoning 为空、新值非空时回填旧行（多轮对话后一次才回显的场景）
+  insertDedup(sessionKey: string, role: string, content: string, reasoning = ''): SessionMessageRow | null {
     const hash = hashMessage(role, content)
     const now = Date.now()
-    const result = this.insertDedupStmt.run(sessionKey, role, content, hash, now, sessionKey, hash)
+    const result = this.insertDedupStmt.run(sessionKey, role, content, reasoning, hash, now, sessionKey, hash)
     if (result.changes === 0) {
+      if (reasoning !== '') {
+        this.backfillReasoningStmt.run(reasoning, sessionKey, hash)
+      }
       return null
     }
     // lastInsertRowid 类型为 number | bigint（better-sqlite3 大数保护），统一收敛为 number
@@ -107,10 +129,10 @@ export class SessionMessageStore {
   }
 
   // 普通写入（响应侧 assistant 消息用：相同回答也要留痕，不去重）
-  insert(sessionKey: string, role: string, content: string): SessionMessageRow {
+  insert(sessionKey: string, role: string, content: string, reasoning = ''): SessionMessageRow {
     const hash = hashMessage(role, content)
     const now = Date.now()
-    const result = this.insertStmt.run(sessionKey, role, content, hash, now)
+    const result = this.insertStmt.run(sessionKey, role, content, reasoning, hash, now)
     // 理论不可达（刚插入即查）；兜底抛错让调用方走隔离路径
     const row = this.selectByIdStmt.get(Number(result.lastInsertRowid))
     if (row === undefined) {

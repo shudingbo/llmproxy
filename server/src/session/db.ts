@@ -153,7 +153,10 @@ export class SessionStore {
 
   // 列出全部 client 去重值（按字母序）；空库返回 []
   listClients(): SessionClient[] {
-    return Object.values(SessionClient) as SessionClient[];
+    const rows = this.db
+      .prepare('SELECT DISTINCT client FROM sessions ORDER BY client ASC')
+      .all() as Array<{ client: string }>
+    return rows.map((r) => r.client as SessionClient)
   }
 
   // 删除单条记录；返回是否删除成功

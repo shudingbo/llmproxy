@@ -37,16 +37,20 @@ const BASE_CONFIG = {
 
 // /api/show 测试专用配置：候选带 capabilities 与 max_context_length
 // （gpt-4 聚合结果：n_ctx = min(8192) = 8192，capabilities 并集 = [completion, vision, embedding]）
+// store.set 只接受运行时 group 形态（裸数组形态由 admin / loader 层归一化）
 const SHOW_CONFIG: Config = {
   upstreams: [
     { id: 'u1', baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'k1', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
     { id: 'u2', baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'k2', timeoutMs: 5000, disabled: false, responsesApi: 'convert' },
   ],
   downstreamModels: {
-    'gpt-4': [
-      { upstreamId: 'u1', model: 'gpt-4-u1', max_context_length: 8192, capabilities: ['completion', 'vision'] },
-      { upstreamId: 'u2', model: 'gpt-4-u2', capabilities: ['vision', 'embedding'] },
-    ],
+    'gpt-4': {
+      disabled: false,
+      candidates: [
+        { upstreamId: 'u1', model: 'gpt-4-u1', max_context_length: 8192, capabilities: ['completion', 'vision'] },
+        { upstreamId: 'u2', model: 'gpt-4-u2', capabilities: ['vision', 'embedding'] },
+      ],
+    },
   },
 }
 
@@ -352,12 +356,15 @@ describe('Ollama 下游服务', () => {
     const first = await request(app).get('/api/tags')
     expect((first.body as { models: Array<{ name: string }> }).models.map((m) => m.name)).toEqual(['gpt-4'])
 
-    // 管理端新增别名 extra
+    // 管理端新增别名 extra（store.set 只接受运行时 group 形态）
     const current = store.get()
     store.set(
       {
         ...current,
-        downstreamModels: { ...current.downstreamModels, extra: [{ upstreamId: 'u1', model: 'extra-up' }] },
+        downstreamModels: {
+          ...current.downstreamModels,
+          extra: { disabled: false, candidates: [{ upstreamId: 'u1', model: 'extra-up' }] },
+        },
       },
       { source: 'admin' },
     )
@@ -376,10 +383,13 @@ describe('Ollama 下游服务', () => {
         ...current,
         downstreamModels: {
           ...current.downstreamModels,
-          'gpt-4': [
-            { upstreamId: 'u1', model: 'gpt-4-u1', max_context_length: 8192 },
-            { upstreamId: 'u2', model: 'gpt-4-u2' },
-          ],
+          'gpt-4': {
+            disabled: false,
+            candidates: [
+              { upstreamId: 'u1', model: 'gpt-4-u1', max_context_length: 8192 },
+              { upstreamId: 'u2', model: 'gpt-4-u2' },
+            ],
+          },
         },
       },
       { source: 'admin' },
@@ -400,10 +410,13 @@ describe('Ollama 下游服务', () => {
         ...current,
         downstreamModels: {
           ...current.downstreamModels,
-          'gpt-4': [
-            { upstreamId: 'u1', model: 'gpt-4-u1', max_context_length: 8192 },
-            { upstreamId: 'u2', model: 'gpt-4-u2', max_context_length: 16384 },
-          ],
+          'gpt-4': {
+            disabled: false,
+            candidates: [
+              { upstreamId: 'u1', model: 'gpt-4-u1', max_context_length: 8192 },
+              { upstreamId: 'u2', model: 'gpt-4-u2', max_context_length: 16384 },
+            ],
+          },
         },
       },
       { source: 'admin' },

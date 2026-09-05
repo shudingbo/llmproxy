@@ -297,12 +297,15 @@ describe('OpenAI 下游服务', () => {
     const first = await request(app).get('/v1/models')
     expect((first.body as { data: Array<{ id: string }> }).data.map((m) => m.id)).toEqual(['gpt-4'])
 
-    // 管理端新增别名 extra
+    // 管理端新增别名 extra（store.set 只接受运行时 group 形态）
     const current = store.get()
     store.set(
       {
         ...current,
-        downstreamModels: { ...current.downstreamModels, extra: [{ upstreamId: 'u1', model: 'extra-up' }] },
+        downstreamModels: {
+          ...current.downstreamModels,
+          extra: { disabled: false, candidates: [{ upstreamId: 'u1', model: 'extra-up' }] },
+        },
       },
       { source: 'admin' },
     )
@@ -321,10 +324,13 @@ describe('OpenAI 下游服务', () => {
         ...current,
         downstreamModels: {
           ...current.downstreamModels,
-          'gpt-4': [
-            { upstreamId: 'u1', model: 'gpt-4-u1', max_context_length: 8192 },
-            { upstreamId: 'u2', model: 'gpt-4-u2' },
-          ],
+          'gpt-4': {
+            disabled: false,
+            candidates: [
+              { upstreamId: 'u1', model: 'gpt-4-u1', max_context_length: 8192 },
+              { upstreamId: 'u2', model: 'gpt-4-u2' },
+            ],
+          },
         },
       },
       { source: 'admin' },
@@ -345,10 +351,13 @@ describe('OpenAI 下游服务', () => {
         ...current,
         downstreamModels: {
           ...current.downstreamModels,
-          'gpt-4': [
-            { upstreamId: 'u1', model: 'gpt-4-u1', max_context_length: 8192 },
-            { upstreamId: 'u2', model: 'gpt-4-u2', max_context_length: 16384 },
-          ],
+          'gpt-4': {
+            disabled: false,
+            candidates: [
+              { upstreamId: 'u1', model: 'gpt-4-u1', max_context_length: 8192 },
+              { upstreamId: 'u2', model: 'gpt-4-u2', max_context_length: 16384 },
+            ],
+          },
         },
       },
       { source: 'admin' },
@@ -1030,7 +1039,9 @@ describe('OpenAI Responses 原生透传（POST /v1/responses）', () => {
         ...current,
         upstreams: current.upstreams.map((u, i) => ({ ...u, responsesApi: modes[i] ?? 'convert' })),
         downstreamModels: opts.singleCandidate
-          ? { 'gpt-4': [{ upstreamId: 'u1', model: 'gpt-4-u1' }] }
+          ? {
+              'gpt-4': { disabled: false, candidates: [{ upstreamId: 'u1', model: 'gpt-4-u1' }] },
+            }
           : current.downstreamModels,
       },
       { source: 'admin' },

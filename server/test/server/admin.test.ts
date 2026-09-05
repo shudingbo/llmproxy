@@ -303,8 +303,11 @@ describe('上游管理 /admin/api/upstreams', () => {
     const config = store.get()
     // u2 被移除
     expect(config.upstreams.map((u) => u.id)).toEqual(['u1'])
-    // gpt-4 保留剩余候选
-    expect(config.downstreamModels['gpt-4']).toEqual([{ upstreamId: 'u1', model: 'gpt-4-u1' }])
+    // gpt-4 保留剩余候选（运行时下游模型按 group 形态存储）
+    expect(config.downstreamModels['gpt-4']).toEqual({
+      disabled: false,
+      candidates: [{ upstreamId: 'u1', model: 'gpt-4-u1' }],
+    })
     // only-u2 候选被清空 → 别名整体删除
     expect(config.downstreamModels['only-u2']).toBeUndefined()
   })

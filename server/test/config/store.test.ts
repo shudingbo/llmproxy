@@ -8,7 +8,9 @@ import { ConfigSchema, type Config } from '../../src/config/schema.js'
 import { ConfigError } from '../../src/config/loader.js'
 import { ConfigStore } from '../../src/config/store.js'
 
-// 一份完整的配置样本
+// 一份完整的配置样本（downstreamModels 用运行时 group 形态；
+// admins 节必须带可用账号——否则「文件已存在」装载会触发默认管理员自愈，内存态与文件不再相等；
+// auth 与 routing 显式填齐 prefault 默认值，便于 set 后与内存态 toEqual 对齐）
 const sampleConfig: Config = {
   upstreams: [
     {
@@ -21,7 +23,21 @@ const sampleConfig: Config = {
     },
   ],
   downstreamModels: {
-    'gpt-4': [{ upstreamId: 'openai-main', model: 'gpt-4' }],
+    'gpt-4': { disabled: false, candidates: [{ upstreamId: 'openai-main', model: 'gpt-4' }] },
+  },
+  routing: { sessionAffinity: { enabled: true, cleanupMaxAgeMs: 604800000, cleanupIntervalMs: 3600000 } },
+  auth: { enabled: false, keyBytes: 24, cleanupRetentionDays: 7 },
+  admins: {
+    salt: 'c'.repeat(64),
+    accounts: [
+      {
+        username: 'admin',
+        password: 'sample-pw',
+        disabled: false,
+        createdAt: '2020-01-01T00:00:00.000Z',
+        lastLoginAt: null,
+      },
+    ],
   },
 }
 

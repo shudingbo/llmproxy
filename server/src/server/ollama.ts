@@ -14,6 +14,7 @@ import { executeWithFallback, isFallbackableAxiosError } from '../router/fallbac
 import { Router } from '../router/index.js'
 import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
 import { buildUpstreamSessionHeaders, extractSessionKey } from '../session/key.js'
+import { extractChatUsage, recordSessionUsage, SseUsageTap } from '../session/usage.js'
 import type { SessionMonitor } from '../monitor/index.js'
 import type { OpenAIUpstreamClient, UpstreamChatRequest, UpstreamChatResponse } from '../upstream/openai.js'
 import { buildAliasMetaMap, listExposedAliases } from './model-meta.js'
@@ -43,10 +44,12 @@ interface StreamSuccess {
 }
 
 // 非流式成功结果：Ollama 形状响应 + 原始 OpenAI 响应
-// （raw 保留 message.reasoning_content 供监控 tap 提取思考内容；Ollama 形状转换后不含该字段）
+// （raw 保留 message.reasoning_content 与 usage 供 tap 提取；Ollama 形状转换后不含这些字段）
+// startedAt 为成功候选发起请求的 hrtime 时刻（用量统计计时零点）
 interface NonStreamSuccess {
   resp: OllamaChatResponse
   raw: UpstreamChatResponse
+  startedAt: bigint
 }
 
 /**
@@ -84,6 +87,9 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
     }
     onAttempt(info)
   }
+
+  // hrtime 时刻差 → 整数毫秒（用量统计的生成时长 / 首 token 时延口径）
+  const msSince = (startedAt: bigint): number => Math.max(0, Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6))
 
   // 监控 tap：把上游 chat SSE 流挂接 assistant 流式记录器（delta 实时旁路推送，不落库；
   // 流正常结束整条落库，主动 abort 时落已收到的部分并标记 truncated）。
@@ -161,7 +167,7 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
           // OpenAI 响应 → Ollama 非流式响应（model 字段回填下游别名）
           const ollamaResp = convertChatResponse(openaiResp, model)
           reportAttempt(candidate.upstreamId, true, attemptStart, 200)
-          return { ok: true, value: { resp: ollamaResp, raw: openaiResp } }
+          return { ok: true, value: { resp: ollamaResp, raw: openaiResp, startedAt: attemptStart } }
         } catch (err) {
           reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
           return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
@@ -181,6 +187,13 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
           ? result.value.raw.choices[0].message.reasoning_content
           : ''
       monitor?.recordAssistant(ctx.sessionKey, result.value.resp.message?.content ?? '', rawReasoning)
+      // 用量统计：原始 OpenAI 响应的 usage（缺失则记 0）+ 全程耗时（非流式无首 token 概念）
+      recordSessionUsage(
+        deps.sessionStore,
+        ctx.sessionKey,
+        extractChatUsage(result.value.raw),
+        { firstTokenMs: 0, firstTokenMeasured: 0, generationMs: msSince(result.value.startedAt) },
+      )
       res.status(200).json(result.value.resp)
       return
     }
@@ -244,6 +257,12 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
           }
           // 监控 tap：assistant 流式记录（挂接原始 chat SSE 流；NDJSON 转换流不含可复用的 delta 形状）
           attachAssistantRecorder(stream, ctx.sessionKey)
+          // 用量统计 tap：首 token 时延 + 末尾 usage 块（同挂原始 chat SSE 流；NDJSON 流已不可复用）
+          new SseUsageTap({
+            kind: 'chat',
+            startedAt: attemptStart,
+            onDone: (usage, timing) => recordSessionUsage(deps.sessionStore, ctx.sessionKey, usage, timing),
+          }).attach(stream)
           // 转换器只负责挂接上游错误监听；必须由调用方显式 pipe，否则读取侧永不结束
           const ollamaStream = createOpenAIToOllamaStream(stream, model)
           stream.pipe(ollamaStream as unknown as Writable)

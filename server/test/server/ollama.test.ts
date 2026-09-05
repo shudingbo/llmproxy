@@ -100,11 +100,12 @@ let app: Express
 let clients: Map<string, OpenAIUpstreamClient>
 const attempts: Array<{ upstreamId: string; ok: boolean; durationMs: number; status?: number }> = []
 
-// 内存 fake 会话存储：实现 SessionStoreLike（get/touch/bind/rebind）并记录调用，供会话亲和用例断言
+// 内存 fake 会话存储：实现 SessionStoreLike（get/touch/bind/rebind/recordUsage）并记录调用，供会话亲和 / 用量统计用例断言
 class FakeSessionStore implements SessionStoreLike {
   records = new Map<string, { upstream_id: string }>()
   bindCalls: Array<{ sessionKey: string; upstreamId: string; client: string }> = []
   rebindCalls: Array<{ sessionKey: string; upstreamId: string; upstreamModel: string }> = []
+  recordUsageCalls: Array<{ sessionKey: string; record: import('../../src/session/db.js').SessionUsageRecord }> = []
 
   get(sessionKey: string): { upstream_id: string } | undefined {
     const record = this.records.get(sessionKey)
@@ -123,6 +124,11 @@ class FakeSessionStore implements SessionStoreLike {
   rebind(sessionKey: string, upstreamId: string, upstreamModel: string): void {
     this.rebindCalls.push({ sessionKey, upstreamId, upstreamModel })
     this.records.set(sessionKey, { upstream_id: upstreamId })
+  }
+
+  recordUsage(sessionKey: string, record: import('../../src/session/db.js').SessionUsageRecord): boolean {
+    this.recordUsageCalls.push({ sessionKey, record })
+    return true
   }
 }
 
@@ -694,5 +700,76 @@ describe('Ollama 会话亲和路由', () => {
     expect(res2.status).toBe(200)
     expect(hitU1).toBe(1)
     expect(hitU2).toBe(2)
+  })
+})
+
+describe('会话用量统计（token usage 捕获 → recordUsage）', () => {
+  let session: FakeSessionStore
+
+  beforeEach(() => {
+    session = new FakeSessionStore()
+    buildApp(session)
+  })
+
+  it('非流式：原始 OpenAI 响应 usage 累加进会话行（Ollama 形状不含 usage，取 raw）', async () => {
+    const url = await startMock(async (req, res) => {
+      await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-1',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: '你好' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 7, completion_tokens: 9, total_tokens: 16 },
+        }),
+      )
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/api/chat')
+      .set('X-OpenWebUI-Chat-Id', 'chat-ollama-1')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+
+    expect(session.recordUsageCalls).toHaveLength(1)
+    expect(session.recordUsageCalls[0]!.sessionKey).toBe('gpt-4::chat-ollama-1')
+    expect(session.recordUsageCalls[0]!.record).toMatchObject({
+      promptTokens: 7,
+      completionTokens: 9,
+      totalTokens: 16,
+      firstTokenMs: 0,
+      firstTokenMeasured: 0,
+    })
+  })
+
+  it('流式：末尾 usage 块 + 首 token 时延（挂接原始 chat SSE 流）', async () => {
+    const url = await startMock(async (req, res) => {
+      await readBody(req)
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write('data: {"id":"1","choices":[{"delta":{"role":"assistant"}}]}\n\n')
+      res.write('data: {"id":"2","choices":[{"delta":{"content":"你"}}]}\n\n')
+      res.write('data: {"id":"3","choices":[{"delta":{"content":"好"}}]}\n\n')
+      res.write('data: {"id":"4","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":9,"total_tokens":16}}\n\n')
+      res.end('data: [DONE]\n\n')
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/api/chat')
+      .set('X-OpenWebUI-Chat-Id', 'chat-ollama-2')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }], stream: true })
+    expect(res.status).toBe(200)
+    // NDJSON 响应（Ollama 形状），流正常结束
+    expect(res.text).toContain('"done":true')
+
+    expect(session.recordUsageCalls).toHaveLength(1)
+    expect(session.recordUsageCalls[0]!.record).toMatchObject({
+      promptTokens: 7,
+      completionTokens: 9,
+      totalTokens: 16,
+      firstTokenMeasured: 1,
+    })
+    expect(session.recordUsageCalls[0]!.record.firstTokenMs).toBeGreaterThanOrEqual(0)
   })
 })

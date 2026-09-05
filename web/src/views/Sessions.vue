@@ -27,16 +27,16 @@
         stripe
         size="small"
       >
-        <el-table-column label="会话 ID" min-width="70">
+        <el-table-column label="会话 ID" min-width="88">
           <template #default="{ row }">
             <span class="session-id" :title="row.session_id">{{ row.session_id.substring(0, 10) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="会话键" min-width="240">
+        <!-- <el-table-column label="会话键" min-width="240">
           <template #default="{ row }">
             <code class="code" :title="row.session_key">{{ row.session_key.substring(0, 32) }}</code>
           </template>
-        </el-table-column>
+        </el-table-column> -->
         <el-table-column label="Client" width="140">
           <template #default="{ row }">
             <el-tag :type="clientTag(row.client)" :color="clientColor(row.client)" size="small" effect="dark">{{ row.client }}</el-tag>
@@ -61,10 +61,28 @@
         <el-table-column label="更新时间" width="120">
           <template #default="{ row }">{{ formatTime(row.updated_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="150" fixed="right">
+        <el-table-column label="请求数" width="70" align="right">
+          <template #default="{ row }">{{ row.request_count ?? 0 }}</template>
+        </el-table-column>
+        <el-table-column label="输入" width="80" align="right">
+          <template #default="{ row }">{{ formatTokens(row.prompt_tokens) }}</template>
+        </el-table-column>
+        <el-table-column label="输出" width="80" align="right">
+          <template #default="{ row }">{{ formatTokens(row.completion_tokens) }}</template>
+        </el-table-column>
+        <el-table-column label="首token" width="90" align="right">
+          <template #default="{ row }">{{ formatAvgFirstToken(row as SessionRow) }}</template>
+        </el-table-column>
+        <el-table-column label="速率" width="60" align="right">
+          <template #default="{ row }">{{ formatTokenRate(row as SessionRow) }}</template>
+        </el-table-column>
+        <el-table-column label="运行时间" width="90" align="right">
+          <template #default="{ row }">{{ formatRuntime(row as SessionRow) }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="106" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" type="primary" plain @click="openMonitor(row as SessionRow)">探测</el-button>
-            <el-button size="small" type="danger" @click="removeOne(row as SessionRow)">解绑</el-button>
+            <el-button type="primary" :icon="Monitor" circle @click="openMonitor(row as SessionRow)" title="探测" />
+            <el-button type="danger" :icon="Unlock" circle @click="removeOne(row as SessionRow)" title="解绑" />
           </template>
         </el-table-column>
       </el-table>
@@ -93,11 +111,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Brush, Delete, Search } from '@element-plus/icons-vue'
+import { Brush, Delete, Search, Unlock, Monitor } from '@element-plus/icons-vue'
 import { api } from '../api/client'
 import SessionMonitorDrawer from '../components/SessionMonitorDrawer.vue'
 
-// 会话粘附映射行（后端 SQLite 持久化）
+// 会话粘附映射行（后端 SQLite 持久化；统计字段为逐请求累加值，见 server/src/session/db.ts）
 interface SessionRow {
   session_key: string
   session_id: string
@@ -107,6 +125,14 @@ interface SessionRow {
   upstream_model: string
   created_at: number
   updated_at: number
+  // ===== 用量统计（累加值；首 token 时延 / 生成时长按测量次数 / 会话维度前端派生）=====
+  request_count?: number
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+  first_token_ms?: number // 累计首 token 时延（仅流式且收到内容的请求参与）
+  first_token_count?: number // 首 token 测量次数
+  generation_ms?: number // 累计输出生成时长
 }
 
 // 列表响应
@@ -176,6 +202,44 @@ function clientColor(c: string): string | undefined {
 function formatTime(ts: number): string {
   if (!ts) return '-'
   return new Date(ts).toLocaleString()
+}
+
+// token 数：千分位分隔；0 / 缺失 → '-'（上游未返回 usage 的会话）
+function formatTokens(n?: number): string {
+  if (!n || n <= 0) return '-'
+  return n.toLocaleString()
+}
+
+// 首 token（平均 TTFT）：累计首 token 时延 ÷ 测量次数（仅流式且收到内容 delta 的请求被测量；
+// 非流式请求不计入）
+function formatAvgFirstToken(row: SessionRow): string {
+  const count = row.first_token_count ?? 0
+  if (count <= 0) return '-'
+  const ms = (row.first_token_ms ?? 0) / count
+  if (ms < 1000) return `${Math.round(ms)} ms`
+  return `${(ms / 1000).toFixed(1)} s`
+}
+
+// token 速率：累计输出 token ÷ 累计生成时长（流式 = 流结束 − 首 token；非流式 = 全程耗时）
+function formatTokenRate(row: SessionRow): string {
+  const tokens = row.completion_tokens ?? 0
+  const ms = row.generation_ms ?? 0
+  if (tokens <= 0 || ms <= 0) return '-'
+  return `${(tokens / (ms / 1000)).toFixed(1)}`
+}
+
+// 会话运行时间（纯前端计算）：updated_at − created_at（首次请求 → 最近一次活动）
+function formatRuntime(row: SessionRow): string {
+  const ms = (row.updated_at ?? 0) - (row.created_at ?? 0)
+  if (!Number.isFinite(ms) || ms < 0) return '-'
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return s % 60 > 0 ? `${m}m ${s % 60}s` : `${m}m`
+  const h = Math.floor(m / 60)
+  if (h < 24) return m % 60 > 0 ? `${h}h ${m % 60}m` : `${h}h`
+  const d = Math.floor(h / 24)
+  return h % 24 > 0 ? `${d}d ${h % 24}h` : `${d}d`
 }
 
 // 拉取客户端列表（GET /admin/api/session-clients）

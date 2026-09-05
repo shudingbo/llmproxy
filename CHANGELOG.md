@@ -6,6 +6,14 @@
 
 ### 新增
 
+- **会话 token 用量统计（`sessions` 表 7 个统计列 + `/sessions` 页 6 个新列）**：逐请求捕获上游返回的 token 使用统计并累加进会话行——输入 / 输出 token、首 token 时延（TTFT）、token 速率、请求数
+  - **数据来源（直接取自上游响应，不估算）**：非流式取响应体 `usage`（`/api/chat` 取原始 OpenAI 响应）；流式利用网关既有的 `stream_options.include_usage = true` 注入，`SseUsageTap`（`server/src/session/usage.ts`）被动挂接 SSE 流解析末尾 usage 块（不消费流，与 pipe / 监控记录器共存）；Responses 口径取 `response.completed.response.usage`（convert 路径由转换器注入，原生透传取原事件）。四条链路全覆盖：`/v1/chat/completions` 流式 / 非流式、`/v1/responses`（convert / native）流式 / 非流式、`/api/chat` 流式 / 非流式
+  - **首 token 时延**：从成功候选发起（hrtime 零点，回退场景取最终成功那次尝试）到首个携带内容的 delta（正文或思考）；非流式无此概念。**生成时长**：流式 = 流结束 − 首 token，非流式 = 全程耗时
+  - **存储**：`sessions` 表新增 `request_count / prompt_tokens / completion_tokens / total_tokens / first_token_ms / first_token_count / generation_ms` 列（旧库打开时自动 `ALTER TABLE` 迁移，既有行默认 0）。`SessionStore.recordUsage` UPDATE-only 累加（会话已解绑 / 清理不复活）；`bind` 重新绑定时统计重置（新粘附生命周期）。无会话键的请求不记录；上游未返回 usage → 请求仍计数、token 累加 0、收到内容 delta 才记 TTFT
+  - **失败隔离**：DB 写失败仅告警一次，绝不影响业务请求（与日志双写 / 监控同契约）
+  - **前端**：`/sessions` 页新增列——请求数 / 输入 / 输出（千分位）/ 首token（平均 TTFT = `first_token_ms ÷ first_token_count`）/ token速率（`completion_tokens ÷ (generation_ms/1000)`，tok/s）/ **运行时间**（纯前端 `updated_at − created_at` 格式化：d/h/m/s）
+  - **测试**：`test/session/db.test.ts`（recordUsage 累加 / 缺失行 / bind 重置 / 旧库迁移）+ `test/session/usage.test.ts`（usage 提取 / SseUsageTap 双口径 TTFT 与 usage 捕获 / 跨 chunk 行切分 / finish 幂等 / 失败隔离）+ `test/server/openai.test.ts` 与 `test/server/ollama.test.ts`（非流式 / 流式 / responses 转换路径 e2e 累加断言）
+
 - **下行候选思考分离开关（`reasoningSplit`）**：MiniMax M 系列等上游的 OpenAI 兼容端点默认把 `...` 思考标签混在 `content` 字段输出（DeepSeek / Qwen 则走独立 `reasoning_content` 字段），导致透传客户端把思考当普通文本显示。`UpstreamCandidateSchema` 新增候选级 `reasoningSplit?: boolean`（缺省 `false`；模型名可能不规范、无法自动识别，故手工开关）：开启后网关在把请求发给该候选的上游时注入 `reasoning_split: true`（MiniMax 官方参数），思考改经独立字段返回——流式 `delta.reasoning_content` / `delta.reasoning_details`（后者元素 `text` 为**累计全文**），非流式 `message.reasoning_content` / `message.reasoning_details`。
   - **注入路径**：所有打到上游 chat completions 的链路——`/v1/chat/completions` 流式 / 非流式（共享 body 在回退尝试间还原客户端原值，不泄漏注入）、`/v1/responses` 转换路径（流式 / 非流式；转换流不携带思考事件，与既有「转换不保留思考」语义一致，客户端拿到干净正文）、`/api/chat` 流式 / 非流式（Ollama 转换器不透传未知字段，故在 `convertChatRequest` 转换后注入；NDJSON 只取正文，下游客户端拿到干净内容）。对不支持该参数的上游注入无副作用（未知字段被忽略）
   - **思考识别扩展**：`AssistantStreamRecorder`（chat 口径）与 `SessionMonitor`（非流式 `recordChatResponse` / 请求侧 `normalizeMessage`）在既有 `reasoning_content`（增量）之外新增 `reasoning_details[].text`（累计全文，按已累积值做差取增量，快照非已累积文本的延伸时拒绝，防御乱序）——会话探测抽屉与既有 DeepSeek 链路不受影响

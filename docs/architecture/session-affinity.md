@@ -76,25 +76,49 @@ CREATE TABLE IF NOT EXISTS sessions (
   upstream_id      TEXT NOT NULL,      -- 粘附的上游 id
   upstream_model   TEXT NOT NULL,
   created_at       INTEGER NOT NULL,   -- epoch ms
-  updated_at       INTEGER NOT NULL    -- epoch ms
+  updated_at       INTEGER NOT NULL,   -- epoch ms
+  -- 用量统计（逐请求累加，见 recordUsage；捕获口径见 session/usage.ts）
+  request_count     INTEGER NOT NULL DEFAULT 0,  -- 成功请求数（无 usage 的请求也计数）
+  prompt_tokens     INTEGER NOT NULL DEFAULT 0,  -- 累计输入 token
+  completion_tokens INTEGER NOT NULL DEFAULT 0,  -- 累计输出 token
+  total_tokens      INTEGER NOT NULL DEFAULT 0,  -- 累计总 token
+  first_token_ms    INTEGER NOT NULL DEFAULT 0,  -- 累计首 token 时延（仅流式且收到内容 delta 的请求）
+  first_token_count INTEGER NOT NULL DEFAULT 0,  -- 首 token 测量次数（前端算平均 TTFT）
+  generation_ms     INTEGER NOT NULL DEFAULT 0   -- 累计输出生成时长（前端算 token 速率）
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
 ```
+
+旧版本构建已建的 `sessions` 表打开时自动 `ALTER TABLE ADD COLUMN` 补齐统计列（既有行取默认 0）。
 
 操作原语（better-sqlite3 同步 API + 预编译语句）：
 
 | 方法 | SQL 语义 | 说明 |
 | --- | --- | --- |
 | `get(sessionKey)` | `SELECT * WHERE session_key = ?` | 不存在返回 undefined |
-| `bind(sessionKey, info)` | `INSERT OR REPLACE` | 覆盖式写入，created_at / updated_at 均 now |
+| `bind(sessionKey, info)` | `INSERT OR REPLACE` | 覆盖式写入，created_at / updated_at 均 now；统计列随整体替换重置为 0（新粘附生命周期） |
 | `touch(sessionKey)` | `UPDATE ... SET updated_at = now` | 仅刷新更新时间；记录不存在返回 false |
 | `rebind(sessionKey, upstreamId, upstreamModel)` | `UPDATE ... SET upstream_id, upstream_model, updated_at = now` | 改绑到实际成功上游；不存在则静默忽略 |
+| `recordUsage(sessionKey, record)` | `UPDATE ... SET request_count = request_count + 1, 统计列 += ?` | 一次成功请求的用量累加；UPDATE-only，行不存在（已解绑/清理）返回 false 且不复活 |
 | `list({offset, limit, client?, keyword?})` | `ORDER BY updated_at DESC LIMIT ? OFFSET ?` + `COUNT(*)` | client 精确匹配，keyword 模糊匹配 session_id / upstream_id；total 不含分页 |
 | `delete(sessionKey)` | `DELETE WHERE session_key = ?` | 返回是否删除成功 |
 | `clear()` | `DELETE FROM sessions` | 清空整表，返回条数 |
 | `cleanup(maxAgeMs)` | `DELETE WHERE updated_at < now - maxAgeMs` | 过期清理原语（调度由装配层负责） |
 
-路由层只消费 `SessionStoreLike` 最小接口（`get / touch / bind / rebind`），不直接碰 SQLite。
+路由层只消费 `SessionStoreLike` 最小接口（`get / touch / bind / rebind` + 可选 `recordUsage`），不直接碰 SQLite。
+用量捕获与累加由 `session/usage.ts` 负责（详见下文「用量统计」）。
+
+### 用量统计（`session/usage.ts`）
+
+上游响应直接携带 token 使用统计，网关被动捕获、**逐会话累加**进 `sessions` 表（无会话键的请求不记录）：
+
+- **非流式**：响应体 `usage` 字段（`/api/chat` 取原始 OpenAI 响应的 `usage`）。
+- **流式**：网关已向上游注入 `stream_options.include_usage = true`，兼容上游在流末尾补发带 `usage` 的最终块；`SseUsageTap` 被动挂接 SSE 流的 `data` 事件（与 pipe / 监控记录器共存，不消费流）。Responses 口径取 `response.completed` 事件内的 `response.usage`（convert 路径由转换器注入，见 `converters/responses-stream.ts`）。
+- **首 token 时延（TTFT）**：流式请求从成功候选发起（hrtime 零点）到首个携带内容的 delta（正文或思考）的耗时；非流式无此概念。
+- **生成时长**：流式 = 流结束 − 首 token；非流式 = 全程耗时。
+- **降级**：上游未返回 usage（或流在 usage 块到达前中断）→ `request_count` 仍 +1、token 累加 0、收到过内容 delta 才记 TTFT。
+- **失败隔离**：DB 写失败仅告警一次，绝不影响业务请求（与日志双写 / 监控同契约）。
+- 前端 `/sessions` 页展示：请求数 / 输入 / 输出 / 首token（平均 TTFT = `first_token_ms ÷ first_token_count`）/ token速率（`completion_tokens ÷ (generation_ms/1000)`）/ 运行时间（纯前端 `updated_at − created_at`）。
 
 ## 4. 路由决策（`router/load-balancer.ts`）
 

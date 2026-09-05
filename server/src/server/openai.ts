@@ -13,12 +13,15 @@ import { executeWithFallback, isFallbackableAxiosError } from '../router/fallbac
 import { Router } from '../router/index.js'
 import type { LoadBalancer, SessionStoreLike } from '../router/load-balancer.js'
 import { buildUpstreamSessionHeaders, extractSessionKey } from '../session/key.js'
+import { extractChatUsage, extractResponsesUsage, recordSessionUsage, SseUsageTap } from '../session/usage.js'
 import type { SessionMonitor } from '../monitor/index.js'
 import type {
   OpenAIUpstreamClient,
   UpstreamChatRequest,
   UpstreamEmbeddingsRequest,
+  UpstreamEmbeddingsResponse,
   UpstreamRerankRequest,
+  UpstreamRerankResponse,
   UpstreamResponsesRequest,
 } from '../upstream/openai.js'
 import { buildAliasMetaMap, listExposedAliases } from './model-meta.js'
@@ -40,27 +43,39 @@ export interface OpenAIDeps {
   authMiddleware?: (req: Request, res: Response, next: () => void) => void
 }
 
-// 非流式成功响应的包络：上游客户端只暴露响应体（axios 非 2xx 即抛错），status 恒为 2xx
+// 非流式成功响应的包络：上游客户端只暴露响应体（axios 非 2xx 即抛错），status 恒为 2xx；
+// startedAt 为成功候选发起请求的 hrtime 时刻（用量统计的生成时长零点）
 interface ChatSuccess {
   status: number
   headers: Record<string, string>
   data: unknown
+  startedAt: bigint
 }
 
 // /v1/responses 非流式成功结果：data 为对外的 responses 对象（原生透传 / 转换产物），
 // rawChat 为 convert 路径的原始 chat 响应——转换器以简单可靠为准会丢弃 reasoning_content 等附加字段，
-// 监控 tap 凭它保留思考内容（原生路径无此字段）
+// 监控 tap 凭它保留思考内容（原生路径无此字段）；startedAt 供用量统计计时
 interface ResponsesNonStreamSuccess {
   status: number
   headers: Record<string, string>
   data: unknown
   rawChat?: unknown
+  startedAt: bigint
 }
 
-// 流式成功结果：上游 SSE 流 + 拆线函数
+// 流式成功结果：上游 SSE 流 + 拆线函数 + 成功候选发起请求的 hrtime 时刻（用量统计 TTFT 零点）
 interface StreamSuccess {
   stream: Readable
   abort: () => void
+  startedAt: bigint
+}
+
+// embeddings / rerank 非流式透传的成功包络：无会话语义（不写 sessions 表、不做用量统计），
+// 故不需要 startedAt（与 ChatSuccess 区分）
+interface PlainSuccess<TData> {
+  status: number
+  headers: Record<string, string>
+  data: TData
 }
 
 /**
@@ -99,6 +114,24 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       info.status = status
     }
     onAttempt(info)
+  }
+
+  // hrtime 时刻差 → 整数毫秒（用量统计的生成时长 / 首 token 时延口径）
+  const msSince = (startedAt: bigint): number => Math.max(0, Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6))
+
+  // 流式用量统计 tap：被动挂接 SSE 流（首 token 时延 + 末尾 usage 块），流结束后累加进会话行。
+  // store / sessionKey 缺失时 recordSessionUsage 内部 no-op，这里无条件挂接（解析开销可忽略）
+  const attachUsageTap = (
+    stream: Readable,
+    sessionKey: string | undefined,
+    kind: 'chat' | 'responses',
+    startedAt: bigint,
+  ): void => {
+    new SseUsageTap({
+      kind,
+      startedAt,
+      onDone: (usage, timing) => recordSessionUsage(deps.sessionStore, sessionKey, usage, timing),
+    }).attach(stream)
   }
 
   // 监控 tap：把上游 SSE 流挂接 assistant 流式记录器（delta 实时旁路推送，不落库；
@@ -190,7 +223,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
         try {
           const data = await client.chatCompletion(body as UpstreamChatRequest, { signal, headers: sessionHeaders })
           reportAttempt(candidate.upstreamId, true, attemptStart, 200)
-          return { ok: true, value: { status: 200, headers: {}, data } }
+          return { ok: true, value: { status: 200, headers: {}, data, startedAt: attemptStart } }
         } catch (err) {
           reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
           return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
@@ -206,6 +239,13 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     if (result.ok && result.value) {
       // 监控 tap：非流式 assistant 回答整条落库 + 推送
       monitor?.recordChatResponse(ctx.sessionKey, result.value.data)
+      // 用量统计：响应体 usage（缺失则记 0）+ 全程耗时（非流式无首 token 概念）
+      recordSessionUsage(
+        deps.sessionStore,
+        ctx.sessionKey,
+        extractChatUsage(result.value.data),
+        { firstTokenMs: 0, firstTokenMeasured: 0, generationMs: msSince(result.value.startedAt) },
+      )
       res.status(result.value.status).json(result.value.data)
       return
     }
@@ -271,7 +311,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
             return { ok: false, error: connectErr, fallbackable: isFallbackableAxiosError(connectErr) }
           }
           reportAttempt(candidate.upstreamId, true, attemptStart)
-          return { ok: true, value: { stream, abort } }
+          return { ok: true, value: { stream, abort, startedAt: attemptStart } }
         } catch (err) {
           reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
           return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
@@ -291,6 +331,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     const { stream, abort } = result.value
     // 监控 tap：assistant 流式记录（delta 实时推送，流结束 / 中断后整条落库）
     attachAssistantRecorder(stream, ctx.sessionKey, 'chat')
+    // 用量统计 tap：首 token 时延 + 末尾 usage 块（被动挂接，与 pipe / 监控记录器共存）
+    attachUsageTap(stream, ctx.sessionKey, 'chat', result.value.startedAt)
     // SSE 响应头必须在首字节之前设置
     res.setHeader('Content-Type', 'text/event-stream')
     res.setHeader('Cache-Control', 'no-cache')
@@ -380,7 +422,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
                 }
               }
               reportAttempt(candidate.upstreamId, true, attemptStart)
-              return { ok: true, value: { stream, abort } }
+              return { ok: true, value: { stream, abort, startedAt: attemptStart } }
             } catch (err) {
               reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
               return {
@@ -416,11 +458,12 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
               reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(connectErr))
               return { ok: false, error: connectErr, fallbackable: isFallbackableAxiosError(connectErr) }
             }
-            // chat SSE 流 → responses SSE 事件流（转换器内部挂接上游 error 监听）
+            // chat SSE 流 → responses SSE 事件流（转换器内部挂接上游 error 监听；
+            // usage 由转换器捕获后注入 response.completed，tap 按 responses 口径统一消费）
             const responsesStream = createResponsesStream(stream, model)
             stream.pipe(responsesStream as unknown as Writable)
             reportAttempt(candidate.upstreamId, true, attemptStart)
-            return { ok: true, value: { stream: responsesStream, abort } }
+            return { ok: true, value: { stream: responsesStream, abort, startedAt: attemptStart } }
           } catch (err) {
             reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
             return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
@@ -441,6 +484,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       // 监控 tap：assistant 流式记录——原生透传流与转换流（createResponsesStream）同为
       // Responses SSE 事件流，统一用 'responses' 口径解析 output_text.delta
       attachAssistantRecorder(stream, ctx.sessionKey, 'responses')
+      // 用量统计 tap：首 token 时延（首个 output_text / reasoning_text delta）+ response.completed 内 usage
+      attachUsageTap(stream, ctx.sessionKey, 'responses', result.value.startedAt)
       // SSE 响应头必须在首字节之前设置（原生透传流与转换流共用同一输出管道，直接 pipe）
       res.setHeader('Content-Type', 'text/event-stream')
       res.setHeader('Cache-Control', 'no-cache')
@@ -486,7 +531,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
               { signal, headers: sessionHeaders },
             )
             reportAttempt(candidate.upstreamId, true, attemptStart, 200)
-            return { ok: true, value: { status: 200, headers: {}, data } }
+            return { ok: true, value: { status: 200, headers: {}, data, startedAt: attemptStart } }
           } catch (err) {
             reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
             // 决策 6/7：透传 404 → 视为该上游实际不支持 → 可回退；其余沿用 isFallbackableAxiosError
@@ -510,8 +555,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
           // chat 响应 → responses 响应对象（model 用下游别名，与 /v1/chat/completions 一致）
           const responsesBody = chatResponseToResponses(data, model)
           reportAttempt(candidate.upstreamId, true, attemptStart, 200)
-          // rawChat：保留原始 chat 响应供监控 tap 提取 reasoning_content（转换产物不含思考）
-          return { ok: true, value: { status: 200, headers: {}, data: responsesBody, rawChat: data } }
+          // rawChat：保留原始 chat 响应供监控 tap 提取 reasoning_content 与 usage（转换产物不含该字段）
+          return { ok: true, value: { status: 200, headers: {}, data: responsesBody, rawChat: data, startedAt: attemptStart } }
         } catch (err) {
           reportAttempt(candidate.upstreamId, false, attemptStart, extractErrorStatus(err))
           return { ok: false, error: err, fallbackable: isFallbackableAxiosError(err) }
@@ -535,6 +580,20 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
       } else {
         monitor?.recordChatResponse(ctx.sessionKey, data)
       }
+      // 用量统计：usage 与监控同口径分流——convert 取原始 chat 响应（usage 为 chat 字段名），
+      // 原生透传取 responses 对象（usage 为 input_tokens / output_tokens 字段名）
+      const usage =
+        result.value.rawChat !== undefined
+          ? extractChatUsage(result.value.rawChat)
+          : data !== null && typeof data === 'object' && (data as Record<string, unknown>).object === 'response'
+            ? extractResponsesUsage(data)
+            : extractChatUsage(data)
+      recordSessionUsage(
+        deps.sessionStore,
+        ctx.sessionKey,
+        usage,
+        { firstTokenMs: 0, firstTokenMeasured: 0, generationMs: msSince(result.value.startedAt) },
+      )
       res.status(result.value.status).json(result.value.data)
       return
     }
@@ -560,7 +619,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     // ctx 缺省 sessionKey/client：无会话键 → 走轮询兜底，会话亲和均衡器也不会 bind/touch/rebind
     const ctx = { downstreamModel: model, sessionKey: undefined, client: undefined }
     // 省略第 5 个 onSuccess 参数：无会话键，无需 rebind
-    const result = await executeWithFallback<ChatSuccess>(
+    const result = await executeWithFallback<PlainSuccess<UpstreamEmbeddingsResponse>>(
       candidates,
       loadBalancer,
       ctx,
@@ -618,7 +677,7 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     // ctx 缺省 sessionKey/client：无会话键 → 走轮询兜底，会话亲和均衡器也不会 bind/touch/rebind
     const ctx = { downstreamModel: model, sessionKey: undefined, client: undefined }
     // 省略第 5 个 onSuccess 参数：无会话键，无需 rebind
-    const result = await executeWithFallback<ChatSuccess>(
+    const result = await executeWithFallback<PlainSuccess<UpstreamRerankResponse>>(
       candidates,
       loadBalancer,
       ctx,

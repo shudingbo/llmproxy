@@ -80,12 +80,13 @@ let app: Express
 let clients: Map<string, OpenAIUpstreamClient>
 const attempts: Array<{ upstreamId: string; ok: boolean; durationMs: number; status?: number }> = []
 
-// 内存 fake 会话存储：实现 SessionStoreLike（get/touch/bind/rebind）并记录调用，供会话亲和用例断言
+// 内存 fake 会话存储：实现 SessionStoreLike（get/touch/bind/rebind/recordUsage）并记录调用，供会话亲和 / 用量统计用例断言
 class FakeSessionStore implements SessionStoreLike {
   records = new Map<string, { upstream_id: string }>()
   bindCalls: Array<{ sessionKey: string; upstreamId: string; client: string }> = []
   rebindCalls: Array<{ sessionKey: string; upstreamId: string; upstreamModel: string }> = []
   touchCalls: string[] = []
+  recordUsageCalls: Array<{ sessionKey: string; record: import('../../src/session/db.js').SessionUsageRecord }> = []
 
   get(sessionKey: string): { upstream_id: string } | undefined {
     const record = this.records.get(sessionKey)
@@ -105,6 +106,11 @@ class FakeSessionStore implements SessionStoreLike {
   rebind(sessionKey: string, upstreamId: string, upstreamModel: string): void {
     this.rebindCalls.push({ sessionKey, upstreamId, upstreamModel })
     this.records.set(sessionKey, { upstream_id: upstreamId })
+  }
+
+  recordUsage(sessionKey: string, record: import('../../src/session/db.js').SessionUsageRecord): boolean {
+    this.recordUsageCalls.push({ sessionKey, record })
+    return true
   }
 }
 
@@ -1732,5 +1738,169 @@ describe('POST /rerank 与 /v1/rerank', () => {
     expect(captured).toEqual({ ...body, model: 'gpt-4-u1' })
     expect(attempts).toHaveLength(1)
     expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: true })
+  })
+})
+
+describe('会话用量统计（token usage 捕获 → recordUsage）', () => {
+  let session: FakeSessionStore
+
+  beforeEach(() => {
+    session = new FakeSessionStore()
+    buildApp(session)
+  })
+
+  it('非流式：响应体 usage 累加进会话行（token 原样、无 TTFT、生成时长 = 全程耗时）', async () => {
+    const url = await startMock(async (req, res) => {
+      await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-1',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: '你好' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+        }),
+      )
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/chat/completions')
+      .set('X-OpenWebUI-Chat-Id', 'chat-usage-1')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+
+    // 会话键 = `${model}::${header 值}`；恰好一次累加
+    expect(session.recordUsageCalls).toHaveLength(1)
+    expect(session.recordUsageCalls[0]!.sessionKey).toBe('gpt-4::chat-usage-1')
+    expect(session.recordUsageCalls[0]!.record).toMatchObject({
+      promptTokens: 10,
+      completionTokens: 20,
+      totalTokens: 30,
+      firstTokenMs: 0,
+      firstTokenMeasured: 0,
+    })
+    expect(session.recordUsageCalls[0]!.record.generationMs).toBeGreaterThanOrEqual(0)
+  })
+
+  it('非流式：上游未返回 usage → token 记 0 但仍计数（request_count +1）', async () => {
+    const url = await startMock(async (req, res) => {
+      await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-1',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: '你好' }, finish_reason: 'stop' }],
+        }),
+      )
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/chat/completions')
+      .set('X-OpenWebUI-Chat-Id', 'chat-usage-2')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+
+    expect(session.recordUsageCalls).toHaveLength(1)
+    expect(session.recordUsageCalls[0]!.record).toMatchObject({
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      firstTokenMs: 0,
+      firstTokenMeasured: 0,
+    })
+  })
+
+  it('流式：末尾 usage 块 + 首 token 时延（首个内容 delta 被测量）', async () => {
+    const url = await startMock(async (req, res) => {
+      await readBody(req)
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write('data: {"id":"1","choices":[{"delta":{"role":"assistant"}}]}\n\n')
+      res.write('data: {"id":"2","choices":[{"delta":{"content":"你"}}]}\n\n')
+      res.write('data: {"id":"3","choices":[{"delta":{"content":"好"}}]}\n\n')
+      res.write('data: {"id":"4","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}\n\n')
+      res.end('data: [DONE]\n\n')
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/chat/completions')
+      .set('X-OpenWebUI-Chat-Id', 'chat-usage-3')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }], stream: true })
+    expect(res.status).toBe(200)
+    expect(res.text).toContain('data: [DONE]')
+
+    expect(session.recordUsageCalls).toHaveLength(1)
+    expect(session.recordUsageCalls[0]!.record).toMatchObject({
+      promptTokens: 10,
+      completionTokens: 20,
+      totalTokens: 30,
+      firstTokenMeasured: 1,
+    })
+    expect(session.recordUsageCalls[0]!.record.firstTokenMs).toBeGreaterThanOrEqual(0)
+    expect(session.recordUsageCalls[0]!.record.generationMs).toBeGreaterThanOrEqual(0)
+  })
+
+  it('流式：无 usage 块（上游不支持 include_usage）→ token 记 0、TTFT 仍测量', async () => {
+    const url = await startMock(async (req, res) => {
+      await readBody(req)
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write('data: {"id":"1","choices":[{"delta":{"content":"你"}}]}\n\n')
+      res.end('data: [DONE]\n\n')
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/chat/completions')
+      .set('X-OpenWebUI-Chat-Id', 'chat-usage-4')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }], stream: true })
+    expect(res.status).toBe(200)
+
+    expect(session.recordUsageCalls).toHaveLength(1)
+    expect(session.recordUsageCalls[0]!.record).toMatchObject({
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      firstTokenMeasured: 1,
+    })
+  })
+
+  it('/v1/responses 转换路径：usage 取自原始 chat 响应（input/output 归一化）', async () => {
+    const url = await startMock(async (req, res) => {
+      // convert 模式：只打 /chat/completions（/responses 端点返回 404 防误用）
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
+      await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-1',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: '你好' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 12, completion_tokens: 34, total_tokens: 46 },
+        }),
+      )
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/responses')
+      .set('X-OpenWebUI-Chat-Id', 'chat-usage-5')
+      .send({ model: 'gpt-4', input: '你好' })
+    expect(res.status).toBe(200)
+    expect((res.body as { object?: string }).object).toBe('response')
+
+    expect(session.recordUsageCalls).toHaveLength(1)
+    expect(session.recordUsageCalls[0]!.record).toMatchObject({
+      promptTokens: 12,
+      completionTokens: 34,
+      totalTokens: 46,
+      firstTokenMeasured: 0,
+    })
   })
 })

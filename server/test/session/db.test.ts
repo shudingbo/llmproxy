@@ -236,4 +236,110 @@ describe('SessionStore', () => {
       reopened.close()
     }
   })
+
+  it('bind 后统计列初始为 0（新会话无任何用量）', () => {
+    const key = 'gpt-4o::chat-uuid-1'
+    store.bind(key, makeInfo())
+    const row = store.get(key)!
+    expect(row.request_count).toBe(0)
+    expect(row.prompt_tokens).toBe(0)
+    expect(row.completion_tokens).toBe(0)
+    expect(row.total_tokens).toBe(0)
+    expect(row.first_token_ms).toBe(0)
+    expect(row.first_token_count).toBe(0)
+    expect(row.generation_ms).toBe(0)
+  })
+
+  it('recordUsage：多次累加（request_count 恒 +1，token / 首 token / 生成时长按值累加）', () => {
+    const key = 'gpt-4o::chat-uuid-1'
+    store.bind(key, makeInfo())
+
+    // 流式请求：有 usage + 有 TTFT
+    expect(store.recordUsage(key, { promptTokens: 10, completionTokens: 20, totalTokens: 30, firstTokenMs: 150, firstTokenMeasured: 1, generationMs: 2000 })).toBe(true)
+    // 非流式请求：有 usage、无 TTFT（firstTokenMs=0 / measured=0）
+    expect(store.recordUsage(key, { promptTokens: 5, completionTokens: 8, totalTokens: 13, firstTokenMs: 0, firstTokenMeasured: 0, generationMs: 800 })).toBe(true)
+    // 无 usage 的请求（上游未返回）：token 全 0，仍计数
+    expect(store.recordUsage(key, { promptTokens: 0, completionTokens: 0, totalTokens: 0, firstTokenMs: 0, firstTokenMeasured: 0, generationMs: 100 })).toBe(true)
+
+    const row = store.get(key)!
+    expect(row.request_count).toBe(3)
+    expect(row.prompt_tokens).toBe(15)
+    expect(row.completion_tokens).toBe(28)
+    expect(row.total_tokens).toBe(43)
+    // 首 token 只累加测量过的请求（第 1 次 150ms），测量次数 = 1
+    expect(row.first_token_ms).toBe(150)
+    expect(row.first_token_count).toBe(1)
+    expect(row.generation_ms).toBe(2900)
+  })
+
+  it('recordUsage：会话不存在 → 返回 false 且不复活记录', () => {
+    expect(store.recordUsage('gpt-4o::no-such-key', { promptTokens: 1, completionTokens: 1, totalTokens: 2, firstTokenMs: 0, firstTokenMeasured: 0, generationMs: 10 })).toBe(false)
+    expect(store.get('gpt-4o::no-such-key')).toBeUndefined()
+  })
+
+  it('bind（重新绑定）→ 统计列重置为 0（新粘附生命周期不继承旧统计）', () => {
+    const key = 'gpt-4o::chat-uuid-1'
+    store.bind(key, makeInfo())
+    store.recordUsage(key, { promptTokens: 10, completionTokens: 20, totalTokens: 30, firstTokenMs: 150, firstTokenMeasured: 1, generationMs: 2000 })
+    expect(store.get(key)!.request_count).toBe(1)
+
+    // 同键重新绑定（如粘附上游被删除后重选）
+    store.bind(key, makeInfo({ upstreamId: 'up-2', upstreamModel: 'gpt-4o-turbo' }))
+    const row = store.get(key)!
+    expect(row.upstream_id).toBe('up-2')
+    expect(row.request_count).toBe(0)
+    expect(row.prompt_tokens).toBe(0)
+    expect(row.completion_tokens).toBe(0)
+    expect(row.total_tokens).toBe(0)
+    expect(row.first_token_ms).toBe(0)
+    expect(row.first_token_count).toBe(0)
+    expect(row.generation_ms).toBe(0)
+  })
+
+  it('旧库迁移：无统计列的 sessions 表打开后自动补列（既有行取默认 0）', () => {
+    // 销毁 beforeEach 建的 15 列表，用旧版建表语句（无统计列）造一个旧库并写入一条记录
+    store.close() // 原 store 已在测试开头关闭，afterEach 的重复 close 被 try/catch 吞掉
+    const legacy = new Database(dbPath)
+    try {
+      legacy.exec('DROP TABLE IF EXISTS sessions')
+      legacy.exec(
+        `CREATE TABLE sessions (
+           session_key      TEXT PRIMARY KEY,
+           session_id       TEXT NOT NULL,
+           client           TEXT NOT NULL,
+           downstream_model TEXT NOT NULL,
+           upstream_id      TEXT NOT NULL,
+           upstream_model   TEXT NOT NULL,
+           created_at       INTEGER NOT NULL,
+           updated_at       INTEGER NOT NULL
+         )`,
+      )
+      legacy
+        .prepare('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run('gpt-4o::legacy-1', 'legacy-1', 'open-webui', 'gpt-4o', 'up-1', 'gpt-4o-azure', 1, 2)
+    } finally {
+      legacy.close()
+    }
+
+    // SessionStore 打开旧库 → 补列；既有行统计取默认 0 且可继续累加
+    const migrated = new SessionStore(dbPath)
+    try {
+      const row = migrated.get('gpt-4o::legacy-1')!
+      expect(row.request_count).toBe(0)
+      expect(row.prompt_tokens).toBe(0)
+      expect(
+        migrated.recordUsage('gpt-4o::legacy-1', {
+          promptTokens: 7,
+          completionTokens: 9,
+          totalTokens: 16,
+          firstTokenMs: 0,
+          firstTokenMeasured: 0,
+          generationMs: 50,
+        }),
+      ).toBe(true)
+      expect(migrated.get('gpt-4o::legacy-1')!.total_tokens).toBe(16)
+    } finally {
+      migrated.close()
+    }
+  })
 })

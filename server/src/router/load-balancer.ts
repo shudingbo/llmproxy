@@ -2,7 +2,7 @@
 // 接口预留扩展点（加权 / 健康检查等），当前实现纯内存的轮询（Round Robin）与会话亲和（Session Affinity）两种策略
 // 计数只保存在内存中：不落盘、无随机、无加权、无外部状态
 import type { UpstreamCandidate } from '../config/schema.js'
-import type { SessionBindInfo } from '../session/db.js'
+import type { SessionBindInfo, SessionUsageRecord } from '../session/db.js'
 
 /**
  * 请求上下文：
@@ -66,6 +66,8 @@ export interface SessionStoreLike {
   bind(sessionKey: string, info: SessionBindInfo): void
   // 改绑上游：请求回退成功后实际成功上游 ≠ 首选时，调用方把会话粘附改绑到成功上游
   rebind(sessionKey: string, upstreamId: string, upstreamModel: string): void
+  // 可选：用量统计累加（session/usage.ts 在成功请求后调用；均衡器不需要，测试 fake 可缺省）
+  recordUsage?(sessionKey: string, record: SessionUsageRecord): boolean
 }
 
 /**

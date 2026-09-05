@@ -91,6 +91,23 @@ describe('SessionMonitor', () => {
       expect(pushed[1]).toMatchObject({ role: 'user', content: '新问题', reasoning: '' })
     })
 
+    it('reasoning_details：请求侧思考数组（MiniMax reasoning_split 形态）多元素拼接后落库', () => {
+      const key = 'gpt-4::s3d'
+      const { events, unsubscribe } = messages(key, monitor)
+      monitor.recordRequest(key, [
+        {
+          role: 'assistant',
+          content: '历史回答',
+          reasoning_details: [{ text: '思考一' }, { text: '思考二' }],
+        },
+        { role: 'user', content: '新问题' },
+      ])
+      unsubscribe()
+      expect(monitor.list(key)[0].reasoning).toBe('思考一思考二')
+      const pushed = events.filter((e) => e.type === 'message')
+      expect(pushed[0]).toMatchObject({ role: 'assistant', content: '历史回答', reasoning: '思考一思考二' })
+    })
+
     it('多模态 content 数组 / 缺失 content：归一化为 JSON 字符串 / 空串', () => {
       const key = 'gpt-4::s2'
       monitor.recordRequest(key, [
@@ -258,6 +275,36 @@ describe('SessionMonitor', () => {
       expect(monitor.list(key)).toHaveLength(1)
       expect(monitor.list(key)[0]).toMatchObject({ content: '回答', reasoning: '推理过程' })
       expect(events.some((e) => e.type === 'message' && e.reasoning === '推理过程')).toBe(true)
+    })
+
+    it('recordChatResponse：reasoning_details 思考数组（MiniMax reasoning_split 形态）拼接后落库；reasoning_content 优先', () => {
+      const key = 'gpt-4::s3d'
+      const { unsubscribe } = messages(key, monitor)
+      monitor.recordChatResponse(key, {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: '回答',
+              reasoning_details: [{ text: '思考一' }, { text: '思考二' }],
+            },
+          },
+        ],
+      })
+      monitor.recordChatResponse(key, {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: '回答2',
+              reasoning_content: '增量思考',
+              reasoning_details: [{ text: '不该被采用' }],
+            },
+          },
+        ],
+      })
+      unsubscribe()
+      expect(monitor.list(key).map((r) => r.reasoning)).toEqual(['思考一思考二', '增量思考'])
     })
 
     it('recordAssistant：正文空但思考非空 → 落库（思考留痕）', () => {

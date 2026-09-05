@@ -35,6 +35,11 @@ export const UpstreamSchema = z.object({
  * - capabilities：该候选对外宣称的能力集合（任意字符串，无枚举约束，兼容 Ollama 生态扩展）；
  *   常用约定值：completion（文本补全）/ vision（图像输入）/ embedding（向量化）/
  *   tools（工具调用）/ reasoning（推理）等；别名聚合时取各候选并集，缺省即未设置
+ * - reasoningSplit：思考分离开关，缺省 false。开启后网关向该候选的上游请求注入
+ *   `reasoning_split: true`（MiniMax 官方参数）：思考内容经独立的 reasoning_content /
+ *   reasoning_details 字段返回，而非以 ... 标签混入 content。
+ *   模型名可能不规范、无法自动识别，故做成候选级手工开关；
+ *   对不支持该参数的上游（如 DeepSeek）注入无副作用（未知字段被忽略）
  *
  * 注：「关停单个候选」语义已移除，需要暂禁某条候选时改为：上游 disabled（统一关停）
  * 或在 Models 页面把该候选删除；候选级粒度在三层开关模型下不直观，已收敛。
@@ -44,6 +49,7 @@ export const UpstreamCandidateSchema = z.object({
   model: z.string(),
   max_context_length: z.number().int().positive().nullable().optional(),
   capabilities: z.array(z.string()).optional(),
+  reasoningSplit: z.boolean().optional(),
 })
 
 /**

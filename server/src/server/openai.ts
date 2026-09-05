@@ -128,6 +128,25 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     return typeof status === 'number' ? status : undefined
   }
 
+  // 按候选的思考分离开关改写请求体中的 reasoning_split：
+  // - 候选 reasoningSplit === true → 强制 true（MiniMax 等上游改经独立的
+  //   reasoning_content / reasoning_details 字段返回思考，而非以 ... 标签混入 content）
+  // - 开关未开 → 还原客户端原值。body 在回退的多轮尝试间共享，
+  //   前一个候选注入的值不能泄漏给后一个未开开关的候选
+  const applyReasoningSplit = (
+    body: Record<string, unknown>,
+    candidate: { reasoningSplit?: boolean },
+    original: unknown,
+  ): void => {
+    if (candidate.reasoningSplit === true) {
+      body.reasoning_split = true
+    } else if (original === undefined) {
+      delete body.reasoning_split
+    } else {
+      body.reasoning_split = original
+    }
+  }
+
   // 非流式透传：改写模型名 → 逐个候选尝试 → 成功即回写；全部失败返回 502
   const handleNonStream = async (
     req: Request,
@@ -150,6 +169,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     }
     // 监控 tap：请求侧消息去重落库（在模型名改写前取原始 body；无会话键时 no-op）
     monitor?.recordRequest(ctx.sessionKey, body.messages)
+    // 客户端原值快照：回退尝试间 body 共享，未开开关的候选需还原此值
+    const originalReasoningSplit = body.reasoning_split
     const result = await executeWithFallback<ChatSuccess>(
       candidates,
       loadBalancer,
@@ -162,9 +183,10 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
           // 客户端缺失（防御性，如配置刚删除）：可回退，尝试下一个候选
           return { ok: false, error: new Error('upstream_client_missing'), fallbackable: true }
         }
-        // 改写请求体：模型名换成上游侧名称，强制非流式
+        // 改写请求体：模型名换成上游侧名称，强制非流式；思考分离按候选开关注入
         body.model = candidate.model
         body.stream = false
+        applyReasoningSplit(body, candidate, originalReasoningSplit)
         try {
           const data = await client.chatCompletion(body as UpstreamChatRequest, { signal, headers: sessionHeaders })
           reportAttempt(candidate.upstreamId, true, attemptStart, 200)
@@ -213,6 +235,8 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     }
     // 监控 tap：请求侧消息去重落库（在模型名改写前取原始 body；无会话键时 no-op）
     monitor?.recordRequest(ctx.sessionKey, body.messages)
+    // 客户端原值快照：回退尝试间 body 共享，未开开关的候选需还原此值
+    const originalReasoningSplit = body.reasoning_split
     const result = await executeWithFallback<StreamSuccess>(
       candidates,
       loadBalancer,
@@ -224,9 +248,11 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
           reportAttempt(candidate.upstreamId, false, attemptStart)
           return { ok: false, error: new Error('upstream_client_missing'), fallbackable: true }
         }
-        // 改写请求体：模型名换成上游侧名称，强制流式（includeUsage 让上游补发 usage 块）
+        // 改写请求体：模型名换成上游侧名称，强制流式（includeUsage 让上游补发 usage 块）；
+        // 思考分离按候选开关注入
         body.model = candidate.model
         body.stream = true
+        applyReasoningSplit(body, candidate, originalReasoningSplit)
 
         try {
           const { stream, abort, connectError } = client.chatCompletionStream(body as UpstreamChatRequest, {
@@ -369,6 +395,11 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
           const chatReq = responsesRequestToChat(body as ResponsesRequest)
           chatReq.model = candidate.model
           chatReq.stream = true
+          // 思考分离按候选开关注入：思考改经独立字段返回（转换流不携带思考事件，
+          // 与转换路径既有「不保留思考」语义一致，客户端拿到的是干净正文）
+          if (candidate.reasoningSplit === true) {
+            chatReq.reasoning_split = true
+          }
           try {
             const { stream, abort, connectError } = client.chatCompletionStream(chatReq, {
               signal,
@@ -470,6 +501,10 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
         const chatReq = responsesRequestToChat(body as ResponsesRequest)
         chatReq.model = candidate.model
         chatReq.stream = false
+        // 思考分离按候选开关注入（rawChat 保留原始响应，监控 tap 仍可提取思考）
+        if (candidate.reasoningSplit === true) {
+          chatReq.reasoning_split = true
+        }
         try {
           const data = await client.chatCompletion(chatReq, { signal, headers: sessionHeaders })
           // chat 响应 → responses 响应对象（model 用下游别名，与 /v1/chat/completions 一致）

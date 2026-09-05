@@ -66,8 +66,17 @@
               </el-tag>
             </div>
           </template>
-          <!-- 助手消息：markdown-it 渲染（html 选项保持关闭，用户输入按纯文本转义，防 XSS） -->
-          <div v-else class="md-body" v-html="msg.contentHtml || ''"></div>
+          <!-- 助手消息：思考子区块（推理模型）+ markdown-it 渲染（html 选项保持关闭，防 XSS） -->
+          <template v-else>
+            <!-- 思考子区块：reasoning 累积文本的 md 渲染，流式期间随增量重渲染（与监控抽屉同风格） -->
+            <div v-if="msg.reasoning" class="think-section">
+              <div class="think-head">
+                <el-tag type="warning" size="small" effect="plain">思考</el-tag>
+              </div>
+              <div class="md-body md-body-think" v-html="msg.reasoningHtml || ''"></div>
+            </div>
+            <div class="md-body" v-html="msg.contentHtml || ''"></div>
+          </template>
         </div>
       </div>
     </div>
@@ -191,9 +200,13 @@ type RawAliasEntry = { disabled?: boolean; candidates: RawCandidate[] } | RawCan
 // 页面本地展示消息 = 线上 ChatMessage + 仅 UI 使用的扩展字段：
 // - contentHtml：markdown-it 渲染出的 HTML。流式期间按 chunk 就地改写该字符串，
 //   v-html 绑定随响应式更新在原地改写 DOM 文本，消息元素不重建、不闪烁
+// - reasoning / reasoningHtml：思考内容（reasoning_content / reasoning_details 累积）与渲染产物，
+//   助手消息独立"思考"子区块展示（与监控抽屉同风格）；回传线上时不携带（本页无工具调用回路）
 // - attachments：用户消息携带的附件胶囊（UI 展示用；发请求时展开进 content 数组）
 type UiMessage = ChatMessage & {
   contentHtml?: string
+  reasoning?: string
+  reasoningHtml?: string
   attachments?: UploadedAttachment[]
 }
 
@@ -409,7 +422,8 @@ function removeAttachment(id: string) {
 // ========== 发送与流式 ==========
 
 // 组装线上消息（入参为「要纳入请求的消息列表」，由调用方裁剪）：
-// - 助手消息：content 为累积文本
+// - 助手消息：content 为累积正文；思考（reasoning）不随线上消息回传——本页无多轮工具
+//   调用回路，思考链完整保留是上游（如 MiniMax function call 场景）对客户端的要求，普通对话无需
 // - 用户消息：无附件时 content 为纯文本；有附件时展开为 content 数组——
 //   文本段（非图片附件以 <attachment name=... mime=... size=...>base64</attachment>
 //   行内嵌）+ 每个图片附件一个 image_url 段（dataURL 直接内联）
@@ -438,14 +452,38 @@ function buildWireMessages(msgs: UiMessage[]): ChatMessage[] {
   return wire
 }
 
-// 解析单个 data 事件：取 choices[0].delta.content；坏 chunk 静默跳过
-function extractDelta(data: string): string {
+// 解析单个 data 事件：取 choices[0].delta 的正文 / 思考增量；坏 chunk 静默跳过
+// 思考有两种载体（与 server 侧 stream-recorder 同口径）：
+// - reasoning_content：增量文本（DeepSeek / Qwen 等推理模型）
+// - reasoning_details[].text：累计全文（MiniMax reasoning_split 模式），
+//   以已累积思考（reasoningSeen）为基线做差取增量（两种载体互斥，增量字段优先）
+function extractDelta(data: string, reasoningSeen: string): { content: string; reasoning: string } {
   try {
     const chunk = JSON.parse(data) as ChatCompletionChunk
     const delta = chunk.choices?.[0]?.delta
-    return delta?.content ?? ''
+    if (delta === undefined || delta === null) {
+      return { content: '', reasoning: '' }
+    }
+    const content = typeof delta.content === 'string' ? delta.content : ''
+    if (typeof delta.reasoning_content === 'string' && delta.reasoning_content !== '') {
+      return { content, reasoning: delta.reasoning_content }
+    }
+    if (Array.isArray(delta.reasoning_details) && delta.reasoning_details.length > 0) {
+      // 取最长元素作为累计快照（通常仅 1 个元素）
+      let snapshot = ''
+      for (const item of delta.reasoning_details) {
+        if (item !== null && typeof item === 'object' && typeof item.text === 'string' && item.text.length > snapshot.length) {
+          snapshot = item.text
+        }
+      }
+      // 仅当快照是已累积文本的延伸时接受（防御乱序 / 重置，避免脏数据）
+      if (snapshot.length > reasoningSeen.length && (reasoningSeen === '' || snapshot.startsWith(reasoningSeen))) {
+        return { content, reasoning: snapshot.slice(reasoningSeen.length) }
+      }
+    }
+    return { content, reasoning: '' }
   } catch {
-    return ''
+    return { content: '', reasoning: '' }
   }
 }
 
@@ -490,6 +528,7 @@ async function send() {
     // （parseSseEvent 是无状态解析器，契约见 chat.ts 注释）
     let buffer = ''
     let acc = ''
+    let reasoningAcc = ''
     let finished = false
     while (!finished) {
       const { done, value } = await reader.read()
@@ -504,13 +543,21 @@ async function send() {
           finished = true
           break
         }
-        const piece = extractDelta(ev.data)
-        if (!piece) continue
-        acc += piece
-        // 就地改写：消息元素不重建，v-html 在 DOM 中原位更新文本，无闪烁
-        assistantMsg.content = acc
-        assistantMsg.contentHtml = md.render(acc)
-        scrollToBottom()
+        const { content: contentPiece, reasoning: reasoningPiece } = extractDelta(ev.data, reasoningAcc)
+        // 思考增量：累积进独立字段，思考子区块随增量重渲染
+        if (reasoningPiece !== '') {
+          reasoningAcc += reasoningPiece
+          assistantMsg.reasoning = reasoningAcc
+          assistantMsg.reasoningHtml = md.render(reasoningAcc)
+          scrollToBottom()
+        }
+        if (contentPiece !== '') {
+          acc += contentPiece
+          // 就地改写：消息元素不重建，v-html 在 DOM 中原位更新文本，无闪烁
+          assistantMsg.content = acc
+          assistantMsg.contentHtml = md.render(acc)
+          scrollToBottom()
+        }
       }
     }
     ok = true
@@ -713,6 +760,24 @@ onMounted(async () => {
   text-overflow: ellipsis;
   white-space: nowrap;
   cursor: default;
+}
+
+/* 思考子区块（推理模型 reasoning_content / reasoning_details）：
+   气泡内正文上方的浅底次级区域，与正文视觉区分（样式与监控抽屉一致） */
+.think-section {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  background: var(--el-fill-color-light);
+  border-radius: 6px;
+}
+
+.think-head {
+  margin-bottom: 4px;
+}
+
+/* 思考正文弱化色调（基础排版仍走 .md-body 的 :deep 规则） */
+.md-body-think {
+  color: var(--el-text-color-secondary);
 }
 
 /* markdown 渲染内容（v-html 产物在 scoped 之外，用 :deep 穿透） */

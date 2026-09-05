@@ -418,6 +418,191 @@ describe('OpenAI 下游服务', () => {
   })
 })
 
+describe('候选思考分离开关（reasoningSplit → 上游注入 reasoning_split）', () => {
+  // 把 gpt-4 别名改写成带 reasoningSplit 的候选列表（store 热更新，路由按请求重建）
+  const setCandidates = (reasoningSplit?: boolean): void => {
+    const current = store.get()
+    const candidate: { upstreamId: string; model: string; reasoningSplit?: boolean } = {
+      upstreamId: 'u1',
+      model: 'gpt-4-u1',
+    }
+    if (reasoningSplit !== undefined) {
+      candidate.reasoningSplit = reasoningSplit
+    }
+    store.set(
+      {
+        ...current,
+        downstreamModels: { 'gpt-4': { disabled: false, candidates: [candidate] } },
+      },
+      { source: 'admin' },
+    )
+  }
+
+  it('非流式：候选开启 reasoningSplit → 上游请求体注入 reasoning_split=true', async () => {
+    setCandidates(true)
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-1',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: '你好' }, finish_reason: 'stop' }],
+        }),
+      )
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/chat/completions')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+    expect(captured).toMatchObject({ model: 'gpt-4-u1', stream: false, reasoning_split: true })
+  })
+
+  it('非流式：候选未配置 reasoningSplit → 上游请求体不含 reasoning_split（不注入）', async () => {
+    setCandidates()
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-1',
+          choices: [{ index: 0, message: { role: 'assistant', content: '你好' }, finish_reason: 'stop' }],
+        }),
+      )
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/chat/completions')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+    expect((captured as Record<string, unknown>).reasoning_split).toBeUndefined()
+  })
+
+  it('非流式：候选开启 reasoningSplit 覆盖客户端显式 false（运维开关优先）', async () => {
+    setCandidates(true)
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-1',
+          choices: [{ index: 0, message: { role: 'assistant', content: '你好' }, finish_reason: 'stop' }],
+        }),
+      )
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/chat/completions')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }], reasoning_split: false })
+    expect(res.status).toBe(200)
+    expect((captured as Record<string, unknown>).reasoning_split).toBe(true)
+  })
+
+  it('流式：候选开启 reasoningSplit → 上游请求体注入 reasoning_split=true', async () => {
+    setCandidates(true)
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write('data: {"id":"1","choices":[{"delta":{"content":"你"}}]}\n\n')
+      res.end('data: [DONE]\n\n')
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/chat/completions')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }], stream: true })
+    expect(res.status).toBe(200)
+    expect(captured).toMatchObject({ model: 'gpt-4-u1', stream: true, reasoning_split: true })
+  })
+
+  it('回退：候选1 开开关（500 失败）→ 候选2 未开开关，其上游请求体不含 reasoning_split（不泄漏注入）', async () => {
+    const current = store.get()
+    store.set(
+      {
+        ...current,
+        downstreamModels: {
+          'gpt-4': {
+            disabled: false,
+            candidates: [
+              { upstreamId: 'u1', model: 'gpt-4-u1', reasoningSplit: true },
+              { upstreamId: 'u2', model: 'gpt-4-u2' },
+            ],
+          },
+        },
+      },
+      { source: 'admin' },
+    )
+    let captured1: unknown
+    let captured2: unknown
+    const url1 = await startMock(async (_req, res) => {
+      captured1 = await readBody(_req)
+      res.statusCode = 500
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: 'boom' }))
+    })
+    const url2 = await startMock(async (req, res) => {
+      captured2 = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'ok',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        }),
+      )
+    })
+    addClient('u1', url1)
+    addClient('u2', url2)
+
+    // 客户端未携带 reasoning_split（原值 undefined）
+    const res = await request(app)
+      .post('/v1/chat/completions')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+    expect(attempts.map((a) => a.upstreamId)).toEqual(['u1', 'u2'])
+    // 候选1 收到注入，候选2 还原为客户端原值（无该字段）
+    expect((captured1 as Record<string, unknown>).reasoning_split).toBe(true)
+    expect((captured2 as Record<string, unknown>).reasoning_split).toBeUndefined()
+  })
+
+  it('Responses 转换路径：候选开启 reasoningSplit → 转换后的 chat 请求体注入 reasoning_split=true', async () => {
+    setCandidates(true)
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      if (req.url?.startsWith('/v1/responses')) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-1',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: '你好' }, finish_reason: 'stop' }],
+        }),
+      )
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/v1/responses')
+      .send({ model: 'gpt-4', input: '你好' })
+    expect(res.status).toBe(200)
+    expect((res.body as { object?: string }).object).toBe('response')
+    expect(captured).toMatchObject({ model: 'gpt-4-u1', stream: false, reasoning_split: true })
+  })
+})
+
 describe('OpenAI Responses API（POST /v1/responses）', () => {
   it('非流式：responses 请求 → chat 上游 → responses 响应对象', async () => {
     // 捕获上游收到的请求体，断言已转换为 chat 格式

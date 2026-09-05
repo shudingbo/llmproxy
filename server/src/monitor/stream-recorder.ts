@@ -5,7 +5,9 @@
 //                 （含网关 convert 路径 createResponsesStream 产出的同形事件流）
 //
 // 双通道（think / content）：推理模型（DeepSeek 等）先流式输出思考过程、再输出正文：
-//   - 'chat'      思考 = delta.reasoning_content（与 content 同一 choice，先于正文到达）
+//   - 'chat'      思考 = delta.reasoning_content（增量，与 content 同一 choice，先于正文到达）
+//                 或 delta.reasoning_details[].text（MiniMax reasoning_split 模式，text 为累计全文，
+//                 记录器按已累积值做差取增量）
 //   - 'responses' 思考 = response.reasoning_text.delta / response.reasoning_summary_text.delta
 //                 （原生透传流；convert 路径的转换流不含思考事件——转换器以简单可靠为准，不携带）
 //
@@ -22,9 +24,9 @@ export type RecorderKind = 'chat' | 'responses'
 // delta 通道：think = 思考/推理过程（reasoning_content），content = 正文
 export type DeltaChannel = 'think' | 'content'
 
-// 最小 chat SSE chunk 结构（只取首 choice 的 delta.content / delta.reasoning_content，其余字段忽略）
+// 最小 chat SSE chunk 结构（只取首 choice 的 delta.content / 思考字段，其余字段忽略）
 interface ChatSseChunk {
-  choices?: Array<{ delta?: { content?: unknown; reasoning_content?: unknown } }>
+  choices?: Array<{ delta?: { content?: unknown; reasoning_content?: unknown; reasoning_details?: unknown } }>
 }
 
 // 最小 Responses SSE 事件结构（只关心 output_text / reasoning_text / reasoning_summary_text 的 delta / done）
@@ -117,7 +119,7 @@ export class AssistantStreamRecorder {
   }
 
   private consumeChatChunk(evt: Record<string, unknown>): void {
-    const { content, reasoning } = extractChatDelta(evt)
+    const { content, reasoning } = this.extractChatDelta(evt)
     if (reasoning !== '') {
       this.reasoning += reasoning
       this.onDelta('think', reasoning)
@@ -126,6 +128,39 @@ export class AssistantStreamRecorder {
       this.content += content
       this.onDelta('content', content)
     }
+  }
+
+  // 从 chat SSE chunk 提取首 choice 的增量正文 / 思考文本；结构缺失 / 类型不符返回空串（调用方跳过）
+  // 思考有两种载体：
+  // - delta.reasoning_content：增量（DeepSeek 等推理模型；与 content 同一 choice，先于正文到达）
+  // - delta.reasoning_details[].text：累计全文（MiniMax reasoning_split 模式），
+  //   以已累积的思考文本为基线做差取增量（两种载体互斥，增量字段优先）
+  private extractChatDelta(chunk: ChatSseChunk): { content: string; reasoning: string } {
+    const delta = chunk.choices?.[0]?.delta
+    if (delta === undefined || delta === null) {
+      return { content: '', reasoning: '' }
+    }
+    const content = typeof delta.content === 'string' ? delta.content : ''
+    if (typeof delta.reasoning_content === 'string' && delta.reasoning_content !== '') {
+      return { content, reasoning: delta.reasoning_content }
+    }
+    if (Array.isArray(delta.reasoning_details) && delta.reasoning_details.length > 0) {
+      // 取最长元素作为累计快照（通常仅 1 个元素）
+      let snapshot = ''
+      for (const item of delta.reasoning_details) {
+        if (typeof item === 'object' && item !== null) {
+          const text = (item as { text?: unknown }).text
+          if (typeof text === 'string' && text.length > snapshot.length) {
+            snapshot = text
+          }
+        }
+      }
+      // 仅当快照是已累积文本的延伸时接受（防御乱序 / 重置，避免脏数据）
+      if (snapshot.length > this.reasoning.length && (this.reasoning === '' || snapshot.startsWith(this.reasoning))) {
+        return { content, reasoning: snapshot.slice(this.reasoning.length) }
+      }
+    }
+    return { content, reasoning: '' }
   }
 
   private consumeResponsesEvent(evt: Record<string, unknown>): void {
@@ -151,18 +186,5 @@ export class AssistantStreamRecorder {
         this.fallbackReasoning = event.text
       }
     }
-  }
-}
-
-// 从 chat SSE chunk 提取首 choice 的增量正文 / 思考文本；结构缺失 / 类型不符返回空串（调用方跳过）
-// 推理模型（DeepSeek 等）的 reasoning_content 与 content 位于同一 choice，思考片段先于正文到达
-function extractChatDelta(chunk: ChatSseChunk): { content: string; reasoning: string } {
-  const delta = chunk.choices?.[0]?.delta
-  if (delta === undefined || delta === null) {
-    return { content: '', reasoning: '' }
-  }
-  return {
-    content: typeof delta.content === 'string' ? delta.content : '',
-    reasoning: typeof delta.reasoning_content === 'string' ? delta.reasoning_content : '',
   }
 }

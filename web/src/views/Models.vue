@@ -82,6 +82,15 @@
                   >
                     <el-option v-for="cap in CAPABILITY_OPTIONS" :key="cap" :label="cap" :value="cap" />
                   </el-select>
+                  <!-- 思考分离开关：开启后网关向该候选的上游请求注入 reasoning_split=true，
+                       思考经独立字段返回而非以 ... 标签混入 content（MiniMax 等上游用） -->
+                  <span
+                    class="rsplit-wrap"
+                    title="思考分离：开启后网关向该候选的上游请求注入 reasoning_split=true，思考经独立字段（reasoning_content / reasoning_details）返回，而非以 ... 标签混入 content。用于 MiniMax 等上游。"
+                  >
+                    <span class="rsplit-label">思考分离</span>
+                    <el-switch v-model="element.reasoningSplit" size="small" />
+                  </span>
                   <el-button
                     size="small"
                     :loading="probingKey === element._key"
@@ -127,13 +136,15 @@ interface AliasGroup {
   candidates: Candidate[]
 }
 
-// 候选条目：上游 id + 上游侧模型名 + 最大上下文；_key 仅用于拖拽排序的稳定 Vue key，保存时剔除
+// 候选条目：上游 id + 上游侧模型名 + 最大上下文 + 思考分离开关；_key 仅用于拖拽排序的稳定 Vue key，保存时剔除
 interface Candidate {
   _key: number
   upstreamId: string
   model: string
   max_context_length?: number | null
   capabilities?: string[]
+  // 思考分离：开启后网关向上游请求注入 reasoning_split=true（MiniMax 等上游的思考改经独立字段返回）
+  reasoningSplit: boolean
 }
 
 // 上游信息（管理端接口返回的 apiKey 已脱敏）
@@ -216,6 +227,7 @@ function buildCandidate(raw: Omit<Candidate, '_key'>): Candidate {
     model: raw.model,
     max_context_length: raw.max_context_length ?? null,
     capabilities: raw.capabilities ?? [],
+    reasoningSplit: raw.reasoningSplit === true,
   }
 }
 
@@ -246,7 +258,7 @@ function removeAlias(alias: string) {
   activeNames.value = activeNames.value.filter((n) => n !== alias)
 }
 
-// 新增候选：默认选中第一个上游，名称留空待填
+// 新增候选：默认选中第一个上游，名称留空待填，思考分离默认关闭
 function addCandidate(alias: string) {
   models[alias].candidates.push({
     _key: ++seq,
@@ -254,6 +266,7 @@ function addCandidate(alias: string) {
     model: '',
     max_context_length: null,
     capabilities: [],
+    reasoningSplit: false,
   })
 }
 
@@ -284,7 +297,8 @@ async function save() {
   saving.value = true
   try {
     // payload 形态对齐后端 group 形态：{ disabled, candidates: [...] }，
-    // 字段剔除：_key（仅前端用）、max_context_length 为 null 时剔除、capabilities 空数组剔除
+    // 字段剔除：_key（仅前端用）、max_context_length 为 null 时剔除、capabilities 空数组剔除、
+    // reasoningSplit 为 false 时剔除（缺省即关闭）
     const payload: Record<string, { disabled: boolean; candidates: Array<Record<string, unknown>> }> = {}
     for (const [alias, group] of entries) {
       payload[alias] = {
@@ -296,6 +310,9 @@ async function save() {
           }
           if (c.capabilities && c.capabilities.length > 0) {
             row.capabilities = c.capabilities
+          }
+          if (c.reasoningSplit) {
+            row.reasoningSplit = true
           }
           return row
         }),
@@ -431,6 +448,21 @@ onMounted(load)
 .candidate-row .caps-select {
   width: 220px;
   flex-shrink: 0;
+}
+
+/* 思考分离开关：文字标签 + 小尺寸 switch，整体不参与伸缩 */
+.rsplit-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  cursor: default;
+}
+
+.rsplit-label {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  white-space: nowrap;
 }
 
 .drag-handle {

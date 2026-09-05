@@ -33,6 +33,7 @@
 | `downstreamModels[alias][].upstreamId` | string | 是 | — | 须与某个 `upstreams[].id` 对应 |
 | `downstreamModels[alias][].model` | string | 是 | — | 在上游侧使用的模型名 |
 | `downstreamModels[alias][].max_context_length` | number | 否 | — | 下游模型最大上下文（正整数）；可手动设置或管理端「自动」按钮探测（llama.cpp / LM Studio）；`null` 显式清空，缺省不设 |
+| `downstreamModels[alias][].reasoningSplit` | boolean | 否 | `false` | 思考分离开关；开启后网关向该候选的上游请求注入 `reasoning_split: true`（MiniMax 官方参数），思考经独立的 `reasoning_content` / `reasoning_details` 字段返回而非以 `...` 标签混入 `content`。模型名可能不规范无法自动识别，故为候选级手工开关（管理端 Models 页「思考分离」） |
 | `server` | object | 否 | — | 下行流监听配置（整节可缺省） |
 | `server.host` | string | 否 | `127.0.0.1` | 监听地址（IPv4 / IPv6 / Unix socket 名） |
 | `server.port` | number | 否 | `3000` | TCP 端口（1–65535） |
@@ -151,6 +152,7 @@
 
 - **别名系统**：聊天请求（`/v1/chat/completions` 与 `/api/chat`）的 `model` 字段必须填**下游别名**（如 `qwen3.5-9b`）。填上游原始模型名会得到 `404 model_not_found`。模型列表接口（`/v1/models`、`/api/tags`）返回的也是别名列表。
 - **`upstreamId`**：必须与某个 `upstreams[].id` 对应；管理界面删除上游时会级联清理引用它的候选。
+- **`reasoningSplit`（候选级，可选）**：思考分离开关，缺省 `false`。部分上游（典型为 MiniMax M 系列）的 OpenAI 兼容端点默认把 `...` 思考标签**混在 `content` 字段**里输出；开启后网关在把请求发给该候选的上游时注入 `reasoning_split: true`，思考改经独立字段返回（流式 `delta.reasoning_content` / `delta.reasoning_details`，非流式 `message.reasoning_content` / `message.reasoning_details`），`content` 只剩正文。注入作用于所有打到上游 chat completions 的路径（`/v1/chat/completions` 流式 / 非流式、`/v1/responses` 转换路径、`/api/chat` 流式 / 非流式）；回退到未开开关的候选时自动还原客户端原值（不泄漏注入）。管理端监控与会话抽屉、聊天页均已识别两种思考载体（增量 `reasoning_content` 与累计 `reasoning_details`）。对不支持该参数的上游（如 DeepSeek）注入无副作用（未知字段被上游忽略）。
 - **同一别名多候选**：候选列表是有序的。新请求由轮询（round-robin）从 `count % 候选数` 选起点，随后按列表顺序逐个尝试：
   - 某一候选失败且**可回退**（网络错误、超时、HTTP `429`、HTTP `5xx`）时自动切到下一个候选；
   - 其它 `4xx`（如 `401` / `403` / `404`）不可回退，立即中断并把错误返回给客户端；

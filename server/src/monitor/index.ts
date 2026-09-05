@@ -35,9 +35,34 @@ export interface AssistantStreamHandle {
 // 无会话键 / 未注入监控时的零开销空实现
 const NOOP_HANDLE: AssistantStreamHandle = { feed: () => {}, finish: () => {} }
 
+// 从消息对象提取思考文本，两种载体：
+// - reasoning_content：字符串（DeepSeek 等推理模型 / MiniMax 非流式）
+// - reasoning_details[].text：数组（MiniMax reasoning_split 模式），多元素按序拼接
+// 优先 reasoning_content；均缺失 → 空串
+const extractMessageReasoning = (msg: { reasoning_content?: unknown; reasoning_details?: unknown }): string => {
+  if (typeof msg.reasoning_content === 'string' && msg.reasoning_content !== '') {
+    return msg.reasoning_content
+  }
+  if (Array.isArray(msg.reasoning_details) && msg.reasoning_details.length > 0) {
+    const parts: string[] = []
+    for (const item of msg.reasoning_details) {
+      if (typeof item === 'object' && item !== null) {
+        const text = (item as { text?: unknown }).text
+        if (typeof text === 'string' && text !== '') {
+          parts.push(text)
+        }
+      }
+    }
+    if (parts.length > 0) {
+      return parts.join('')
+    }
+  }
+  return ''
+}
+
 // 单条消息归一化：提取 [role, content, reasoning]（与 session/key.ts 的 serializeMessage 同口径）——
 // role 缺失 → 空串；content 字符串原样、缺失 → 空串；null / 对象 / 多模态数组 → JSON.stringify
-// reasoning 取 reasoning_content（推理模型客户端回显的历史思考；多数客户端不回显，通常为空串）
+// reasoning 取 reasoning_content / reasoning_details（推理模型客户端回显的历史思考；多数客户端不回显，通常为空串）
 // role 与 content 均为空 → null（空消息跳过）
 const normalizeMessage = (m: unknown): { role: string; content: string; reasoning: string } | null => {
   const msg = (m ?? {}) as Record<string, unknown>
@@ -48,7 +73,7 @@ const normalizeMessage = (m: unknown): { role: string; content: string; reasonin
       : msg.content === undefined
         ? ''
         : JSON.stringify(msg.content)
-  const reasoning = typeof msg.reasoning_content === 'string' ? msg.reasoning_content : ''
+  const reasoning = extractMessageReasoning(msg)
   if (role === '' && content === '') {
     return null
   }
@@ -161,10 +186,12 @@ export class SessionMonitor {
   }
 
   // chat 非流式响应记录：逐 choice 提取 message 内容（content 缺失时回退 tool_calls JSON）
-  // + reasoning_content（推理模型思考过程；缺失为空串）
+  // + 思考（reasoning_content / reasoning_details，推理模型思考过程；缺失为空串）
   recordChatResponse(sessionKey: string | undefined, data: unknown): void {
     const body = data as {
-      choices?: Array<{ message?: { content?: unknown; tool_calls?: unknown; reasoning_content?: unknown } }>
+      choices?: Array<{
+        message?: { content?: unknown; tool_calls?: unknown; reasoning_content?: unknown; reasoning_details?: unknown }
+      }>
     } | null
     if (sessionKey === undefined || body === null || typeof body !== 'object' || !Array.isArray(body.choices)) {
       return
@@ -180,7 +207,7 @@ export class SessionMonitor {
           : message.tool_calls !== undefined && message.tool_calls !== null
             ? JSON.stringify(message.tool_calls)
             : ''
-      const reasoning = typeof message.reasoning_content === 'string' ? message.reasoning_content : ''
+      const reasoning = extractMessageReasoning(message)
       this.recordAssistant(sessionKey, content, reasoning)
     }
   }

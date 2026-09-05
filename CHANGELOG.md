@@ -6,6 +6,12 @@
 
 ### 新增
 
+- **下行候选思考分离开关（`reasoningSplit`）**：MiniMax M 系列等上游的 OpenAI 兼容端点默认把 `...` 思考标签混在 `content` 字段输出（DeepSeek / Qwen 则走独立 `reasoning_content` 字段），导致透传客户端把思考当普通文本显示。`UpstreamCandidateSchema` 新增候选级 `reasoningSplit?: boolean`（缺省 `false`；模型名可能不规范、无法自动识别，故手工开关）：开启后网关在把请求发给该候选的上游时注入 `reasoning_split: true`（MiniMax 官方参数），思考改经独立字段返回——流式 `delta.reasoning_content` / `delta.reasoning_details`（后者元素 `text` 为**累计全文**），非流式 `message.reasoning_content` / `message.reasoning_details`。
+  - **注入路径**：所有打到上游 chat completions 的链路——`/v1/chat/completions` 流式 / 非流式（共享 body 在回退尝试间还原客户端原值，不泄漏注入）、`/v1/responses` 转换路径（流式 / 非流式；转换流不携带思考事件，与既有「转换不保留思考」语义一致，客户端拿到干净正文）、`/api/chat` 流式 / 非流式（Ollama 转换器不透传未知字段，故在 `convertChatRequest` 转换后注入；NDJSON 只取正文，下游客户端拿到干净内容）。对不支持该参数的上游注入无副作用（未知字段被忽略）
+  - **思考识别扩展**：`AssistantStreamRecorder`（chat 口径）与 `SessionMonitor`（非流式 `recordChatResponse` / 请求侧 `normalizeMessage`）在既有 `reasoning_content`（增量）之外新增 `reasoning_details[].text`（累计全文，按已累积值做差取增量，快照非已累积文本的延伸时拒绝，防御乱序）——会话探测抽屉与既有 DeepSeek 链路不受影响
+  - **前端**：Models 页候选行新增「思考分离」小开关（`false` 时保存 payload 剔除该字段）；聊天页助手气泡新增独立「思考」子区块（与监控抽屉同风格：浅底 + 弱化色调 + markdown-it 渲染），流式期间随思考增量重渲染；思考不随线上消息回传（本页无多轮工具调用回路）
+  - **测试**：`test/config/schema.test.ts`（reasoningSplit 解析 / 缺省）+ `test/server/openai.test.ts`（流式 / 非流式注入、回退还原客户端原值、未开候选不泄漏）+ `test/server/ollama.test.ts`（转换后注入）+ `test/monitor/stream-recorder.test.ts`（reasoning_details 累计做差 / 乱序防御）
+
 - **会话探测（会话消息监控）**：Sessions 页操作栏新增「探测」按钮，点击弹出 `el-drawer` 实时展示该会话与 LLM 交互的全部消息（历史 + 实时 + 流式增量）。**被动监控**：不发起任何探测请求，仅旁路记录并推送既有业务流量（`/v1/chat/completions`、`/v1/responses`（convert / native 两模式）、`/api/chat`）
   - **存储策略**：新增 `session_messages` 表（SQLite，与 sessions / logs 同库 `~/llmproxy/llmproxy.db`，WAL 多连接安全），字段 `id / session_key / role / content / reasoning / content_hash / created_at`。请求侧消息按 `(session_key, content_hash)` **去重写入**（多轮对话每轮重发的历史只落库一次，会话日志不膨胀）；响应侧 assistant 回答**每次整条写入**（相同回答也留痕）。**SSE delta 绝不逐 token 入库**——只在内存累积、流结束 / 中断后落库一条（中断则存已收到的部分并标记 `truncated`），写库频率 ≈ 每请求一次，与 token 数无关
   - **实时推送**：进程内订阅总线（`Map<sessionKey, Set<listener>>`）。流式回答的 SSE delta 经总线以 `assistant_delta` 事件 **token 级**实时推送（抽屉内逐字增长、markdown-it 增量重渲染）；流结束推 `assistant_done`（携带完整文本，订阅晚于首 delta 的中途打开者可补块）；请求侧新写入 / 非流式回答推 `message` 事件。DB 写失败 try-catch 隔离仅告警一次，绝不影响业务请求；订阅者异常自动摘除

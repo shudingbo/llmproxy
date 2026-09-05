@@ -23,10 +23,18 @@ export type ChatCompletionRequest = {
 }
 
 // 流式响应中的一个 chunk（OpenAI SSE 格式），保持宽松：delta.content 允许为 null
+// 思考字段两种载体（与 server 侧 stream-recorder 同口径）：
+// - reasoning_content：增量文本（DeepSeek / Qwen 等推理模型）
+// - reasoning_details：数组，元素 text 为累计全文（MiniMax reasoning_split 模式）
 export type ChatCompletionChunk = {
   id?: string
   choices: Array<{
-    delta: { content?: string | null; role?: string }
+    delta: {
+      content?: string | null
+      role?: string
+      reasoning_content?: string | null
+      reasoning_details?: Array<{ text?: string }>
+    }
     finish_reason?: string | null
   }>
 }

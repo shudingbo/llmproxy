@@ -268,6 +268,66 @@ describe('Ollama 下游服务', () => {
     expect(attempts[0]).toMatchObject({ upstreamId: 'u1', ok: true })
   })
 
+  it('非流式：候选开启 reasoningSplit → 转换后的上游请求体注入 reasoning_split=true', async () => {
+    const current = store.get()
+    store.set(
+      {
+        ...current,
+        downstreamModels: {
+          'gpt-4': { disabled: false, candidates: [{ upstreamId: 'u1', model: 'gpt-4-u1', reasoningSplit: true }] },
+        },
+      },
+      { source: 'admin' },
+    )
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-1',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: '你好' }, finish_reason: 'stop' }],
+        }),
+      )
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/api/chat')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+    // Ollama 转换器不透传未知字段，注入发生在转换之后：上游请求体带 reasoning_split
+    expect(captured).toMatchObject({ model: 'gpt-4-u1', stream: false, reasoning_split: true })
+  })
+
+  it('流式：候选开启 reasoningSplit → 转换后的上游请求体注入 reasoning_split=true', async () => {
+    const current = store.get()
+    store.set(
+      {
+        ...current,
+        downstreamModels: {
+          'gpt-4': { disabled: false, candidates: [{ upstreamId: 'u1', model: 'gpt-4-u1', reasoningSplit: true }] },
+        },
+      },
+      { source: 'admin' },
+    )
+    let captured: unknown
+    const url = await startMock(async (req, res) => {
+      captured = await readBody(req)
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.write('data: {"id":"1","choices":[{"delta":{"content":"你"}}]}\n\n')
+      res.end('data: [DONE]\n\n')
+    })
+    addClient('u1', url)
+
+    const res = await request(app)
+      .post('/api/chat')
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'hi' }], stream: true })
+    expect(res.status).toBe(200)
+    expect(captured).toMatchObject({ model: 'gpt-4-u1', stream: true, reasoning_split: true })
+  })
+
   it('GET /api/tags 返回下游别名列表（Ollama 形状）', async () => {
     const res = await request(app).get('/api/tags')
     expect(res.status).toBe(200)

@@ -218,6 +218,30 @@ describe('UpstreamCandidateSchema.capabilities', () => {
   })
 })
 
+describe('UpstreamCandidateSchema.reasoningSplit', () => {
+  it('缺省时为 undefined（不报错，向后兼容）', () => {
+    const result = UpstreamCandidateSchema.safeParse({ upstreamId: 'a', model: 'm1' })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data.reasoningSplit).toBeUndefined()
+  })
+
+  it('显式 true / false 均原样保留', () => {
+    const on = UpstreamCandidateSchema.safeParse({ upstreamId: 'a', model: 'm1', reasoningSplit: true })
+    expect(on.success).toBe(true)
+    if (on.success) expect(on.data.reasoningSplit).toBe(true)
+    const off = UpstreamCandidateSchema.safeParse({ upstreamId: 'a', model: 'm1', reasoningSplit: false })
+    expect(off.success).toBe(true)
+    if (off.success) expect(off.data.reasoningSplit).toBe(false)
+  })
+
+  it('非布尔值（字符串 / 数字）时拒绝', () => {
+    const base = { upstreamId: 'a', model: 'm1' }
+    expect(UpstreamCandidateSchema.safeParse({ ...base, reasoningSplit: 'true' }).success).toBe(false)
+    expect(UpstreamCandidateSchema.safeParse({ ...base, reasoningSplit: 1 }).success).toBe(false)
+  })
+})
+
 describe('server 配置节（进程级 server 配置：host / port / bodyLimit）', () => {
   it('未指定 server 时 ConfigSchema 仍接受（向上兼容现有配置）', () => {
     const result = ConfigSchema.safeParse(validConfig)

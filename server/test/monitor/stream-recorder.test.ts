@@ -149,6 +149,64 @@ describe('AssistantStreamRecorder (think 通道)', () => {
     expect(r.getReasoning()).toBe('ok')
   })
 
+  it('chat 口径：reasoning_details 累计全文按已累积值做差取增量（MiniMax reasoning_split 模式）', () => {
+    const { deltas, thinks, onDelta } = collect()
+    const r = new AssistantStreamRecorder('chat', onDelta)
+    r.feed(
+      // MiniMax 流式典型时序：reasoning_details[0].text 为累计全文，逐块增长；思考先于正文
+      'data: {"choices":[{"delta":{"reasoning_details":[{"text":"让我"}]}}]}\n\n' +
+        'data: {"choices":[{"delta":{"reasoning_details":[{"text":"让我想想"}]}}]}\n\n' +
+        'data: {"choices":[{"delta":{"reasoning_details":[{"text":"让我想想呢"}],"content":"你"}}]}\n\n' +
+        'data: {"choices":[{"delta":{"content":"好"}}]}\n\n' +
+        'data: [DONE]\n\n',
+    )
+    expect(thinks).toEqual(['让我', '想想', '呢'])
+    expect(deltas).toEqual(['你', '好'])
+    expect(r.getReasoning()).toBe('让我想想呢')
+    expect(r.getContent()).toBe('你好')
+  })
+
+  it('chat 口径：reasoning_details 快照非已累积文本的延伸时拒绝（防御乱序 / 重置）', () => {
+    const { thinks, onDelta } = collect()
+    const r = new AssistantStreamRecorder('chat', onDelta)
+    r.feed(
+      'data: {"choices":[{"delta":{"reasoning_details":[{"text":"ABC"}]}}]}\n' +
+        // "XYZ" 不以 "ABC" 开头 → 拒绝
+        'data: {"choices":[{"delta":{"reasoning_details":[{"text":"XYZ"}]}}]}\n' +
+        // 同长快照（未增长）→ 拒绝
+        'data: {"choices":[{"delta":{"reasoning_details":[{"text":"ABC"}]}}]}\n' +
+        // 正常延伸 → 接受
+        'data: {"choices":[{"delta":{"reasoning_details":[{"text":"ABCD"}]}}]}\n\n',
+    )
+    expect(thinks).toEqual(['ABC', 'D'])
+    expect(r.getReasoning()).toBe('ABCD')
+  })
+
+  it('chat 口径：reasoning_details 为空数组 / 元素缺 text / 非数组：跳过', () => {
+    const { thinks, onDelta } = collect()
+    const r = new AssistantStreamRecorder('chat', onDelta)
+    r.feed(
+      'data: {"choices":[{"delta":{"reasoning_details":[]}}]}\n' +
+        'data: {"choices":[{"delta":{"reasoning_details":[{"type":"text"}]}}]}\n' +
+        'data: {"choices":[{"delta":{"reasoning_details":"not-array"}}]}\n' +
+        'data: {"choices":[{"delta":{"reasoning_details":[{"text":"ok"}]}}]}\n\n',
+    )
+    expect(thinks).toEqual(['ok'])
+    expect(r.getReasoning()).toBe('ok')
+  })
+
+  it('chat 口径：reasoning_content 与 reasoning_details 并存时增量字段优先', () => {
+    const { thinks, onDelta } = collect()
+    const r = new AssistantStreamRecorder('chat', onDelta)
+    r.feed(
+      'data: {"choices":[{"delta":{"reasoning_content":"增量","reasoning_details":[{"text":"累计全文"}]}}]}\n' +
+        // 下一块仅有 reasoning_details 且以已累积（增量）为前缀 → 做差接受
+        'data: {"choices":[{"delta":{"reasoning_details":[{"text":"增量文本"}]}}]}\n\n',
+    )
+    expect(thinks).toEqual(['增量', '文本'])
+    expect(r.getReasoning()).toBe('增量文本')
+  })
+
   it('responses 口径：reasoning_text.delta 与 reasoning_summary_text.delta 均走 think 通道', () => {
     const { deltas, thinks, onDelta } = collect()
     const r = new AssistantStreamRecorder('responses', onDelta)

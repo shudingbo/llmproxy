@@ -148,6 +148,11 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
         try {
           // 下游 Ollama 形状请求 → OpenAI 请求（模型名替换为上游侧名称）→ 调用上游
           const ollamaReq = convertChatRequest({ ...body, model: candidate.model })
+          // 思考分离按候选开关注入（须在转换后：Ollama 转换器不透传未知字段；
+          // 开启后思考经独立字段返回，NDJSON 转换只取正文，下游客户端拿到干净内容）
+          if (candidate.reasoningSplit === true) {
+            Object.assign(ollamaReq, { reasoning_split: true })
+          }
           // OllamaChatRequest 结构是 UpstreamChatRequest 的子集（缺索引签名），此处收窄到上游客户端签名
           const openaiResp = await client.chatCompletion(ollamaReq as unknown as UpstreamChatRequest, {
             signal,
@@ -218,6 +223,10 @@ export function registerOllamaRoutes(app: Express, deps: OllamaDeps): void {
         }
         try {
           const ollamaReq = convertChatRequest({ ...body, model: candidate.model })
+          // 思考分离按候选开关注入（同非流式分支：转换后注入，原始 chat SSE 流供监控 tap 提取思考）
+          if (candidate.reasoningSplit === true) {
+            Object.assign(ollamaReq, { reasoning_split: true })
+          }
           const { stream, abort, connectError } = client.chatCompletionStream(ollamaReq as unknown as UpstreamChatRequest, {
             signal,
             includeUsage: true,

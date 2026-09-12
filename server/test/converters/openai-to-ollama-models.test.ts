@@ -15,6 +15,9 @@ describe('convertModelsList', () => {
           details: {
             format: 'openai',
             family: 'openai',
+            families: [],
+            parameter_size: '',
+            quantization_level: '',
           },
         },
       ],
@@ -49,6 +52,9 @@ describe('convertModelsList', () => {
           details: {
             format: 'openai',
             family: 'openai',
+            families: [],
+            parameter_size: '',
+            quantization_level: '',
           },
           meta: { n_ctx: 8192 },
         },
@@ -68,6 +74,9 @@ describe('convertModelsList', () => {
           details: {
             format: 'openai',
             family: 'openai',
+            families: [],
+            parameter_size: '',
+            quantization_level: '',
           },
         },
       ],

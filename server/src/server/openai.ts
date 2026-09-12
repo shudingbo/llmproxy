@@ -26,6 +26,10 @@ import type {
 } from '../upstream/openai.js'
 import { buildAliasMetaMap, listExposedAliases } from './model-meta.js'
 
+// /v1/models 的 created 字段：OpenAI SDK 常用字段；网关无法获知真实模型创建时间，
+// 使用进程启动时的 Unix 秒作为稳定伪值，避免硬编码日期导致响应语义失真。
+const MODEL_LIST_CREATED = Math.floor(Date.now() / 1000)
+
 // 依赖注入集合：由装配层（T19）构造后传入
 export interface OpenAIDeps {
   store: ConfigStore
@@ -725,13 +729,20 @@ export function registerOpenAIRoutes(app: Express, deps: OpenAIDeps): void {
     const config = store.get()
     const metaMap = buildAliasMetaMap(config)
     const data = listExposedAliases(config).map((id) => {
-      const entry: { id: string; object: string; owned_by: string; meta?: { n_ctx: number } } = {
+      const entry: {
+        id: string
+        object: string
+        created: number
+        owned_by: string
+        meta?: { n_ctx: number }
+      } = {
         id,
         object: 'model',
+        created: MODEL_LIST_CREATED,
         owned_by: 'llmproxy',
       }
       const meta = metaMap[id]
-      // 仅当别名能聚合出 n_ctx 时附加 meta（capabilities 属 Ollama 侧字段，/v1/models 不输出）
+      // 仅当别名能聚合出 n_ctx 时附加 meta
       if (meta !== undefined && meta.n_ctx !== undefined) {
         entry.meta = { n_ctx: meta.n_ctx }
       }

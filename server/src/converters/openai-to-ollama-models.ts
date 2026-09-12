@@ -37,6 +37,9 @@ export function convertModelsList(
       details: {
         format: 'openai',
         family: 'openai',
+        families: [],
+        parameter_size: '',
+        quantization_level: '',
       },
     }
     const meta = metaById?.[entry.id]

@@ -36,6 +36,12 @@
   - **前端**：`web/src/components/SessionMonitorDrawer.vue`（消息**倒序**展示、最新在上；每块显示类型标签（user / assistant / system / tool / 其它）、内容（markdown-it 渲染，html 关闭防 XSS）、块下方时间（流式中为开始时间、结束后为完成时间）；流式块「生成中…」/「已中断」状态；页面渲染上限 500 块防 DOM 膨胀）+ `web/src/api/session-monitor.ts`（fetch SSE 助手，401 时清登录态跳登录页，与 axios 拦截器同语义）。Sessions 页操作列加宽至 150 容纳「探测 / 解绑」
   - **测试**：`test/monitor/`（38 例：去重写入 / 列表 / 级联 / 孤儿 / 保留期 / 重开持久化、chat / responses 两种 SSE 口径解析 / 跨 chunk 行切分 / 非 JSON 容错 / finish 幂等、门面事件推送 / 订阅摘除）+ `test/server/session-monitor.test.ts`（5 例端到端：非流式 / 流式落库、SSE 历史回放、实时推送、未知会话 404、解绑级联 404）
 
+## [0.6.1] - 2026-09-12
+
+### 修复
+
+- **Ollama / OpenAI 模型列表兼容字段补全**：`GET /api/tags` 的 `details` 补齐 `families` / `parameter_size` / `quantization_level`；`GET /v1/models` 增加 OpenAI 标准字段 `created` / `owned_by`，其中 `created` 使用网关进程启动时的 Unix 秒作为稳定伪值（网关无法获知上游模型真实创建时间）。
+
 ## [0.6.0] - 2026-08-19
 
 ### 新增

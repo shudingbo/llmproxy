@@ -291,6 +291,14 @@ describe('上游管理 /admin/api/upstreams', () => {
     expect(res2.body.id).toBe('u1')
   })
 
+  it('PUT 回传掩码 API Key 视为保持原值（防掩码覆盖真实密钥）', async () => {
+    const res = await req().put('/admin/api/upstreams/u1').send({ apiKey: '***1234' })
+    expect(res.status).toBe(200)
+    expect(res.body.apiKey).toBe('***1234')
+    // 存储中的明文未被掩码串覆盖
+    expect(store.get().upstreams[0].apiKey).toBe('sk-long-1234')
+  })
+
   it('PUT 不存在的上游返回 404', async () => {
     const res = await req().put('/admin/api/upstreams/nope').send({ baseUrl: 'https://x.com/v1' })
     expect(res.status).toBe(404)
@@ -361,6 +369,19 @@ describe('上游连通性测试 /admin/api/upstreams/:id/test', () => {
     const res2 = await req().post('/admin/api/upstreams/u1/test').send({ baseUrl: url, apiKey: 'sk-ovr' })
     expect(res2.body.ok).toBe(true)
     expect(capturedAuth).toBe('Bearer sk-ovr')
+  })
+
+  it('覆盖模式只传 baseUrl（未传 apiKey 字段）→ 沿用配置中的密钥', async () => {
+    let capturedAuth = ''
+    const url = await startMock((req, res) => {
+      capturedAuth = req.headers.authorization ?? ''
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ data: [{ id: 'a' }] }))
+    })
+    // 编辑弹窗「测试/检测」只传 baseUrl，不传 apiKey 字段
+    const res = await req().post('/admin/api/upstreams/u1/test').send({ baseUrl: url })
+    expect(res.body.ok).toBe(true)
+    expect(capturedAuth).toBe('Bearer sk-long-1234')
   })
 
   it('覆盖模式下未配置的上游 id 也可测试（无需存在于配置）', async () => {

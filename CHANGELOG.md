@@ -36,6 +36,13 @@
   - **前端**：`web/src/components/SessionMonitorDrawer.vue`（消息**倒序**展示、最新在上；每块显示类型标签（user / assistant / system / tool / 其它）、内容（markdown-it 渲染，html 关闭防 XSS）、块下方时间（流式中为开始时间、结束后为完成时间）；流式块「生成中…」/「已中断」状态；页面渲染上限 500 块防 DOM 膨胀）+ `web/src/api/session-monitor.ts`（fetch SSE 助手，401 时清登录态跳登录页，与 axios 拦截器同语义）。Sessions 页操作列加宽至 150 容纳「探测 / 解绑」
   - **测试**：`test/monitor/`（38 例：去重写入 / 列表 / 级联 / 孤儿 / 保留期 / 重开持久化、chat / responses 两种 SSE 口径解析 / 跨 chunk 行切分 / 非 JSON 容错 / finish 幂等、门面事件推送 / 订阅摘除）+ `test/server/session-monitor.test.ts`（5 例端到端：非流式 / 流式落库、SSE 历史回放、实时推送、未知会话 404、解绑级联 404）
 
+### 修复
+
+- **OpenCode 官方网关新增强制会话标识（`x-opencode-session`）导致上游 400 / 检测报 `ERR_BAD_REQUEST`**：OpenCode Go / Zen 现在要求每个请求带会话标识（缺失直接 `400 {"error":{"type":"MissingSessionID"}}`，axios 侧表现为 `ERR_BAD_REQUEST`），且要求客户端自报身份 UA。`OpenAIUpstreamClient` 统一构造请求头：`opencode.ai` 及其子域的请求始终补齐 `x-opencode-session`（优先沿用调用方透传的 `x-opencode-session` / `x-session-id` / `x-session-affinity`，保证同一会话稳定；管理端探针等无会话场景用实例级稳定 id 兜底），并发送 `llmproxy/<version>` UA。修复「上游检测」误判——探针请求此前不带会话头，Responses 原生探测一律失败被降级为 `convert`，现在可正确识别为 `native`
+- **管理端编辑上游会把掩码串写回为真实 apiKey**：`GET /admin/api/upstreams` 返回掩码值，前端编辑弹窗回填该掩码后保存即覆盖真实密钥（表现为上游突然全部 401）。前端编辑不再回填 apiKey（留空 = 保持原值），后端追加防御：PUT 的 `apiKey` 恰为现有值的掩码时视为「保持原值」；测试见 `test/server/admin.test.ts` 与 `test/upstream/openai.test.ts`
+- **编辑弹窗「测试 / 检测」对鉴权上游恒失败**：前端只传 `baseUrl`，后端覆盖模式把 `apiKey` 当空串处理 → 401 / `ERR_BAD_REQUEST`。改为「未提供 `apiKey` 字段时回落到配置值，显式空串仍表示无鉴权（Ollama 风格）」
+- **上下文长度探测（模型页「检测」）不支持 OpenCode**：原先剥掉 baseUrl 路径拼 `{origin}/v1/models`，OpenCode 的模型列表实际在 `/inference/go/v1/models`（404）；且只认 `data[].meta.n_ctx`。现改为按 baseUrl 路径拼 `models`（无路径才退回 `{origin}/v1/models`），并支持 `data[].limit.context`（OpenCode Go 返回 1000000）；测试见 `test/upstream/context.test.ts`
+
 ## [0.6.1] - 2026-09-12
 
 ### 修复

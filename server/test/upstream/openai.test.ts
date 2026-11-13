@@ -3,7 +3,8 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { Readable } from 'node:stream'
-import { afterEach, describe, expect, it } from 'vitest'
+import axios from 'axios'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { OpenAIUpstreamClient, openaiClient } from '../../src/upstream/openai.js'
 
 // 模拟服务器处理器类型
@@ -925,5 +926,69 @@ describe('OpenAIUpstreamClient 附加请求头', () => {
     )
     await drain(stream)
     expect(capturedHeaders?.['x-session-id']).toBe('sess-3')
+  })
+})
+
+describe('OpenAIUpstreamClient 会话头与 User-Agent', () => {
+  it('普通上游：自报 llmproxy UA，不注入 x-opencode-session', async () => {
+    let capturedHeaders: Record<string, string | string[] | undefined> | undefined
+    await startMock(async (req, res) => {
+      capturedHeaders = req.headers
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ data: [] }))
+    })
+    const client = new OpenAIUpstreamClient({ baseUrl, apiKey: 'sk-test', timeoutMs: 5000 })
+    await client.listModels()
+    expect(capturedHeaders?.['user-agent']).toMatch(/^llmproxy\//)
+    expect(capturedHeaders?.['x-opencode-session']).toBeUndefined()
+  })
+
+  it('opencode.ai 上游：无会话头时补 x-opencode-session，同实例稳定；探针请求也携带', async () => {
+    const captured: Array<{ url?: string; headers: Record<string, string> }> = []
+    const spy = vi.spyOn(axios, 'request').mockImplementation((async (config: {
+      url?: string
+      headers?: Record<string, string>
+    }) => {
+      captured.push({ url: config.url, headers: config.headers ?? {} })
+      return { data: { data: [], object: 'response' } }
+    }) as never)
+    try {
+      const client = new OpenAIUpstreamClient({
+        baseUrl: 'https://opencode.ai/inference/go/v1',
+        apiKey: 'sk-test',
+        timeoutMs: 5000,
+      })
+      await client.listModels()
+      // 探针（检测按钮）同样必须带会话标识，否则上游 400 MissingSessionID
+      await client.probeResponsesSupport('deepseek-v4.1-flash', true)
+      expect(captured).toHaveLength(2)
+      const first = captured[0].headers['x-opencode-session']
+      expect(first).toBeTruthy()
+      expect(captured[1].headers['x-opencode-session']).toBe(first)
+      expect(captured[0].headers['User-Agent']).toMatch(/^llmproxy\//)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('opencode.ai 上游：调用方透传的会话头优先于实例兜底 id', async () => {
+    const captured: Array<Record<string, string>> = []
+    const spy = vi.spyOn(axios, 'request').mockImplementation((async (config: {
+      headers?: Record<string, string>
+    }) => {
+      captured.push(config.headers ?? {})
+      return { data: { id: 'x', choices: [] } }
+    }) as never)
+    try {
+      const client = new OpenAIUpstreamClient({
+        baseUrl: 'https://opencode.ai/inference/go/v1',
+        apiKey: 'sk-test',
+        timeoutMs: 5000,
+      })
+      await client.chatCompletion({ model: 'm', messages: [] }, { headers: { 'x-session-id': 'sess-9' } })
+      expect(captured[0]['x-opencode-session']).toBe('sess-9')
+    } finally {
+      spy.mockRestore()
+    }
   })
 })

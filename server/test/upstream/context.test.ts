@@ -13,8 +13,8 @@ type MockHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise
 // 已启动的模拟上游服务器（afterEach 统一关闭）
 const servers: Server[] = []
 
-// 启动一个模拟上游，返回 baseUrl（形如 http://127.0.0.1:PORT/v1；探测逻辑会剥掉 /v1 取 origin）
-async function startMock(handler: MockHandler): Promise<string> {
+// 启动一个模拟上游，返回 baseUrl（缺省形如 http://127.0.0.1:PORT/v1；探测逻辑按 baseUrl 路径拼 /models）
+async function startMock(handler: MockHandler, pathSuffix = '/v1'): Promise<string> {
   const srv = createServer((req, res) => {
     Promise.resolve(handler(req, res)).catch((err: unknown) => {
       if (!res.destroyed) {
@@ -26,7 +26,7 @@ async function startMock(handler: MockHandler): Promise<string> {
   servers.push(srv)
   await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve))
   const { port } = srv.address() as AddressInfo
-  return `http://127.0.0.1:${port}/v1`
+  return `http://127.0.0.1:${port}${pathSuffix}`
 }
 
 // 便捷：写 JSON 响应（默认 200）
@@ -108,6 +108,25 @@ describe('probeMaxContext', () => {
       routedHandler({ llamaStatus: 404, lmStudioStatus: 404 }),
     )
     expect(await probeMaxContext(notFound)).toBeNull()
+  })
+
+  it('OpenCode 风格：保留 baseUrl 路径请求 /inference/go/v1/models 并读取 limit.context', async () => {
+    const baseUrl = await startMock((req, res) => {
+      if (req.url === '/inference/go/v1/models') {
+        json(res, { data: [{ id: 'deepseek-v4.1-flash', limit: { context: 1000000 } }] })
+        return
+      }
+      json(res, {}, 404)
+    }, '/inference/go/v1')
+    expect(await probeMaxContext(baseUrl, { model: 'deepseek-v4.1-flash' })).toBe(1000000)
+  })
+
+  it('baseUrl 无路径时退回 {origin}/v1/models', async () => {
+    const baseUrl = await startMock(
+      routedHandler({ llama: { data: [{ id: 'm1', meta: { n_ctx: 2048 } }] }, lmStudioStatus: 404 }),
+      '',
+    )
+    expect(await probeMaxContext(baseUrl)).toBe(2048)
   })
 
   it('带 model 参数时按 id 过滤：llama.cpp 返回匹配模型的 n_ctx，不匹配返回 null', async () => {

@@ -247,6 +247,11 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     }
     const patch = { ...(req.body as Record<string, unknown>) }
     delete patch.id
+    // 防御：编辑表单可能回传展示用掩码值（***xxxx）→ 视为「保持原密钥」，
+    // 避免把真实密钥覆盖成掩码串导致上游鉴权失效
+    if (typeof patch.apiKey === 'string' && patch.apiKey === maskApiKey(existing.apiKey)) {
+      delete patch.apiKey
+    }
     const parsed = UpstreamSchema.safeParse({ ...existing, ...patch })
     if (!parsed.success) {
       res.status(400).json({ error: 'invalid_upstream', issues: parsed.error.issues.map((i) => i.message) })
@@ -291,10 +296,12 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     const body = (req.body ?? {}) as Record<string, unknown>
     let client: OpenAIUpstreamClient
     if (typeof body.baseUrl === 'string') {
-      // 覆盖模式：超时沿用已配置上游的值（无配置时 30s），apiKey 缺省为空
+      // 覆盖模式：超时沿用已配置上游的值（无配置时 30s）；未提供 apiKey 字段时回落到配置值
+      // （编辑弹窗「测试/检测」只传 baseUrl），显式传空串仍表示无鉴权（Ollama 风格）
+      const overrideKey = typeof body.apiKey === 'string' ? body.apiKey : (configured?.apiKey ?? '')
       client = new OpenAIUpstreamClient({
         baseUrl: body.baseUrl,
-        apiKey: typeof body.apiKey === 'string' ? body.apiKey : '',
+        apiKey: overrideKey,
         timeoutMs: configured?.timeoutMs ?? 30000,
       })
     } else {
@@ -337,10 +344,12 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     const body = (req.body ?? {}) as Record<string, unknown>
     let client: OpenAIUpstreamClient
     if (typeof body.baseUrl === 'string') {
-      // 覆盖模式：超时沿用已配置上游的值（无配置时 30s），apiKey 缺省为空
+      // 覆盖模式：超时沿用已配置上游的值（无配置时 30s）；未提供 apiKey 字段时回落到配置值
+      // （编辑弹窗「测试/检测」只传 baseUrl），显式传空串仍表示无鉴权（Ollama 风格）
+      const overrideKey = typeof body.apiKey === 'string' ? body.apiKey : (configured?.apiKey ?? '')
       client = new OpenAIUpstreamClient({
         baseUrl: body.baseUrl,
-        apiKey: typeof body.apiKey === 'string' ? body.apiKey : '',
+        apiKey: overrideKey,
         timeoutMs: configured?.timeoutMs ?? 30000,
       })
     } else {

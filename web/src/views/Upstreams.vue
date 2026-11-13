@@ -181,12 +181,12 @@ function openCreate() {
   dialogVisible.value = true
 }
 
-// 打开编辑弹窗：预填已有数据（apiKey 为掩码值）
+// 打开编辑弹窗：预填已有数据（apiKey 不回填：列表返回的是掩码值，回填后再保存会覆盖真实密钥）
 function openEdit(row: UpstreamItem) {
   editingId.value = row.id
   form.id = row.id
   form.baseUrl = row.baseUrl
-  form.apiKey = row.apiKey
+  form.apiKey = ''
   form.timeoutMs = row.timeoutMs
   form.disabled = row.disabled
   form.responsesApi = row.responsesApi ?? 'convert'

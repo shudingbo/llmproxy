@@ -1,5 +1,7 @@
 // OpenAI 兼容上游的 HTTP 客户端：模型列表 / 聊天补全（非流式与 SSE 流式）
 // 只负责把请求发到上游并返回响应（或响应流）；不做重试、不做故障转移（那是 router 的职责）
+import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { Readable } from 'node:stream'
 import axios from 'axios'
 import type { AxiosRequestConfig, AxiosResponse } from 'axios'
@@ -7,6 +9,40 @@ import type { Upstream } from '../config/schema.js'
 
 // Responses 原生支持探测的独立超时：默认上游超时（30s）对探测过长，单独收紧到 5s
 const PROBE_TIMEOUT_MS = 5000
+
+// 上游请求 User-Agent：OpenCode 等上游要求客户端自报身份，明确禁止 axios 等通用 HTTP 库 UA
+const USER_AGENT = ((): string => {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf-8')) as {
+      version?: unknown
+    }
+    return `llmproxy/${typeof pkg.version === 'string' ? pkg.version : 'unknown'}`
+  } catch {
+    return 'llmproxy/unknown'
+  }
+})()
+
+// 是否 OpenCode 官方网关（opencode.ai 及其子域）：
+// 该网关（Go / Zen）要求请求携带会话标识，缺失时直接 400 MissingSessionID
+const isOpenCodeBaseUrl = (baseUrl: string): boolean => {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase()
+    return host === 'opencode.ai' || host.endsWith('.opencode.ai')
+  } catch {
+    return false
+  }
+}
+
+// 按名查找请求头（大小写不敏感），供会话头优先级判定使用
+const findHeaderValue = (headers: Record<string, string>, name: string): string | undefined => {
+  const lower = name.toLowerCase()
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === lower) {
+      return value
+    }
+  }
+  return undefined
+}
 
 // 上游请求体最小公共形状（chat / responses 共用）：model + stream 为核心，其余字段原样透传
 export interface UpstreamStreamRequest {
@@ -131,6 +167,9 @@ export class OpenAIUpstreamClient {
   private readonly baseUrl: string
   private readonly apiKey: string
   private readonly timeoutMs: number
+  // OpenCode 网关要求每个请求带会话标识；调用方未透传会话头时用本实例的稳定 id 兜底
+  private readonly requiresSessionHeader: boolean
+  private readonly fallbackSessionId: string
 
   constructor({ baseUrl, apiKey, timeoutMs }: OpenAIUpstreamClientOptions) {
     // 去掉尾部斜杠，避免拼路径时出现双斜杠
@@ -138,6 +177,35 @@ export class OpenAIUpstreamClient {
     // apiKey 仅存于私有字段，任何日志/请求体都不应包含它
     this.apiKey = apiKey
     this.timeoutMs = timeoutMs
+    this.requiresSessionHeader = isOpenCodeBaseUrl(this.baseUrl)
+    this.fallbackSessionId = randomUUID()
+  }
+
+  /**
+   * 构造上游请求头：
+   * - 自报身份 UA（OpenCode 等上游要求，禁止通用 HTTP 库 UA）
+   * - 鉴权头只来自配置，绝不接受调用方传入的 Authorization；附加头展开在鉴权头之前，
+   *   保证 Authorization / Content-Type 不可被覆盖
+   * - OpenCode 网关：始终补齐 x-opencode-session（会话标识缺失会被 400 拒绝）。
+   *   优先沿用调用方透传的会话头（x-opencode-session / x-session-id / x-session-affinity，
+   *   由会话键计算、同一会话稳定），都没有时用实例兜底 id（管理端探针等无会话场景）
+   */
+  private buildHeaders(extra: Record<string, string> | undefined): Record<string, string> {
+    const headers: Record<string, string> = {
+      ...extra,
+      'User-Agent': USER_AGENT,
+      Authorization: `Bearer ${this.apiKey}`,
+      'Content-Type': 'application/json',
+    }
+    if (this.requiresSessionHeader) {
+      const session =
+        findHeaderValue(headers, 'x-opencode-session') ||
+        findHeaderValue(headers, 'x-session-id') ||
+        findHeaderValue(headers, 'x-session-affinity') ||
+        this.fallbackSessionId
+      headers['x-opencode-session'] = session
+    }
+    return headers
   }
 
   /**
@@ -153,13 +221,7 @@ export class OpenAIUpstreamClient {
     const config: AxiosRequestConfig = {
       method,
       url: `${this.baseUrl}${path}`,
-      // 鉴权头只来自配置，绝不接受调用方传入的 Authorization；
-      // 附加头（如 x-session-id）展开在鉴权头之前，保证 Authorization / Content-Type 不可被覆盖
-      headers: {
-        ...options.headers,
-        Authorization: `Bearer ${this.apiKey}`,
-        'Content-Type': 'application/json',
-      },
+      headers: this.buildHeaders(options.headers),
       // 未显式传 timeout 时沿用默认值，probe 等场景可单独覆盖
       timeout: options.timeout ?? this.timeoutMs,
       signal: options.signal,

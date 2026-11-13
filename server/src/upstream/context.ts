@@ -16,9 +16,14 @@ export interface ProbeContextOptions {
 // 缺省请求超时（毫秒），与参考实现一致
 const DEFAULT_TIMEOUT_MS = 5000
 
-// llama.cpp /v1/models 响应结构（宽松：只取需要的字段，其余忽略）
+// llama.cpp / OpenAI 兼容 /v1/models 响应结构（宽松：只取需要的字段，其余忽略）
 interface LlamaCppModelsResponse {
-  data?: Array<{ id?: string; meta?: { n_ctx?: number | string | null } }>
+  data?: Array<{
+    id?: string
+    meta?: { n_ctx?: number | string | null }
+    // OpenCode Go / 部分聚合网关把上下文长度放在 limit.context
+    limit?: { context?: number | string | null }
+  }>
 }
 
 // LM Studio /api/v1/models 响应结构（宽松）
@@ -48,7 +53,7 @@ export async function probeMaxContext(baseUrl: string, options: ProbeContextOpti
 
   // 并行请求两个端点，取首个成功
   const results = await Promise.allSettled([
-    tryLlamaCpp(origin, model, timeoutMs, headers),
+    tryLlamaCpp(baseUrl, model, timeoutMs, headers),
     tryLmStudio(origin, model, timeoutMs, headers),
   ])
 
@@ -78,17 +83,19 @@ function getOrigin(url: string): string {
 }
 
 /**
- * 尝试 llama.cpp 的 /v1/models 端点：data[].meta.n_ctx，Number 后 >0 且非 NaN 即返回。
- * model 为空时不按 id 过滤（取首个有值模型）。
+ * 尝试 OpenAI 兼容的 models 端点：data[].meta.n_ctx（llama.cpp）/ data[].limit.context（OpenCode Go），
+ * Number 后 >0 且非 NaN 即返回。model 为空时不按 id 过滤（取首个有值模型）。
+ * URL 按 baseUrl 拼接（保留其路径，OpenCode 的模型列表在 /inference/go/v1/models）：
+ * baseUrl 无路径时退回 {origin}/v1/models（llama.cpp 常见形态）。
  * axios 默认对非 2xx 抛错（落入 Promise.allSettled 的 rejected 分支，视为该端点失败）。
  */
 async function tryLlamaCpp(
-  origin: string,
+  baseUrl: string,
   model: string,
   timeoutMs: number,
   headers: Record<string, string>,
 ): Promise<number | null> {
-  const url = `${origin.replace(/\/+$/, '')}/v1/models`
+  const url = buildModelsUrl(baseUrl)
   const config: AxiosRequestConfig = {
     method: 'GET',
     url,
@@ -103,13 +110,20 @@ async function tryLlamaCpp(
       if (model && m?.id !== model) {
         continue
       }
-      const nCtx = Number(m?.meta?.n_ctx)
+      const nCtx = Number(m?.meta?.n_ctx ?? m?.limit?.context)
       if (!Number.isNaN(nCtx) && nCtx > 0) {
         return nCtx
       }
     }
   }
   return null
+}
+
+/** 由 baseUrl 推导 OpenAI 兼容 models 端点：保留路径拼 /models；无路径时用 {origin}/v1/models */
+function buildModelsUrl(baseUrl: string): string {
+  const url = new URL(baseUrl)
+  const path = url.pathname.replace(/\/+$/, '')
+  return path === '' ? `${url.origin}/v1/models` : `${url.origin}${path}/models`
 }
 
 /**

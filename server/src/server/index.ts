@@ -17,6 +17,7 @@ import { ApiKeyStore } from '../auth/db.js'
 import { createAuthMiddleware } from '../auth/middleware.js'
 import { AdminSessionStore } from '../auth/session-store.js'
 import { getConfigPath, getDataDir, getLogDir } from '../paths.js'
+import { RECLAIM_THRESHOLD_BYTES, enableIncrementalAutoVacuum, reclaimFreeSpace } from '../db/vacuum.js'
 import { getLogger, initLogRetention, requestLogger, configureLogging, setLogStore } from '../logger/index.js'
 import { RETENTION_DAYS } from '../logger/sweep.js'
 import { registerAdminRoutes } from './admin.js'
@@ -74,18 +75,27 @@ export function createApp(deps: AppDeps): Express {
   store.subscribe(rebuildClients)
 
   // 单例负载均衡器与统计计数器（跨请求共享）
+  // 五类存储共用同一 SQLite 文件
+  const dbPath = join(getDataDir(), 'llmproxy.db')
+  // 空间回收模式：一次性把 DB 转为 incremental auto_vacuum（文件级持久属性，仅首次启动触发全量 VACUUM，
+  // 发生在 listen 之前不影响在线服务；转换耗时与存活数据量成正比，与文件大小无关）。失败仅告警不阻断启动
+  try {
+    enableIncrementalAutoVacuum(dbPath)
+  } catch (err) {
+    getLogger().warn('数据库空间回收模式启用失败（跳过，不影响启动）', err)
+  }
   // 会话亲和均衡器：同一会话（内容前缀 hash / Open WebUI chat_id）粘附同一上游，利用 LLM prompt cache；
   // 无会话键的请求委托内部轮询均衡器，行为不变
-  const sessionStore = new SessionStore(join(getDataDir(), 'llmproxy.db'))
+  const sessionStore = new SessionStore(dbPath)
   // 日志 SQLite 存储：与 SessionStore 共用 ~/llmproxy/llmproxy.db（WAL 多连接安全）
-  const logStore = new LogStore(join(getDataDir(), 'llmproxy.db'))
+  const logStore = new LogStore(dbPath)
   // API Key 鉴权存储：与 SessionStore / LogStore 共用 ~/llmproxy/llmproxy.db
-  const apiKeyStore = new ApiKeyStore(join(getDataDir(), 'llmproxy.db'))
+  const apiKeyStore = new ApiKeyStore(dbPath)
   // 管理端会话存储：与 ApiKeyStore 共用 ~/llmproxy/llmproxy.db（WAL 多连接安全）
-  const adminSessionStore = new AdminSessionStore(join(getDataDir(), 'llmproxy.db'))
+  const adminSessionStore = new AdminSessionStore(dbPath)
   // 会话消息监控存储：与 SessionStore / LogStore 共用 ~/llmproxy/llmproxy.db（WAL 多连接安全）；
   // 持久化各会话与 LLM 交互的消息，实时推送给管理端"探测"抽屉（SSE）
-  const monitor = new SessionMonitor(join(getDataDir(), 'llmproxy.db'))
+  const monitor = new SessionMonitor(dbPath)
   // 双写：所有 getLogger().info/warn/... 在写文件的同时写 SQLite
   setLogStore(logStore)
   // 会话亲和总开关：routing.sessionAffinity.enabled 缺省为 true（schema 已给默认值），
@@ -95,6 +105,20 @@ export function createApp(deps: AppDeps): Express {
     ? new SessionAffinityLoadBalancer(sessionStore, new RoundRobinLoadBalancer())
     : new RoundRobinLoadBalancer()
   const stats = new StatsCounter()
+
+  // 空闲页回收（带日志与错误隔离）：freelist 超过回收门限才触发；门限从配置 database.reclaimThresholdBytes
+  // 实时读取（热更新，管理端「数据库管理」页可改），未配置回退缺省 5GB。回收失败仅告警，不影响清理结果与业务
+  const reclaimFreeSpaceGuarded = (): void => {
+    try {
+      const threshold = store.get().database?.reclaimThresholdBytes ?? RECLAIM_THRESHOLD_BYTES
+      const reclaimed = reclaimFreeSpace(dbPath, threshold)
+      if (reclaimed > 0) {
+        getLogger().info(`数据库空闲页回收完成，释放 ${(reclaimed / 1024 / 1024).toFixed(1)} MB`, 'db-vacuum')
+      }
+    } catch (err) {
+      getLogger().warn('数据库空闲页回收失败', err)
+    }
+  }
 
   // 会话粘附自动清理：读配置取保留期与清理周期，启动执行一次 + 周期调度（interval 0 关闭）
   const routing = store.get().routing?.sessionAffinity
@@ -107,6 +131,8 @@ export function createApp(deps: AppDeps): Express {
       // 级联：会话映射已删除的会话键，其监控消息一并清理（孤儿清扫）
       const orphaned = monitor.deleteOrphaned()
       if (orphaned > 0) getLogger().info(`会话消息孤儿清理完成，删除 ${orphaned} 条`, 'session-message-cleanup')
+      // 空闲页回收：删除产生的 freelist 超过门限（5GB）时截断出文件（分块执行，块间让出写锁）
+      reclaimFreeSpaceGuarded()
     } catch (err) {
       getLogger().warn('会话清理失败', err)
     }
@@ -125,6 +151,8 @@ export function createApp(deps: AppDeps): Express {
       // 会话消息保留期兜底清扫：与日志同保留期（RETENTION_DAYS 天），孤儿清扫之外的时间维度保险
       const expired = monitor.deleteExpired(RETENTION_DAYS * 24 * 60 * 60 * 1000)
       if (expired > 0) getLogger().info(`会话消息过期清理完成，删除 ${expired} 条`, 'session-message-cleanup')
+      // 空闲页回收：日志 / 消息删除产生的 freelist 超过门限（5GB）时截断出文件
+      reclaimFreeSpaceGuarded()
     } catch (err) {
       getLogger().warn('日志 DB 清理失败', err)
     }

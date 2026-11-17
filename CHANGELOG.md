@@ -6,6 +6,19 @@
 
 ### 新增
 
+- **管理端「数据库管理」页（SystemConfig 新 tab）**：数据库状态可视化 + 收缩门限可配置 + 手动收缩按钮
+  - **状态接口**：`GET /admin/api/database` 返回 DB 文件路径 / 文件与 WAL 大小 / 页级分布（`page_size` / `page_count` / 存活 `usedBytes` / 空闲 `freeBytes`）/ `auto_vacuum` 模式 / 各用户表行数与 B-tree 占用（`dbstat` 虚表聚合，按占用降序；编译产物缺 dbstat 时降级为仅行数）。新增 `getDatabaseStats`（`server/src/db/vacuum.ts`，只读连接在线查询，不产生写锁）
+  - **手动收缩**：`POST /admin/api/database/vacuum` 无视门限直接回收全部空闲页（`threshold=1`）；库未处于 incremental auto_vacuum 模式时先做一次性模式转换（内部全量 VACUUM，幂等），保证按钮在任何库上都有效。响应携带释放字节数与收缩后的最新状态（前端免二次查询）
+  - **门限可配置**：新增配置节 `database.reclaimThresholdBytes`（字节，0-1TB，缺省 5GB；0 = 有空闲即回收），取代硬编码 `RECLAIM_THRESHOLD_BYTES` 作为回收判据——会话 / 日志清理（`index.ts`）与手动清理路由（`admin.ts`）每次清理实时读取，改后**即时生效无需重启**（`RECLAIM_THRESHOLD_BYTES` 常量保留为缺省回退值）。`PUT /admin/api/config` 支持 `database` 节部分更新（`prefault` 防未提供节被默认值重置，永不列入 `restartRequired`）
+  - **前端**：`/system-config` 新增「数据库管理」tab——状态卡（文件容量 / WAL / 数据占用 / 空闲可回收 / auto_vacuum 模式 tag / 各表明细表）、门限输入（GB，换算字节保存）、「立即收缩」按钮（确认弹窗 + 成功提示释放量）；独立于顶部「保存」按钮
+  - **测试**：`test/db/vacuum.test.ts` 新增 2 例（getDatabaseStats 页级恒等式与表统计 / 文件缺失抛错）+ `test/server/admin-database.test.ts` 新增 6 例（状态快照 / 文件缺失 500 / 手动收缩回收与模式自动转换 / 无空闲返回 0 / 门限持久化与回显 / 门限校验 400）
+
+- **SQLite 空闲页自动回收（磁盘膨胀修复）**：长期运行下 logs / session_messages / sessions 的保留期清理只删行不归还磁盘——SQLite 的 DELETE 把页挂入 freelist，文件永不收缩（实际案例：库文件膨胀到 15GB 而存活数据仅约 10MB）。新增 `server/src/db/vacuum.ts` 空间回收助手：
+  - **模式转换（一次性）**：启动装配（`createApp`，listen 之前，不影响在线服务）把 DB 文件转为 incremental auto_vacuum 模式（文件级持久属性，幂等）；转换需一次全量 VACUUM，耗时与存活数据量成正比（空闲页不参与重建），与文件历史大小无关
+  - **按门限回收**：会话清理 / 日志 DB 清理（启动一次 + 周期调度）与手动清理路由（`POST /admin/api/logs/cleanup`、`POST /admin/api/sessions/cleanup`）末尾检查 freelist——超过 `RECLAIM_THRESHOLD_BYTES`（**5GB**）才触发 `incremental_vacuum` 把空闲页截断出文件。**滞回语义**：触发后清空整个 freelist，之后需重新积累超 5GB 才会再次触发；空闲页在下次写入时优先复用，低于门限完全无害。**分块执行**：单事务最多 64MB 页，块间让出写锁（WAL 读不受影响，写可插队），最坏阻塞有界；实现注意 `incremental_vacuum` 是行返回型 pragma，不能用 `{simple:true}`（只 step 一次 = 每次仅移 1 页）
+  - **失败隔离**：回收失败仅告警，不影响清理结果与业务请求
+  - **测试**：`test/db/vacuum.test.ts`（模式转换幂等 / 超门限回收并截断文件 / 门限下不动 / 非增量模式不生效）
+
 - **会话 token 用量统计（`sessions` 表 7 个统计列 + `/sessions` 页 6 个新列）**：逐请求捕获上游返回的 token 使用统计并累加进会话行——输入 / 输出 token、首 token 时延（TTFT）、token 速率、请求数
   - **数据来源（直接取自上游响应，不估算）**：非流式取响应体 `usage`（`/api/chat` 取原始 OpenAI 响应）；流式利用网关既有的 `stream_options.include_usage = true` 注入，`SseUsageTap`（`server/src/session/usage.ts`）被动挂接 SSE 流解析末尾 usage 块（不消费流，与 pipe / 监控记录器共存）；Responses 口径取 `response.completed.response.usage`（convert 路径由转换器注入，原生透传取原事件）。四条链路全覆盖：`/v1/chat/completions` 流式 / 非流式、`/v1/responses`（convert / native）流式 / 非流式、`/api/chat` 流式 / 非流式
   - **首 token 时延**：从成功候选发起（hrtime 零点，回退场景取最终成功那次尝试）到首个携带内容的 delta（正文或思考）；非流式无此概念。**生成时长**：流式 = 流结束 − 首 token，非流式 = 全程耗时

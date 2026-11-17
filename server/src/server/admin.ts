@@ -3,6 +3,7 @@
 // 全局登录鉴权（白名单：/auth/login、/auth/salt、/auth/status、/auth/logout、/health），无 CORS（开发期走 web/vite 代理）；apiKey 一律不落日志、响应中全部掩码
 import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { networkInterfaces } from 'node:os'
 import type { Express, Request, Response } from 'express'
 import { z, type ZodType } from 'zod'
@@ -20,7 +21,8 @@ import { normalizeDownstreamAliasEntry } from '../config/loader.js'
 import { getLogger } from '../logger/index.js'
 import { sweepLogsBefore } from '../logger/sweep.js'
 import { LogStore } from '../logstore/index.js'
-import { getLogDir } from '../paths.js'
+import { getLogDir, getDataDir } from '../paths.js'
+import { RECLAIM_THRESHOLD_BYTES, enableIncrementalAutoVacuum, getDatabaseStats, reclaimFreeSpace } from '../db/vacuum.js'
 import type { StatsCounter } from '../stats/counter.js'
 import { SessionStore } from '../session/db.js'
 import type { SessionMonitor } from '../monitor/index.js'
@@ -204,6 +206,10 @@ function resolvePublicBaseUrl(listen: { host: string; port: number }): string {
  */
 export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
   const { store, getUpstreamClient, stats, sessionStore, logStore, apiKeyStore, adminSessionStore, monitor, cli } = deps
+
+  // 数据库空闲页回收门限（字节）：配置 database.reclaimThresholdBytes（热更新，每次清理实时读），
+  // 未配置回退编译期缺省 5GB
+  const getReclaimThreshold = (): number => store.get().database?.reclaimThresholdBytes ?? RECLAIM_THRESHOLD_BYTES
 
   // 管理端会话鉴权：全局挂载到 /admin/api，白名单外的所有端点一律要求登录
   // 白名单为相对挂载点的路径（中间件内 req.path 已剥离 /admin/api 前缀）
@@ -532,6 +538,15 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     try {
       const deleted = logStore.deleteBefore(before)
       const deletedFiles = sweepLogsBefore(getLogDir(), before)
+      // 空闲页回收：日志删除产生的 freelist 超过门限时截断出文件（失败仅告警，不影响清理结果）
+      try {
+        const reclaimed = reclaimFreeSpace(join(getDataDir(), 'llmproxy.db'), getReclaimThreshold())
+        if (reclaimed > 0) {
+          getLogger().info(`数据库空闲页回收完成，释放 ${(reclaimed / 1024 / 1024).toFixed(1)} MB`, 'db-vacuum')
+        }
+      } catch (err) {
+        getLogger().warn('数据库空闲页回收失败', err)
+      }
       res.json({ deleted, deletedFiles, before })
     } catch (err) {
       getLogger().warn({ err }, '手动清理日志失败')
@@ -639,6 +654,15 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
       const deleted = sessionStore.cleanup(maxAgeMs)
       // 级联：被清理的会话键，其监控消息一并删除（孤儿清扫）
       const orphaned = monitor?.deleteOrphaned() ?? 0
+      // 空闲页回收：会话 / 消息删除产生的 freelist 超过门限时截断出文件（失败仅告警，不影响清理结果）
+      try {
+        const reclaimed = reclaimFreeSpace(join(getDataDir(), 'llmproxy.db'), getReclaimThreshold())
+        if (reclaimed > 0) {
+          getLogger().info(`数据库空闲页回收完成，释放 ${(reclaimed / 1024 / 1024).toFixed(1)} MB`, 'db-vacuum')
+        }
+      } catch (err) {
+        getLogger().warn('数据库空闲页回收失败', err)
+      }
       res.json({ deleted, deletedMessages: orphaned })
     } catch (err) {
       getLogger().warn({ err, maxAgeMs }, '会话粘附过期清理失败')
@@ -1135,21 +1159,62 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     })
   })
 
+  // 数据库状态：文件容量 / 页级分布（存活 / 空闲）/ auto_vacuum 模式 / 各表行数与占用 +
+  // 当前生效的空闲页回收门限（database.reclaimThresholdBytes，未配置为缺省 5GB）。
+  // getDatabaseStats 用只读连接在线查询，不产生写锁
+  app.get('/admin/api/database', (_req: Request, res: Response) => {
+    const dbPath = join(getDataDir(), 'llmproxy.db')
+    try {
+      const stats = getDatabaseStats(dbPath)
+      res.json({ status: true, msg: 'ok', path: dbPath, db: stats, thresholdBytes: getReclaimThreshold() })
+    } catch (err) {
+      getLogger().warn({ err }, '数据库状态查询失败')
+      res.status(500).json({ status: false, msg: '数据库状态查询失败', error: 'db_stats_failed' })
+    }
+  })
+
+  // 手动触发数据库收缩：无视门限直接回收全部空闲页（threshold=1 → freelist 非空即回收）。
+  // 非 incremental auto_vacuum 模式下 incremental_vacuum 不生效，先做一次性模式转换
+  // （内部含一次全量 VACUUM，耗时与存活数据量成正比）再回收，保证按钮在任何库上都有效。
+  // 返回释放字节数与收缩后的最新状态（前端直接刷新，不用再查一次）
+  app.post('/admin/api/database/vacuum', (_req: Request, res: Response) => {
+    const dbPath = join(getDataDir(), 'llmproxy.db')
+    try {
+      // 模式保障：未启用增量模式时先转换（幂等；已是增量模式时直接返回，不产生 VACUUM）
+      enableIncrementalAutoVacuum(dbPath)
+      const reclaimed = reclaimFreeSpace(dbPath, 1)
+      if (reclaimed > 0) {
+        getLogger().info(`手动数据库收缩完成，释放 ${(reclaimed / 1024 / 1024).toFixed(1)} MB`, 'db-vacuum')
+      }
+      const stats = getDatabaseStats(dbPath)
+      res.json({
+        status: true,
+        msg: reclaimed > 0 ? `收缩完成，释放 ${(reclaimed / 1024 / 1024).toFixed(1)} MB` : '当前没有可回收的空闲页',
+        reclaimedBytes: reclaimed,
+        db: stats,
+        thresholdBytes: getReclaimThreshold(),
+      })
+    } catch (err) {
+      getLogger().warn({ err }, '手动数据库收缩失败')
+      res.status(500).json({ status: false, msg: '手动数据库收缩失败', error: 'db_vacuum_failed' })
+    }
+  })
+
   // 当前生效配置：apiKey 掩码后返回
   app.get('/admin/api/config', (_req: Request, res: Response) => {
     const config = store.get()
     res.json({ ...config, upstreams: config.upstreams.map((u) => ({ ...u, apiKey: maskApiKey(u.apiKey) })) })
   })
 
-  // 保存系统配置：部分更新 server / routing / auth 三节（请求体缺省的键不修改现有值）
-  // 校验用 ConfigSchema.pick（三节本身 optional，未知顶层键被过滤）；写回复用 store.set（原子写盘 + deepEqual 防自环）
+  // 保存系统配置：部分更新 server / routing / auth / database 四节（请求体缺省的键不修改现有值）
+  // 校验用 ConfigSchema.pick（节本身 optional，未知顶层键被过滤）；写回复用 store.set（原子写盘 + deepEqual 防自环）
   // restartRequired 语义：本次请求体实际提供的、需重启才生效的顶层键——
   //   server 节（监听 host/port 与 bodyLimit 在进程启动时绑定）→ 含 'server'；
   //   routing 节（会话亲和开关与清理参数在启动时读取，节内无其它字段）→ 含 'routing'；
-  //   auth 节每请求实时读 store，永不列入
+  //   auth / database 节每请求 / 每次清理实时读 store，永不列入
   app.put('/admin/api/config', (req: Request, res: Response) => {
     const body = (req.body ?? {}) as Record<string, unknown>
-    const parsed = ConfigSchema.pick({ server: true, routing: true, auth: true }).safeParse(req.body)
+    const parsed = ConfigSchema.pick({ server: true, routing: true, auth: true, database: true }).safeParse(req.body)
     if (!parsed.success) {
       const issues = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`)
       res
@@ -1157,12 +1222,13 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
         .json({ status: false, msg: `系统配置校验失败：${issues.join('；')}`, error: 'invalid_config', issues })
       return
     }
-    // 注：AuthConfigSchema 的 .prefault({}) 会使未提供的 auth 节也带默认值出现在 parsed.data，
-    // 直接合并会把未提供的节静默重置为默认值（例如把已启用的鉴权关掉），故按请求体实际提供的键过滤
-    const patch: Partial<Pick<Config, 'server' | 'routing' | 'auth'>> = {}
+    // 注：AuthConfigSchema / DatabaseConfigSchema 的 .prefault({}) 会使未提供的节也带默认值出现在
+    // parsed.data，直接合并会把未提供的节静默重置为默认值（例如把已启用的鉴权关掉），故按请求体实际提供的键过滤
+    const patch: Partial<Pick<Config, 'server' | 'routing' | 'auth' | 'database'>> = {}
     if (body.server !== undefined) patch.server = parsed.data.server
     if (body.routing !== undefined) patch.routing = parsed.data.routing
     if (body.auth !== undefined) patch.auth = parsed.data.auth
+    if (body.database !== undefined) patch.database = parsed.data.database
     // 需重启的顶层键：以请求体实际提供的键为准（与写入过滤同一判据）
     const restartRequired: string[] = []
     if (body.server !== undefined) restartRequired.push('server')

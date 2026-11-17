@@ -81,15 +81,72 @@
             </el-form-item>
           </el-form>
         </el-tab-pane>
+
+        <!-- 数据库管理：状态只读展示 + 收缩门限设置 + 手动收缩；
+             独立于顶部「保存」按钮（不参与三节表单快照），门限单独保存、实时生效 -->
+        <el-tab-pane label="数据库管理">
+          <div v-loading="dbLoading" class="db-panel">
+            <!-- 状态卡片：文件容量 / 页级分布 / auto_vacuum 模式 -->
+            <el-descriptions v-if="dbInfo" :column="3" border size="small" class="db-desc">
+              <el-descriptions-item label="数据库文件" :span="3">
+                <span class="db-path">{{ dbPath }}</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="文件大小">{{ formatBytes(dbInfo.fileSizeBytes) }}</el-descriptions-item>
+              <el-descriptions-item label="WAL 大小">{{ formatBytes(dbInfo.walSizeBytes) }}</el-descriptions-item>
+              <el-descriptions-item label="页大小">{{ formatBytes(dbInfo.pageSize) }}</el-descriptions-item>
+              <el-descriptions-item label="数据占用">{{ formatBytes(dbInfo.usedBytes) }}</el-descriptions-item>
+              <el-descriptions-item label="空闲可回收">
+                <span :class="{ 'free-warn': dbInfo.freeBytes > 0 }">{{ formatBytes(dbInfo.freeBytes) }}</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="auto_vacuum">
+                <el-tag :type="autoVacuumTag.type" size="small">{{ autoVacuumTag.label }}</el-tag>
+              </el-descriptions-item>
+            </el-descriptions>
+
+            <el-alert v-if="dbLoadError" type="error" :title="dbLoadError" :closable="false" show-icon class="db-error" />
+
+            <!-- 操作区：刷新 + 手动收缩（确认弹窗；无视门限回收全部空闲页） -->
+            <div class="db-actions">
+              <el-button :disabled="dbLoading" @click="loadDb">刷新状态</el-button>
+              <el-button type="danger" :loading="vacuuming" :disabled="!dbInfo" @click="vacuumNow">
+                立即收缩
+              </el-button>
+            </div>
+
+            <!-- 收缩门限：前端以 GB 输入，保存时换算为字节数写入配置 database 节（实时生效） -->
+            <el-form label-width="140px" class="db-threshold-form">
+              <el-form-item label="自动收缩门限 (GB)">
+                <div class="threshold-row">
+                  <el-input-number v-model="thresholdGB" :min="0" :max="1024" :step="1" :precision="2" />
+                  <el-button type="primary" :loading="thresholdSaving" @click="saveThreshold">保存门限</el-button>
+                </div>
+              </el-form-item>
+              <el-text class="field-note" type="info" size="small">
+                空闲页累计超过门限后，会话 / 日志清理时会自动收缩并截断文件（0 = 有空闲页即回收；低于门限的空闲页无害，写入时优先复用）。保存后实时生效，无需重启
+              </el-text>
+            </el-form>
+
+            <!-- 各表占用明细：按占用字节降序 -->
+            <el-table v-if="dbInfo" :data="dbInfo.tables" size="small" class="db-tables">
+              <el-table-column prop="name" label="表" min-width="200" show-overflow-tooltip />
+              <el-table-column label="行数" width="140">
+                <template #default="{ row }">{{ row.rows.toLocaleString() }}</template>
+              </el-table-column>
+              <el-table-column label="占用" width="160">
+                <template #default="{ row }">{{ row.sizeBytes > 0 ? formatBytes(row.sizeBytes) : '—' }}</template>
+              </el-table-column>
+            </el-table>
+          </div>
+        </el-tab-pane>
       </el-tabs>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
+import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { api } from '../api/client'
 
 const router = useRouter()
@@ -328,7 +385,151 @@ async function save() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadDb()
+})
+
+// ===== 数据库管理 tab =====
+
+// 单张用户表统计：行数 + B-tree 实际占用字节（后端 getDatabaseStats 提供）
+interface DbTableStat {
+  name: string
+  rows: number
+  sizeBytes: number
+}
+
+// 数据库状态快照：与后端 DatabaseStats（server/src/db/vacuum.ts）契约一致
+interface DatabaseStats {
+  fileSizeBytes: number
+  walSizeBytes: number
+  pageSize: number
+  pageCount: number
+  usedBytes: number
+  freeBytes: number
+  autoVacuum: number
+  tables: DbTableStat[]
+}
+
+// GET /admin/api/database 响应：状态 + 当前生效的回收门限 + DB 文件路径
+interface DatabaseResponse {
+  status: boolean
+  msg?: string
+  path?: string
+  db?: DatabaseStats
+  thresholdBytes?: number
+}
+
+// POST /admin/api/database/vacuum 响应：额外返回释放字节数与收缩后的最新状态
+interface VacuumResponse extends DatabaseResponse {
+  reclaimedBytes?: number
+}
+
+const dbLoading = ref(false)
+const vacuuming = ref(false)
+const thresholdSaving = ref(false)
+const dbInfo = ref<DatabaseStats | null>(null)
+const dbPath = ref('')
+const dbLoadError = ref<string | null>(null)
+// 收缩门限：前端以 GB 输入（后端契约为字节），加载 / 保存时换算
+const thresholdGB = ref(5)
+
+// auto_vacuum 模式展示：模式值 → 标签文案与 tag 颜色
+const AUTO_VACUUM_TAGS: Record<number, { label: string; type: 'success' | 'warning' | 'info' }> = {
+  0: { label: '未启用（首次手动收缩会自动转换）', type: 'warning' },
+  1: { label: 'full（全量）', type: 'info' },
+  2: { label: 'incremental（增量回收）', type: 'success' },
+}
+const autoVacuumTag = computed(() => {
+  const mode = dbInfo.value?.autoVacuum ?? 0
+  return AUTO_VACUUM_TAGS[mode] ?? { label: `未知 (${mode})`, type: 'info' as const }
+})
+
+// 字节数人性化格式（KB/MB/GB/TB 自适应，保留 1 位小数）
+function formatBytes(bytes?: number): string {
+  if (bytes === undefined || bytes === null) return '—'
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes / 1024
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex++
+  }
+  return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unitIndex]}`
+}
+
+// 拉取数据库状态 + 当前门限（独立于配置 load，失败不影响其余 tab）
+async function loadDb() {
+  dbLoading.value = true
+  dbLoadError.value = null
+  try {
+    const { data } = await api.get<DatabaseResponse>('/database')
+    if (data?.db) {
+      dbInfo.value = data.db
+      dbPath.value = data.path ?? ''
+      // 字节 → GB（门限常为整 GB；非整除时保留两位小数回显）
+      if (data.thresholdBytes !== undefined) {
+        thresholdGB.value = Math.round((data.thresholdBytes / 1024 ** 3) * 100) / 100
+      }
+    }
+  } catch (err: any) {
+    dbLoadError.value = `加载数据库状态失败：${err?.response?.data?.error ?? err.message}`
+  } finally {
+    dbLoading.value = false
+  }
+}
+
+// 保存收缩门限：GB → 字节，走 PUT /config 的 database 节（实时生效，无需重启）
+async function saveThreshold() {
+  thresholdSaving.value = true
+  try {
+    const bytes = Math.round(thresholdGB.value * 1024 ** 3)
+    const { data } = await api.put<{ status: boolean; msg?: string }>('/config', {
+      database: { reclaimThresholdBytes: bytes },
+    })
+    if (data?.status) {
+      ElMessage.success(`收缩门限已保存（${thresholdGB.value} GB），实时生效`)
+    } else {
+      ElMessage.error(data?.msg ?? '保存门限失败')
+    }
+  } catch (err: any) {
+    ElMessage.error(`保存门限失败：${err?.response?.data?.error ?? err.message}`)
+  } finally {
+    thresholdSaving.value = false
+  }
+}
+
+// 手动收缩：确认后无视门限回收全部空闲页；用响应中的最新状态直接刷新界面
+async function vacuumNow() {
+  try {
+    await ElMessageBox.confirm(
+      '收缩将回收数据库中全部空闲页并截断文件。期间分块执行、块间让出写锁，业务请求基本不受影响。确认立即收缩？',
+      '手动收缩',
+      { confirmButtonText: '立即收缩', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch {
+    return // 用户取消
+  }
+  vacuuming.value = true
+  try {
+    const { data } = await api.post<VacuumResponse>('/database/vacuum')
+    if (data?.db) dbInfo.value = data.db
+    if (data?.status) {
+      if ((data.reclaimedBytes ?? 0) > 0) {
+        ElMessage.success(data.msg ?? '收缩完成')
+      } else {
+        ElMessage.info(data.msg ?? '当前没有可回收的空闲页')
+      }
+    } else {
+      ElMessage.error(data?.msg ?? '收缩失败')
+    }
+  } catch (err: any) {
+    ElMessage.error(`收缩失败：${err?.response?.data?.error ?? err.message}`)
+  } finally {
+    vacuuming.value = false
+  }
+}
 </script>
 
 <style scoped>
@@ -386,5 +587,41 @@ onMounted(load)
 .field-note {
   display: block;
   margin-top: 4px;
+}
+
+/* ===== 数据库管理 tab ===== */
+.db-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* DB 文件路径：小字号弱化展示，可完整换行 */
+.db-path {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  word-break: break-all;
+}
+
+/* 空闲页非零时用警示色提示「可回收」 */
+.free-warn {
+  color: var(--el-color-warning);
+  font-weight: 600;
+}
+
+.db-actions {
+  display: flex;
+  gap: 12px;
+}
+
+/* 门限行：输入框与保存按钮同行 */
+.threshold-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.db-tables {
+  width: 100%;
 }
 </style>

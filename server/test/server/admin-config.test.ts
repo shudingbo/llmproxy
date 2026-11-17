@@ -222,6 +222,8 @@ describe('系统配置保存 PUT /admin/api/config', () => {
       server: { host: '127.0.0.1', port: 9000, bodyLimit: '10mb' },
       routing: { sessionAffinity: { enabled: true, cleanupMaxAgeMs: 604800000, cleanupIntervalMs: 0 } },
       auth: { enabled: true, keyBytes: 24, cleanupRetentionDays: 7 },
+      // database 节未在请求体提供 → 装载时被 prefault 补齐为 schema 默认值（既有 auth 语义一致）
+      database: { reclaimThresholdBytes: 5 * 1024 * 1024 * 1024 },
       admins: BASE_CONFIG.admins,
     })
   })

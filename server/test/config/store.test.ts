@@ -27,6 +27,7 @@ const sampleConfig: Config = {
   },
   routing: { sessionAffinity: { enabled: true, cleanupMaxAgeMs: 604800000, cleanupIntervalMs: 3600000 } },
   auth: { enabled: false, keyBytes: 24, cleanupRetentionDays: 7 },
+  database: { reclaimThresholdBytes: 5 * 1024 * 1024 * 1024 },
   admins: {
     salt: 'c'.repeat(64),
     accounts: [

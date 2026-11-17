@@ -165,12 +165,26 @@ export const AdminsConfigSchema = z.object({
 })
 
 /**
+ * 数据库维护配置（可选）：
+ * - reclaimThresholdBytes：空闲页自动回收门限（字节）。会话 / 日志清理后 freelist 超过该门限
+ *   才触发 incremental_vacuum 截断出文件（滞回语义：回收清空整个 freelist，需重新积累才再触发）；
+ *   0 表示只要产生空闲页就回收。管理端「数据库管理」页可改，改后即时生效（每次清理时实时读取）。
+ *   缺省 5GB（RECLAIM_THRESHOLD_BYTES，与 vacuum.ts 常量一致）
+ */
+export const DatabaseConfigSchema = z
+  .object({
+    reclaimThresholdBytes: z.number().int().min(0).max(1024 ** 4).default(5 * 1024 * 1024 * 1024),
+  })
+  .prefault({})
+
+/**
  * 完整配置：
  * - upstreams：上游列表（至少 1 个）
  * - downstreamModels：别名 → DownstreamAliasGroup 的映射（运行时归一化形态，见 loader）
  * - server：可选的进程级 server 配置（host / port / bodyLimit）；未指定时按缺省值
  * - routing：可选的路由配置（会话亲和等）；未指定时按缺省值
  * - auth：可选的鉴权配置（开关 + Key 长度）；未指定时按缺省值（disabled）
+ * - database：可选的数据库维护配置（空闲页回收门限）；未指定时按缺省值（5GB）
  * - admins：可选的管理员配置（salt + 账号列表）；首次启动由 bootstrap 注入，旧配置可缺省
  *
  * 注意：raw 形态（未归一化）见 DownstreamModelEntrySchema，由 loader 负责在落库前归一化
@@ -181,6 +195,7 @@ export const ConfigSchema = z.object({
   server: ServerConfigSchema.optional(),
   routing: RoutingSchema.optional(),
   auth: AuthConfigSchema.optional(),
+  database: DatabaseConfigSchema.optional(),
   admins: AdminsConfigSchema.optional(),
 })
 
@@ -192,6 +207,7 @@ export type DownstreamAliasGroup = z.infer<typeof DownstreamAliasGroupSchema>
 export type ServerConfig = z.infer<typeof ServerConfigSchema>
 export type Routing = z.infer<typeof RoutingSchema>
 export type AuthConfig = z.infer<typeof AuthConfigSchema>
+export type DatabaseConfig = z.infer<typeof DatabaseConfigSchema>
 export type AdminAccount = z.infer<typeof AdminAccountSchema>
 export type AdminsConfig = z.infer<typeof AdminsConfigSchema>
 
